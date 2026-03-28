@@ -723,7 +723,8 @@ def _parse_detail_md(team: str, rank: int, valve_pts: int, text: str) -> dict:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_valve_github_data(date_str: str | None = None,
-                            year: str | None = None) -> dict:
+                            year: str | None = None,
+                            _cache_v: int = 2) -> dict:
     """
     Fetch a VRS snapshot from GitHub.  If date_str is None, use the latest.
 
