@@ -2887,6 +2887,178 @@ elif page == "🔍 Team Breakdown":
             f"Factor avg: **{ex['seed_combined']:.4f}** · "
             f"Percentile: **{pct_rank:.1f}th**"
         )
+
+        # ════════════════════════════════════════════════════════
+        # SIMULATION WATERFALL — "Why did the score change?"
+        # ════════════════════════════════════════════════════════
+        if _orig_ex is not None:
+            st.markdown("---")
+            st.markdown("### 🔬 Score Change Breakdown")
+
+            # ── Compute deltas ─────────────────────────────────
+            _d_total = ex["total_points"] - _orig_ex["total_points"]
+            _d_seed  = ex["seed"]         - _orig_ex["seed"]
+            _d_h2h   = ex["h2h_delta"]    - _orig_ex["h2h_delta"]
+
+            # Factor-level deltas (each contributes 25% to the avg)
+            _d_bo  = (ex["bo_factor"]  - _orig_ex["bo_factor"])  / 4.0
+            _d_bc  = (ex["bc_factor"]  - _orig_ex["bc_factor"])  / 4.0
+            _d_on  = (ex["on_factor"]  - _orig_ex["on_factor"])  / 4.0
+            _d_lan = (ex["lan_factor"] - _orig_ex["lan_factor"]) / 4.0
+            _d_avg = _d_bo + _d_bc + _d_on + _d_lan
+
+            # Lerp scale: convert avg-units → seed points
+            _lerp_scale = 1600.0 / max(max_avg - min_avg, 1e-9)
+
+            # Factor contributions in seed points
+            _pts_bo  = _d_bo  * _lerp_scale
+            _pts_bc  = _d_bc  * _lerp_scale
+            _pts_on  = _d_on  * _lerp_scale
+            _pts_lan = _d_lan * _lerp_scale
+            _pts_factors_sum = _pts_bo + _pts_bc + _pts_on + _pts_lan
+
+            # Lerp shift = residual (min/max change effect)
+            _pts_lerp = _d_seed - _pts_factors_sum
+
+            # ── Waterfall chart ────────────────────────────────
+
+            _old_label = _gd["cutoff_datetime"].strftime("%b")
+            _new_label = sim_cutoff_dt.strftime("%b")
+            _wf_labels = [
+                f"{_old_label} Score<br><b>{_orig_ex['total_points']:,.0f}</b>",
+                "🏆 BO",
+                "💰 BC",
+                "🕸️ ON",
+                "🖥️ LAN",
+                "📐 Lerp Shift",
+                "⚔️ H2H",
+                f"{_new_label} Score<br><b>{ex['total_points']:,.0f}</b>",
+            ]
+            _wf_values = [_orig_ex["total_points"], _pts_bo, _pts_bc, _pts_on, _pts_lan, _pts_lerp, _d_h2h, ex["total_points"]]
+            _wf_measures = ["absolute", "relative", "relative", "relative", "relative", "relative", "relative", "total"]
+
+            fig_wf = go.Figure(go.Waterfall(
+                x=_wf_labels,
+                y=_wf_values,
+                measure=_wf_measures,
+                text=[
+                    f"{_orig_ex['total_points']:,.0f}",
+                    f"{_pts_bo:+.1f}",
+                    f"{_pts_bc:+.1f}",
+                    f"{_pts_on:+.1f}",
+                    f"{_pts_lan:+.1f}",
+                    f"{_pts_lerp:+.1f}",
+                    f"{_d_h2h:+.1f}",
+                    f"{ex['total_points']:,.0f}",
+                ],
+                textposition="outside",
+                textfont=dict(size=12, color="#c9d1d9"),
+                connector=dict(line=dict(color="#30363d", width=1, dash="dot")),
+                increasing=dict(marker_color="#3fb950"),
+                decreasing=dict(marker_color="#f85149"),
+                totals=dict(marker_color="#58a6ff"),
+            ))
+            fig_wf.update_layout(
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                font=dict(color="#c9d1d9"),
+                yaxis=dict(gridcolor="#21262d", title="Points"),
+                xaxis=dict(gridcolor="#21262d"),
+                margin=dict(l=10, r=10, t=10, b=10),
+                height=320,
+                showlegend=False,
+            )
+            st.plotly_chart(fig_wf, use_container_width=True)
+
+            # ── Compact explanation table ──────────────────────
+            def _driver_row(emoji, name, pts_d, factor_d, color):
+                """One row of the driver table."""
+                if abs(pts_d) < 0.05:
+                    impact = '<span style="color:#8b949e">—</span>'
+                    bar = ""
+                elif pts_d > 0:
+                    impact = f'<span style="color:#3fb950;font-weight:700">+{pts_d:.1f} pts</span>'
+                    bw = min(abs(pts_d) / max(abs(_d_total), 1) * 100, 100)
+                    bar = f'<div style="width:{bw:.0f}%;height:5px;background:#3fb950;border-radius:3px;margin-top:3px"></div>'
+                else:
+                    impact = f'<span style="color:#f85149;font-weight:700">{pts_d:.1f} pts</span>'
+                    bw = min(abs(pts_d) / max(abs(_d_total), 1) * 100, 100)
+                    bar = f'<div style="width:{bw:.0f}%;height:5px;background:#f85149;border-radius:3px;margin-top:3px"></div>'
+                factor_s = f'{factor_d:+.4f}' if factor_d is not None else "—"
+                return (
+                    f'<tr style="border-bottom:1px solid #21262d;">'
+                    f'<td style="padding:8px 10px;font-size:13px">{emoji} {name}</td>'
+                    f'<td style="padding:8px 10px;text-align:right;font-family:monospace;font-size:12px;color:#8b949e">{factor_s}</td>'
+                    f'<td style="padding:8px 10px;text-align:right;min-width:90px">{impact}{bar}</td>'
+                    f'</tr>'
+                )
+
+            _explain_rows = (
+                _driver_row("🏆", "Bounty Offered", _pts_bo, ex["bo_factor"] - _orig_ex["bo_factor"], "#f0b429") +
+                _driver_row("💰", "Bounty Collected", _pts_bc, ex["bc_factor"] - _orig_ex["bc_factor"], "#3fb950") +
+                _driver_row("🕸️", "Opp. Network", _pts_on, ex["on_factor"] - _orig_ex["on_factor"], "#79c0ff") +
+                _driver_row("🖥️", "LAN Wins", _pts_lan, ex["lan_factor"] - _orig_ex["lan_factor"], "#f85149") +
+                _driver_row("📐", "Lerp Normalization", _pts_lerp, None, "#c9d1d9") +
+                _driver_row("⚔️", "H2H (Glicko)", _d_h2h, None, "#58a6ff")
+            )
+            _total_color = "#3fb950" if _d_total >= 0 else "#f85149"
+
+            st.markdown(f"""
+            <table style="width:100%;border-collapse:collapse;font-size:13px;margin-top:4px;">
+              <thead>
+                <tr style="background:#161b22;color:#8b949e;font-size:10px;text-transform:uppercase;">
+                  <th style="padding:8px 10px;text-align:left">Driver</th>
+                  <th style="padding:8px 10px;text-align:right">Factor Δ</th>
+                  <th style="padding:8px 10px;text-align:right">Points Impact</th>
+                </tr>
+              </thead>
+              <tbody>{_explain_rows}</tbody>
+              <tfoot>
+                <tr style="border-top:2px solid #30363d;">
+                  <td style="padding:10px;font-weight:700;font-size:14px" colspan="2">
+                    Total Score Change</td>
+                  <td style="padding:10px;text-align:right;font-weight:700;font-size:16px;color:{_total_color}">
+                    {_d_total:+.1f} pts</td>
+                </tr>
+              </tfoot>
+            </table>
+            """, unsafe_allow_html=True)
+
+            # ── Insight text ──────────────────────────────────
+            _drivers = [
+                ("BC decay", _pts_bc), ("ON decay", _pts_on),
+                ("LAN decay", _pts_lan), ("Lerp shift", _pts_lerp),
+                ("H2H shift", _d_h2h),
+            ]
+            _drivers.sort(key=lambda x: abs(x[1]), reverse=True)
+            _top_driver = _drivers[0]
+
+            if abs(_pts_lerp) > abs(_pts_bc) + abs(_pts_on) + abs(_pts_lan):
+                _insight = (
+                    f"⚠️ The **Lerp normalization** ({_pts_lerp:+.0f} pts) is the dominant driver. "
+                    "This happens when teams drop out of the eligible pool, shifting the min/max baseline. "
+                    "The actual factor decay is modest."
+                )
+            elif _d_total > 10:
+                _insight = (
+                    f"📈 This team **gains** points mainly from **{_top_driver[0]}** ({_top_driver[1]:+.0f} pts). "
+                    "Likely the lerp normalization is inflating their score as weaker teams fall out."
+                )
+            elif _d_total < -10:
+                _biggest_neg = min(_drivers, key=lambda x: x[1])
+                _insight = (
+                    f"📉 This team **loses** points mainly from **{_biggest_neg[0]}** ({_biggest_neg[1]:+.0f} pts). "
+                    "Older matches are losing weight, reducing their factor scores."
+                )
+            else:
+                _insight = "➡️ This team is relatively stable — factor decay and normalization largely cancel out."
+
+            st.markdown(
+                f'<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;'
+                f'padding:12px 16px;font-size:12px;color:#c9d1d9;margin-top:8px;line-height:1.6">'
+                f'{_insight}</div>',
+                unsafe_allow_html=True,
+            )
+
         st.markdown("---")
 
         # ════════════════════════════════════════════════════════
