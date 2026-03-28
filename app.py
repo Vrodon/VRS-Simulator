@@ -6,9 +6,9 @@ Source: https://github.com/ValveSoftware/counter-strike_regional_standings
 
 Architecture
 ────────────
-  Final Score = VRS Score (400–2000) + Glicko H2H Adjustments
+  Final Score = Factor Score (400–2000) + Glicko H2H Adjustments
 
-VRS Score Factors  (Top-10 "bucket" results over a 6-month window)
+Factor Score Factors  (Top-10 "bucket" results over a 6-month window)
   1. Bounty Offered   — scaled prize winnings ÷ 5th-highest normalization
   2. Bounty Collected — sum of opponents' Bounty Offered scores
   3. Opponent Network — distinct opponents beaten × time modifier (top-10)
@@ -943,9 +943,10 @@ TEAM_META: dict[str, dict] = {
 # HELPERS  —  formatting utilities
 # ══════════════════════════════════════════════════════════════════
 
-def region_pill(region: str) -> str:
+def region_pill(region: str, regional_rank: int = 0) -> str:
     cls = {"Europe": "pill-eu", "Americas": "pill-am", "Asia": "pill-as"}.get(region, "pill-eu")
-    return f'<span class="{cls}">{region}</span>'
+    rank_str = f' #{regional_rank}' if regional_rank > 0 else ''
+    return f'<span class="{cls}">{region}{rank_str}</span>'
 
 
 def rank_badge(rank: int) -> str:
@@ -997,7 +998,7 @@ with st.sidebar:
         "🔍 Team Breakdown",
         "🔮 Scenario Simulator",
         "⚔️ Team Comparison",
-    ], label_visibility="collapsed")
+    ], label_visibility="collapsed", key="main_nav")
     st.markdown("---")
 
     # ── Historical date selector ──────────────────────────────────
@@ -1085,7 +1086,7 @@ def compute_standings(extra_matches: pd.DataFrame = None, cutoff: datetime = Non
     For the scenario simulator.
     Starts from Valve's published final scores (exact) and applies
     H2H deltas for any hypothetical extra_matches.
-    VRS Score factors (BO/BC/ON/LAN) are held constant from Valve's snapshot.
+    Factor Score factors (BO/BC/ON/LAN) are held constant from Valve's snapshot.
     """
     result = base_standings.copy()
     if extra_matches is None or extra_matches.empty:
@@ -1128,7 +1129,7 @@ if page == "📊 Ranking Dashboard":
     st.title("📊 CS2 Valve Regional Standings")
     st.caption(
         f"Simulated standings · cutoff **{cutoff_date.strftime('%B %d, %Y')}** · "
-        "Two-phase VRS engine (VRS Score + Glicko H2H) · "
+        "Two-phase VRS engine (Factor Score + Glicko H2H) · "
         "Source: [Valve GitHub](https://github.com/ValveSoftware/counter-strike_regional_standings)"
     )
 
@@ -1151,9 +1152,16 @@ if page == "📊 Ranking Dashboard":
     st.markdown("---")
 
     # ── Table renderer ────────────────────────────────────────────
-    def factor_bar(value: float, color: str = "#58a6ff", width: int = 60) -> str:
-        """Inline mini progress bar representing a 0–1 factor."""
-        pct = max(0.0, min(1.0, float(value))) * 100
+    # Pre-compute per-factor maximums across all teams for relative bar scaling
+    _bo_max  = max(base_standings["bo_factor"].max(),  1e-9)
+    _bc_max  = max(base_standings["bc_factor"].max(),  1e-9)
+    _on_max  = max(base_standings["on_factor"].max(),  1e-9)
+    _lan_max = max(base_standings["lan_factor"].max(), 1e-9)
+
+    def factor_bar(value: float, color: str = "#58a6ff", width: int = 60,
+                   max_val: float = 1.0) -> str:
+        """Mini progress bar scaled to max_val across all teams."""
+        pct = max(0.0, min(1.0, float(value) / max(float(max_val), 1e-9))) * 100
         return (
             f'<div style="display:flex;align-items:center;gap:5px;">' +
             f'<div style="width:{width}px;height:7px;background:#21262d;border-radius:4px;overflow:hidden;">' +
@@ -1175,13 +1183,15 @@ if page == "📊 Ranking Dashboard":
             h2h_s = (f'<span class="change-up">+{h2h:.1f}</span>' if h2h > 0 else
                      f'<span class="change-down">{h2h:.1f}</span>'  if h2h < 0 else
                      '<span class="change-same">0.0</span>')
-            reg  = region_pill(row.get("region", "Global"))
+            region_str = row.get("region", "Global")
+            rrk  = int(row.get("regional_rank", 0))
+            reg  = region_pill(region_str, rrk)
             w    = int(row.get("wins", 0))
             l    = int(row.get("losses", 0))
-            bo   = factor_bar(row.get("bo_factor", 0), "#f0b429")
-            bc   = factor_bar(row.get("bc_factor", 0), "#3fb950")
-            on   = factor_bar(row.get("on_factor", 0), "#79c0ff")
-            lan  = factor_bar(row.get("lan_factor", 0), "#f85149")
+            bo   = factor_bar(row.get("bo_factor", 0), "#f0b429", max_val=_bo_max)
+            bc   = factor_bar(row.get("bc_factor", 0), "#3fb950", max_val=_bc_max)
+            on   = factor_bar(row.get("on_factor", 0), "#79c0ff", max_val=_on_max)
+            lan  = factor_bar(row.get("lan_factor", 0), "#f85149", max_val=_lan_max)
             rows.append(f"""
             <tr style="border-bottom:1px solid #21262d;">
               <td style="padding:6px 4px;text-align:center">{rank_badge(rk)}</td>
@@ -1204,8 +1214,8 @@ if page == "📊 Ranking Dashboard":
               <th style="padding:9px 4px;text-align:center">Rank</th>
               <th style="padding:9px 4px;text-align:left">Team</th>
               <th style="padding:9px 4px;text-align:center">Region</th>
-              <th style="padding:9px 8px;text-align:right" title="VRS Score + H2H adjustment">Total</th>
-              <th style="padding:9px 8px;text-align:right" title="VRS Score (400–2000)">VRS Score</th>
+              <th style="padding:9px 8px;text-align:right" title="Factor Score + H2H adjustment">Total</th>
+              <th style="padding:9px 8px;text-align:right" title="Factor Score (400–2000)">Factor Score</th>
               <th style="padding:9px 8px;text-align:right" title="Glicko H2H adjustment">H2H Δ</th>
               <th style="padding:9px 8px;text-align:left" title="Bounty Offered (prize money)">
                 <span style="color:#f0b429">■</span> BO</th>
@@ -1226,9 +1236,43 @@ if page == "📊 Ranking Dashboard":
           <span style="color:#3fb950">■ BC</span> Bounty Collected &nbsp;·&nbsp;
           <span style="color:#79c0ff">■ ON</span> Opponent Network &nbsp;·&nbsp;
           <span style="color:#f85149">■ LAN</span> LAN Wins &nbsp;·&nbsp;
-          Each bar = 0.000 → 1.000, averaged to produce VRS Score
+          Each bar = 0.000 → 1.000, averaged to produce Factor Score
         </div>
         """, unsafe_allow_html=True)
+
+    def _nav_to_team(team_name: str):
+        """Navigate to Team Breakdown with the given team pre-selected."""
+        st.session_state["main_nav"]  = "🔍 Team Breakdown"
+        st.session_state["bd_team"]   = team_name
+        st.rerun()
+
+    def _click_table(df: pd.DataFrame, tab_key: str):
+        """Render a native st.dataframe below the HTML table for row-click navigation."""
+        click_df = df[["rank","team","total_points","seed","h2h_delta","wins","losses"]].copy()
+        click_df.columns = ["#","Team","Final Score","Factor Score","H2H Δ","W","L"]
+        click_df["Final Score"]  = click_df["Final Score"].round(1)
+        click_df["Factor Score"] = click_df["Factor Score"].round(1)
+        click_df["H2H Δ"]        = click_df["H2H Δ"].round(1)
+        st.caption("👆 Click a row below to open that team's full breakdown:")
+        event = st.dataframe(
+            click_df,
+            use_container_width=True,
+            hide_index=True,
+            on_select="rerun",
+            selection_mode="single-row",
+            key=f"sel_{tab_key}",
+            height=min(400, 35 + len(click_df) * 35),
+        )
+        sel = event.selection.rows
+        if sel:
+            chosen_team = click_df.iloc[sel[0]]["Team"]
+            st.button(
+                f"🔍 Open breakdown for **{chosen_team}**",
+                on_click=_nav_to_team,
+                args=(chosen_team,),
+                key=f"nav_btn_{tab_key}",
+                type="primary",
+            )
 
     tab_gl, tab_eu, tab_am, tab_as = st.tabs(
         ["🌍 Global", "🇪🇺 Europe", "🌎 Americas", "🌏 Asia"])
@@ -1236,21 +1280,25 @@ if page == "📊 Ranking Dashboard":
     with tab_gl:
         show_all = st.checkbox("Show all teams", key="chk_global")
         render_table(base_standings, show_all=show_all)
+        _click_table(base_standings if show_all else base_standings.head(50), "gl")
 
     with tab_eu:
         eu_df = base_standings[base_standings["region"] == "Europe"].reset_index(drop=True)
         eu_df["rank"] = eu_df.index + 1
         render_table(eu_df, show_all=True)
+        _click_table(eu_df, "eu")
 
     with tab_am:
         am_df = base_standings[base_standings["region"] == "Americas"].reset_index(drop=True)
         am_df["rank"] = am_df.index + 1
         render_table(am_df, show_all=True)
+        _click_table(am_df, "am")
 
     with tab_as:
         as_df = base_standings[base_standings["region"] == "Asia"].reset_index(drop=True)
         as_df["rank"] = as_df.index + 1
         render_table(as_df, show_all=True)
+        _click_table(as_df, "as")
 
     st.markdown("---")
 
@@ -1258,11 +1306,11 @@ if page == "📊 Ranking Dashboard":
     col1, col2 = st.columns(2)
 
     with col1:
-        st.subheader("🏆 Top 15 — VRS Score Breakdown")
+        st.subheader("🏆 Top 15 — Factor Score Breakdown")
         top15 = base_standings.head(15).copy()
         fig = go.Figure()
         fig.add_trace(go.Bar(
-            name="VRS Score (400–2000)", x=top15["team"], y=top15["seed"],
+            name="Factor Score (400–2000)", x=top15["team"], y=top15["seed"],
             marker_color="#79c0ff",
         ))
         fig.add_trace(go.Bar(
@@ -1671,7 +1719,7 @@ elif page == "📖 How VRS Works":
         "🕸️ Opp. Network",
         "🖥️ LAN Wins",
         "⚔️ H2H (Glicko)",
-        "🌱 VRS Score",
+        "🌱 Factor Score",
     ])
 
     # ══════════════════════════════════════════════════════════════
@@ -1684,11 +1732,11 @@ The VRS is computed in **two sequential phases** that are simply added together:
 """)
             st.latex(
                 r"\text{Final Score} = "
-                r"\underbrace{\text{VRS Score}_{[400,\;2000]}}_{\text{Phase 1 — Seeding}} "
+                r"\underbrace{\text{Factor Score}_{[400,\;2000]}}_{\text{Phase 1 — Seeding}} "
                 r"+ \;\underbrace{\Delta_{\text{H2H}}}_{\text{Phase 2 — Head-to-Head}}"
             )
             st.markdown("""
-**Phase 1 — VRS Score** asks: *"What is this team's overall quality over the last 6 months?"*
+**Phase 1 — Factor Score** asks: *"What is this team's overall quality over the last 6 months?"*
 
 Four factors are computed, averaged (25% each), and mapped to [400, 2000]. This is the
 team's **starting rank value** for Phase 2.
@@ -1708,10 +1756,10 @@ excluded entirely. Within the window, **age weight** scales contributions contin
             fig = go.Figure()
             nodes = [
                 (0.5, 0.88, "180-day match history", "#21262d", "#8b949e", 13),
-                (0.25, 0.65, "Phase 1\nVRS Score\n(4 factors)", "#0d1a2e", "#58a6ff", 14),
+                (0.25, 0.65, "Phase 1\nFactor Score\n(4 factors)", "#0d1a2e", "#58a6ff", 14),
                 (0.75, 0.65, "Phase 2\nHead-to-Head\n(Glicko, chronological)", "#0d1a0d", "#3fb950", 13),
-                (0.5,  0.40, "VRS Score + H2H Δ", "#1c1c1c", "#c9d1d9", 13),
-                (0.5,  0.17, "Final VRS Score", "#2d1f00", "#f0b429", 15),
+                (0.5,  0.40, "Factor Score + H2H Δ", "#1c1c1c", "#c9d1d9", 13),
+                (0.5,  0.17, "Final Factor Score", "#2d1f00", "#f0b429", 15),
             ]
             for x, y, text, bg, fc, fs in nodes:
                 fig.add_annotation(x=x, y=y, text=text, showarrow=False,
@@ -2255,7 +2303,7 @@ produce different, incorrect results.
 
     # ══════════════════════════════════════════════════════════════
     with tab_seed:
-        st.subheader("🌱 Phase 1 — Combining Factors → VRS Score")
+        st.subheader("🌱 Phase 1 — Combining Factors → Factor Score")
         st.markdown(
             '<span class="tag-v">✓ VERIFIED — simple average (25% each) confirmed from Vitality data</span>',
             unsafe_allow_html=True,
@@ -2271,7 +2319,7 @@ $$\text{average} = \frac{\text{BO} + \text{BC} + \text{ON} + \text{LAN}}{4}$$
 **Step 2.** Find the minimum and maximum average across all eligible teams.
 
 **Step 3.** Linearly interpolate (lerp) to [400, 2000]:
-$$\text{VRS Score} = 400 + \frac{\text{average} - \text{avg}_{\min}}{\text{avg}_{\max} - \text{avg}_{\min}} \times 1600$$
+$$\text{Factor Score} = 400 + \frac{\text{average} - \text{avg}_{\min}}{\text{avg}_{\max} - \text{avg}_{\min}} \times 1600$$
 
 The **worst eligible team** always gets seed = **400**.
 The **best eligible team** always gets seed = **2000**.
@@ -2281,7 +2329,7 @@ All others are spaced proportionally between them.
 $$\frac{1.000 + 0.923 + 0.460 + 1.000}{4} = 0.846$$
 
 Since Vitality has the highest average, they are the reference maximum:
-$$\text{VRS Score} = 400 + \frac{0.846 - 0.000}{0.846 - 0.000} \times 1600 = \mathbf{2000.0} \checkmark$$
+$$\text{Factor Score} = 400 + \frac{0.846 - 0.000}{0.846 - 0.000} \times 1600 = \mathbf{2000.0} \checkmark$$
 """)
         with col_r:
             st.markdown("#### Factor importance — equal weights confirmed")
@@ -2337,8 +2385,14 @@ elif page == "🔍 Team Breakdown":
     opp_on_map     = base_standings.set_index("team")["on_factor"].to_dict()
 
     # ── Helpers ───────────────────────────────────────────────────
-    def _bar(val, color, w=60):
-        pct = max(0.0, min(1.0, float(val))) * 100
+    # Per-factor max for relative bar scaling in breakdown
+    _bd_bo_max  = max(base_standings["bo_factor"].max(),  1e-9)
+    _bd_bc_max  = max(base_standings["bc_factor"].max(),  1e-9)
+    _bd_on_max  = max(base_standings["on_factor"].max(),  1e-9)
+    _bd_lan_max = max(base_standings["lan_factor"].max(), 1e-9)
+
+    def _bar(val, color, w=60, max_val=1.0):
+        pct = max(0.0, min(1.0, float(val) / max(float(max_val), 1e-9))) * 100
         return (
             f'<span style="display:inline-flex;align-items:center;gap:4px;">' +
             f'<span style="display:inline-block;width:{w}px;height:7px;background:#21262d;border-radius:4px;overflow:hidden;">' +
@@ -2353,8 +2407,8 @@ elif page == "🔍 Team Breakdown":
             lines_html + '</div>'
         )
 
-    def _factor_band(emoji, name, value, color):
-        pct = max(0.0, min(1.0, float(value))) * 100
+    def _factor_band(emoji, name, value, color, max_val=1.0):
+        pct = max(0.0, min(1.0, float(value) / max(float(max_val), 1e-9))) * 100
         return (
             f'<div style="display:flex;justify-content:space-between;align-items:center;' +
             f'background:#161b22;border-left:4px solid {color};' +
@@ -2380,7 +2434,7 @@ elif page == "🔍 Team Breakdown":
         k1, k2, k3, k4, k5 = st.columns(5)
         k1.metric("🌍 Global Rank",   f"#{int(ex['rank'])}")
         k2.metric("🎯 Final Score",   f"{ex['total_points']:,.1f}")
-        k3.metric("🌱 VRS Score",     f"{ex['seed']:,.1f}")
+        k3.metric("🌱 Factor Score",     f"{ex['seed']:,.1f}")
         k4.metric("⚔️ H2H Adj.",      f"{ex['h2h_delta']:+.1f}")
         k5.metric("📝 Record",        f"{int(ex['wins'])}W / {int(ex['losses'])}L")
 
@@ -2400,7 +2454,7 @@ elif page == "🔍 Team Breakdown":
         st.markdown("### 🌱 Phase 1 — Four Factors")
 
         # ── BOUNTY OFFERED ────────────────────────────────────────
-        st.markdown(_factor_band("🏆", "Bounty Offered", ex["bo_factor"], "#f0b429"), unsafe_allow_html=True)
+        st.markdown(_factor_band("🏆", "Bounty Offered", ex["bo_factor"], "#f0b429", _bd_bo_max), unsafe_allow_html=True)
         col_bo_l, col_bo_r = st.columns([1, 1])
         with col_bo_l:
             ratio_bo = ex["bo_sum"] / max(ref5_bo, 1.0)
@@ -2440,7 +2494,7 @@ elif page == "🔍 Team Breakdown":
         st.markdown("<div style='margin:10px 0'>", unsafe_allow_html=True)
 
         # ── BOUNTY COLLECTED ──────────────────────────────────────
-        st.markdown(_factor_band("💰", "Bounty Collected", ex["bc_factor"], "#3fb950"), unsafe_allow_html=True)
+        st.markdown(_factor_band("💰", "Bounty Collected", ex["bc_factor"], "#3fb950", _bd_bc_max), unsafe_allow_html=True)
         col_bc_l, col_bc_r = st.columns([1, 1])
         bc_matches = [m for m in raw_ms if m["result"] == "W" and m.get("ev_w", 0) > 0]
         bc_entries = sorted(
@@ -2461,7 +2515,7 @@ elif page == "🔍 Team Breakdown":
                     f'<tr style="border-bottom:1px solid #21262d;{" " if i<10 else "opacity:0.35;"}">' +
                     f'<td style="padding:4px 5px;color:#8b949e;font-size:10px">{m["date"].strftime("%m-%d")}</td>' +
                     f'<td style="padding:4px 5px;color:#c9d1d9;font-size:10px">{m["opponent"][:14]}</td>' +
-                    f'<td style="padding:4px 5px;font-size:10px">{_bar(ob,"#f0b429",30)}</td>' +
+                    f'<td style="padding:4px 5px;font-size:10px">{_bar(ob,"#f0b429",30,_bd_bo_max)}</td>' +
                     f'<td style="padding:4px 5px;font-size:10px">{_bar(m["age_w"],"#e6b430",30)}</td>' +
                     f'<td style="padding:4px 5px;font-size:10px">{_bar(m["ev_w"],"#79c0ff",30)}</td>' +
                     f'<td style="padding:4px 5px;text-align:right;color:#3fb950;font-size:10px;font-weight:600">{e:.3f}</td>' +
@@ -2489,7 +2543,7 @@ elif page == "🔍 Team Breakdown":
         st.markdown("<div style='margin:10px 0'>", unsafe_allow_html=True)
 
         # ── OPPONENT NETWORK ──────────────────────────────────────
-        st.markdown(_factor_band("🕸️", "Opponent Network", ex["on_factor"], "#79c0ff"), unsafe_allow_html=True)
+        st.markdown(_factor_band("🕸️", "Opponent Network", ex["on_factor"], "#79c0ff", _bd_on_max), unsafe_allow_html=True)
         col_on_l, col_on_r = st.columns([1, 1])
         on_matches = [m for m in raw_ms if m["result"] == "W" and m.get("ev_w", 0) > 0]
         on_entries = sorted(
@@ -2510,7 +2564,7 @@ elif page == "🔍 Team Breakdown":
                     f'<tr style="border-bottom:1px solid #21262d;{" " if i<10 else "opacity:0.35;"}">' +
                     f'<td style="padding:4px 5px;color:#8b949e;font-size:10px">{m["date"].strftime("%m-%d")}</td>' +
                     f'<td style="padding:4px 5px;color:#c9d1d9;font-size:10px">{m["opponent"][:14]}</td>' +
-                    f'<td style="padding:4px 5px;font-size:10px">{_bar(on_v,"#79c0ff",30)}</td>' +
+                    f'<td style="padding:4px 5px;font-size:10px">{_bar(on_v,"#79c0ff",30,_bd_on_max)}</td>' +
                     f'<td style="padding:4px 5px;font-size:10px">{_bar(m["age_w"],"#e6b430",30)}</td>' +
                     f'<td style="padding:4px 5px;font-size:10px">{_bar(m["ev_w"],"#58a6ff",30)}</td>' +
                     f'<td style="padding:4px 5px;text-align:right;color:#79c0ff;font-size:10px;font-weight:600">{e:.3f}</td>' +
@@ -2538,7 +2592,7 @@ elif page == "🔍 Team Breakdown":
         st.markdown("<div style='margin:10px 0'>", unsafe_allow_html=True)
 
         # ── LAN WINS ──────────────────────────────────────────────
-        st.markdown(_factor_band("🖥️", "LAN Wins", ex["lan_factor"], "#f85149"), unsafe_allow_html=True)
+        st.markdown(_factor_band("🖥️", "LAN Wins", ex["lan_factor"], "#f85149", _bd_lan_max), unsafe_allow_html=True)
         col_lan_l, col_lan_r = st.columns([1, 1])
         lan_wins_list = sorted(
             [m for m in raw_ms if m["result"] == "W" and m.get("is_lan")],
@@ -2606,7 +2660,7 @@ elif page == "🔍 Team Breakdown":
             </div>
           </div>
           <div style="color:#8b949e;font-size:12px">avg = {combined:.4f} → 400 + ({combined:.4f} − {min_avg:.4f}) / ({max_avg:.4f} − {min_avg:.4f}) × 1600</div>
-          <div style="font-size:28px;font-weight:700;color:#58a6ff;margin-top:4px">VRS Score = {ex["seed"]:,.1f}</div>
+          <div style="font-size:28px;font-weight:700;color:#58a6ff;margin-top:4px">Factor Score = {ex["seed"]:,.1f}</div>
         </div>""", unsafe_allow_html=True)
 
         # ── PHASE 2 ───────────────────────────────────────────────
@@ -2614,14 +2668,14 @@ elif page == "🔍 Team Breakdown":
         st.markdown("### ⚔️ Phase 2 — Head-to-Head (Glicko)")
 
         p2c1, p2c2, p2c3 = st.columns(3)
-        p2c1.metric("🌱 VRS Score",    f"{ex['seed']:,.1f}")
+        p2c1.metric("🌱 Factor Score",    f"{ex['seed']:,.1f}")
         p2c2.metric("⚔️ H2H Adj.",     f"{ex['h2h_delta']:+.1f}")
         p2c3.metric("🎯 Final Score",   f"{ex['total_points']:,.1f}")
 
         import plotly.graph_objects as _go
         fig_p2 = _go.Figure()
         fig_p2.add_trace(_go.Bar(
-            name="VRS Score", x=[sel_team], y=[ex["seed"]],
+            name="Factor Score", x=[sel_team], y=[ex["seed"]],
             marker_color="#79c0ff", text=[f"{ex['seed']:.0f}"], textposition="auto",
         ))
         h2h_v = ex["h2h_delta"]
@@ -2631,7 +2685,7 @@ elif page == "🔍 Team Breakdown":
             text=[f"{h2h_v:+.1f}"], textposition="auto",
         ))
         fig_p2.update_layout(
-            barmode="relative", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            barmode="stack", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
             font=dict(color="#c9d1d9"), yaxis=dict(gridcolor="#21262d"),
             legend=dict(orientation="h", y=1.18),
             margin=dict(l=10,r=10,t=40,b=10), height=200,
@@ -2661,7 +2715,7 @@ elif page == "🔍 Team Breakdown":
                     f'<td style="padding:4px 7px;color:#8b949e;font-size:11px">{m["date"].strftime("%Y-%m-%d")}</td>' +
                     f'<td style="padding:4px 7px">{res_b}</td>' +
                     f'<td style="padding:4px 7px;color:#c9d1d9;font-size:11px">{m["opponent"]}</td>' +
-                    f'<td style="padding:4px 7px;text-align:center;font-size:11px">{"🖥️" if m.get("is_lan") else "🌐"}</td>' +
+                    f'<td style="padding:4px 7px;text-align:center;font-size:11px">{"🖥️" if (is_win and m.get("is_lan")) else "🌐" if is_win else ""}</td>' +
                     f'<td style="padding:4px 7px">{_bar(m["age_w"],"#f0b429",45)}</td>' +
                     f'<td style="padding:4px 7px;text-align:right">{h2h_c}</td>' +
                     f'</tr>'
@@ -2692,7 +2746,7 @@ elif page == "🔍 Team Breakdown":
     # ═══════════════════════════════════════════════════════════════
 
         @st.cache_data(ttl=3600, show_spinner=False)
-        def _load_team_history(team_name: str, all_dates: list) -> pd.DataFrame:
+        def _load_team_history(team_name: str, all_dates) -> pd.DataFrame:
             rows = []
             for ds, yr in all_dates:
                 gd = load_valve_github_data(ds, yr)
@@ -2719,8 +2773,10 @@ elif page == "🔍 Team Breakdown":
                     })
             return pd.DataFrame(sorted(rows, key=lambda r: r["date"])) if rows else pd.DataFrame()
 
+        # Only include snapshots up to and including the currently selected date
+        _hist_dates = [(ds, yr) for ds, yr in _all_dates if ds <= _sel_date]
         with st.spinner(f"Loading history for {sel_team}…"):
-            hist_df = _load_team_history(sel_team, _all_dates)
+            hist_df = _load_team_history(sel_team, tuple(_hist_dates))
 
         if hist_df.empty:
             st.info(f"No historical data found for {sel_team}.")
@@ -2728,10 +2784,10 @@ elif page == "🔍 Team Breakdown":
             import plotly.graph_objects as _go2
 
             # ── Rank + Score dual-axis chart ─────────────────────────
-            st.markdown("#### 📊 Rank & VRS Score over time")
+            st.markdown("#### 📊 Rank & Factor Score over time")
             fig_dual = _go2.Figure()
 
-            # VRS Score as bars (left axis)
+            # Factor Score as bars (left axis)
             fig_dual.add_trace(_go2.Bar(
                 x=hist_df["date_label"], y=hist_df["total_points"],
                 name="Final Score", marker_color="#79c0ff",
@@ -2748,7 +2804,7 @@ elif page == "🔍 Team Breakdown":
 
             fig_dual.update_layout(
                 yaxis=dict(
-                    title="Final VRS Score",
+                    title="Final Factor Score",
                     gridcolor="#21262d", color="#79c0ff",
                     side="left",
                 ),
@@ -2817,7 +2873,7 @@ elif page == "🔍 Team Breakdown":
                 "bo_factor","bc_factor","on_factor","lan_factor","wins","losses"
             ]].rename(columns={
                 "date_label":"Date","rank":"Rank","total_points":"Final Score",
-                "seed":"VRS Score","h2h_delta":"H2H Δ",
+                "seed":"Factor Score","h2h_delta":"H2H Δ",
                 "bo_factor":"BO","bc_factor":"BC","on_factor":"ON","lan_factor":"LAN",
                 "wins":"W","losses":"L",
             }).sort_values("Date", ascending=False)
