@@ -2999,7 +2999,7 @@ elif page == "🔍 Team Breakdown":
             else:
                 _insight = "➡️ This team is relatively stable — factor decay and normalization largely cancel out."
 
-            # Lerp tooltip data
+            # Lerp context data
             _orig_pool = original_standings["team"].nunique()
             _sim_pool  = base_standings[~base_standings["team"].isin(_sim_dup_teams)]["team"].nunique()
             _dropped   = max(0, _orig_pool - _sim_pool)
@@ -3007,26 +3007,36 @@ elif page == "🔍 Team Breakdown":
             _orig_max_avg = original_standings["seed_combined"].max()
             _lerp_color = "#3fb950" if _pts_lerp > 0 else "#f85149"
 
-            _lerp_tooltip = (
-                f"Lerp Shift = {_pts_lerp:+.0f} pts&#10;&#10;"
-                f"The VRS maps factor averages to [400, 2000] via min-max normalization. "
-                f"When teams drop out of the pool, min/max shift and every remaining team&#39;s score changes.&#10;&#10;"
-                f"Pool: {_orig_pool} → {_sim_pool} ({_dropped} dropped)&#10;"
-                f"min avg: {_orig_min_avg:.4f} → {min_avg:.4f}&#10;"
-                f"max avg: {_orig_max_avg:.4f} → {max_avg:.4f}&#10;&#10;"
-                f"This is not a simulation artifact — Valve does this every month."
-            )
-
             st.markdown(
                 f'<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;'
-                f'padding:12px 16px;font-size:12px;color:#c9d1d9;line-height:1.6;'
-                f'display:flex;align-items:flex-start;gap:10px;">'
-                f'<div style="flex:1">{_insight}</div>'
-                f'<span title="{_lerp_tooltip}" style="cursor:help;font-size:16px;'
-                f'color:#f0b429;flex-shrink:0;line-height:1" aria-label="Lerp Shift info">ⓘ</span>'
-                f'</div>',
+                f'padding:12px 16px;font-size:12px;color:#c9d1d9;line-height:1.6">'
+                f'{_insight}</div>',
                 unsafe_allow_html=True,
             )
+
+            # Lerp Shift expander (collapsible, doesn't take space by default)
+            if abs(_pts_lerp) > 1.0:
+                with st.expander(f"📐 What is the Lerp Shift? ({_pts_lerp:+.0f} pts)"):
+                    st.markdown(f"""
+The VRS maps each team's factor average to a score between **400** and **2000** using min-max normalization.
+The worst eligible team always gets 400, the best always 2000.
+
+**This is not a simulation artifact** — Valve does this every month with the then-current pool.
+But it means that score changes don't just come from a team's own performance.
+""")
+                    st.code(
+                        "Factor Score = 400 + (team_avg − min_avg) / (max_avg − min_avg) × 1600",
+                        language=None,
+                    )
+                    st.markdown(f"""
+When the eligible pool changes (teams drop out due to inactivity or window expiry),
+`min_avg` and `max_avg` shift — and **every team's score shifts with them**.
+""")
+                    lc1, lc2, lc3, lc4 = st.columns(4)
+                    lc1.metric("Pool size", f"{_sim_pool}", f"{-_dropped} teams")
+                    lc2.metric("min avg", f"{min_avg:.4f}", f"{min_avg - _orig_min_avg:+.4f}")
+                    lc3.metric("max avg", f"{max_avg:.4f}", f"{max_avg - _orig_max_avg:+.4f}")
+                    lc4.metric("Lerp effect", f"{_pts_lerp:+.0f} pts")
 
         st.markdown("---")
 
