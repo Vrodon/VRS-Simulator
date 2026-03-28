@@ -1057,15 +1057,6 @@ if page == "📊 Ranking Dashboard":
         st.error("No eligible teams for the selected cutoff window.")
         st.stop()
 
-    # ── Live data fetch attempt ───────────────────────────────────
-    with st.expander("🔴 Live Valve Data — direct from GitHub", expanded=False):
-        live_eu = fetch_live_standings("Europe")
-        if live_eu is not None:
-            st.success("✅ Live Europe standings fetched from Valve's GitHub repo")
-            st.dataframe(live_eu, use_container_width=True)
-        else:
-            st.info("Could not fetch live data (network or rate-limit). Simulator uses built-in dataset below.")
-
     # ── KPI row ───────────────────────────────────────────────────
     top  = base_standings.iloc[0]
     eu   = base_standings[base_standings["region"] == "Europe"].iloc[0]
@@ -1081,8 +1072,19 @@ if page == "📊 Ranking Dashboard":
     st.markdown("---")
 
     # ── Table renderer ────────────────────────────────────────────
+    def factor_bar(value: float, color: str = "#58a6ff", width: int = 60) -> str:
+        """Inline mini progress bar representing a 0–1 factor."""
+        pct = max(0.0, min(1.0, float(value))) * 100
+        return (
+            f'<div style="display:flex;align-items:center;gap:5px;">' +
+            f'<div style="width:{width}px;height:7px;background:#21262d;border-radius:4px;overflow:hidden;">' +
+            f'<div style="width:{pct:.0f}%;height:100%;background:{color};border-radius:4px;"></div></div>' +
+            f'<span style="font-size:11px;color:#8b949e;min-width:32px">{float(value):.3f}</span>' +
+            '</div>'
+        )
+
     def render_table(df: pd.DataFrame, show_all: bool = False):
-        display = df.copy() if show_all else df.head(25)
+        display = df.copy() if show_all else df.head(50)
         rows = []
         for _, row in display.iterrows():
             rk   = int(row["rank"])
@@ -1090,41 +1092,64 @@ if page == "📊 Ranking Dashboard":
             team = row["team"]
             pts  = f'{row["total_points"]:,.1f}'
             seed = f'{row["seed"]:,.1f}'
-            h2h  = row["h2h_delta"]
+            h2h  = float(row["h2h_delta"])
             h2h_s = (f'<span class="change-up">+{h2h:.1f}</span>' if h2h > 0 else
                      f'<span class="change-down">{h2h:.1f}</span>'  if h2h < 0 else
                      '<span class="change-same">0.0</span>')
-            reg  = region_pill(row["region"])
-            rrk  = int(row["regional_rank"])
-            w    = int(row["wins"])
-            l    = int(row["losses"])
+            reg  = region_pill(row.get("region", "Global"))
+            w    = int(row.get("wins", 0))
+            l    = int(row.get("losses", 0))
+            bo   = factor_bar(row.get("bo_factor", 0), "#f0b429")
+            bc   = factor_bar(row.get("bc_factor", 0), "#3fb950")
+            on   = factor_bar(row.get("on_factor", 0), "#79c0ff")
+            lan  = factor_bar(row.get("lan_factor", 0), "#f85149")
             rows.append(f"""
-            <tr>
-              <td style="text-align:center">{rank_badge(rk)}</td>
-              <td>{flag} <strong>{team}</strong></td>
-              <td style="text-align:center">{reg}</td>
-              <td style="text-align:right; color:#58a6ff; font-weight:700">{pts}</td>
-              <td style="text-align:right; color:#79c0ff">{seed}</td>
-              <td style="text-align:right">{h2h_s}</td>
-              <td style="text-align:center; color:#8b949e">{w}W / {l}L</td>
-              <td style="text-align:center; color:#8b949e">{rrk}</td>
+            <tr style="border-bottom:1px solid #21262d;">
+              <td style="padding:6px 4px;text-align:center">{rank_badge(rk)}</td>
+              <td style="padding:6px 4px">{flag} <strong style="color:#e6edf3">{team}</strong></td>
+              <td style="padding:6px 4px;text-align:center">{reg}</td>
+              <td style="padding:6px 8px;text-align:right;color:#58a6ff;font-weight:700;font-size:14px">{pts}</td>
+              <td style="padding:6px 8px;text-align:right;color:#8b949e">{seed}</td>
+              <td style="padding:6px 8px;text-align:right">{h2h_s}</td>
+              <td style="padding:6px 8px">{bo}</td>
+              <td style="padding:6px 8px">{bc}</td>
+              <td style="padding:6px 8px">{on}</td>
+              <td style="padding:6px 8px">{lan}</td>
+              <td style="padding:6px 4px;text-align:center;color:#8b949e;font-size:12px">{w}W/{l}L</td>
             </tr>""")
         st.markdown(f"""
-        <table style="width:100%; border-collapse:collapse; font-size:13px;">
+        <div style="overflow-x:auto">
+        <table style="width:100%;border-collapse:collapse;font-size:13px;">
           <thead>
-            <tr style="background:#21262d; color:#8b949e; font-size:11px; text-transform:uppercase;">
-              <th style="padding:10px 5px; text-align:center">Rank</th>
-              <th style="padding:10px 5px; text-align:left">Team</th>
-              <th style="padding:10px 5px; text-align:center">Region</th>
-              <th style="padding:10px 5px; text-align:right" title="Seed + H2H">Total Pts</th>
-              <th style="padding:10px 5px; text-align:right" title="Seeding score (400-2000)">Seed</th>
-              <th style="padding:10px 5px; text-align:right" title="Glicko H2H adjustment">H2H Δ</th>
-              <th style="padding:10px 5px; text-align:center">Record</th>
-              <th style="padding:10px 5px; text-align:center">Reg. Rank</th>
+            <tr style="background:#161b22;color:#8b949e;font-size:10px;text-transform:uppercase;letter-spacing:.05em;">
+              <th style="padding:9px 4px;text-align:center">Rank</th>
+              <th style="padding:9px 4px;text-align:left">Team</th>
+              <th style="padding:9px 4px;text-align:center">Region</th>
+              <th style="padding:9px 8px;text-align:right" title="Total = Seed + H2H">Total</th>
+              <th style="padding:9px 8px;text-align:right" title="Seeding score 400-2000">Seed</th>
+              <th style="padding:9px 8px;text-align:right" title="Glicko H2H adjustment">H2H Δ</th>
+              <th style="padding:9px 8px;text-align:left" title="Bounty Offered (prize money)">
+                <span style="color:#f0b429">■</span> BO</th>
+              <th style="padding:9px 8px;text-align:left" title="Bounty Collected (opp strength)">
+                <span style="color:#3fb950">■</span> BC</th>
+              <th style="padding:9px 8px;text-align:left" title="Opponent Network">
+                <span style="color:#79c0ff">■</span> ON</th>
+              <th style="padding:9px 8px;text-align:left" title="LAN Wins">
+                <span style="color:#f85149">■</span> LAN</th>
+              <th style="padding:9px 4px;text-align:center">W/L</th>
             </tr>
           </thead>
           <tbody>{"".join(rows)}</tbody>
-        </table>""", unsafe_allow_html=True)
+        </table>
+        </div>
+        <div style="font-size:11px;color:#8b949e;margin-top:6px;padding:4px 0">
+          <span style="color:#f0b429">■ BO</span> Bounty Offered &nbsp;·&nbsp;
+          <span style="color:#3fb950">■ BC</span> Bounty Collected &nbsp;·&nbsp;
+          <span style="color:#79c0ff">■ ON</span> Opponent Network &nbsp;·&nbsp;
+          <span style="color:#f85149">■ LAN</span> LAN Wins &nbsp;·&nbsp;
+          Each bar = 0.000 → 1.000, averaged to produce Seed score
+        </div>
+        """, unsafe_allow_html=True)
 
     tab_gl, tab_eu, tab_am, tab_as = st.tabs(
         ["🌍 Global", "🇪🇺 Europe", "🌎 Americas", "🌏 Asia"])
@@ -1214,7 +1239,7 @@ elif page == "🔮 Scenario Simulator":
         "Uses the full two-phase engine (seed recalculation + H2H) on every simulation."
     )
 
-    all_teams = sorted(TEAM_META.keys())
+    all_teams = sorted(base_standings["team"].tolist()) if not base_standings.empty else sorted(TEAM_META.keys())
 
     if "hyp_matches" not in st.session_state:
         st.session_state.hyp_matches = []
@@ -2266,49 +2291,58 @@ This proportional gap then influences the H2H expected scores in Phase 2.
             </div>""", unsafe_allow_html=True)
 
         with col_r:
-            wex_cutoff = cutoff_dt
-            wex_ws     = wex_cutoff - timedelta(days=DECAY_DAYS)
-            team_m = base_matches[
-                ((base_matches["winner"] == ex_team) |
-                 (base_matches["loser"]  == ex_team)) &
-                (base_matches["date"] >= wex_ws) &
-                (base_matches["date"] <= wex_cutoff)
-            ].copy().sort_values("date", ascending=False)
+            st.markdown("#### Match history (wins, used for factor calculation)")
+            # base_matches from GitHub only contains wins (winner/loser rows)
+            if not base_matches.empty and "winner" in base_matches.columns:
+                wex_cutoff = cutoff_dt
+                wex_ws     = wex_cutoff - timedelta(days=DECAY_DAYS)
+                team_m = base_matches[
+                    (base_matches["winner"] == ex_team) &
+                    (base_matches["date"] >= wex_ws) &
+                    (base_matches["date"] <= wex_cutoff)
+                ].copy().sort_values("date", ascending=False)
 
-            if not team_m.empty:
-                team_m["Result"] = team_m["winner"].apply(
-                    lambda w: "✅ Win" if w == ex_team else "❌ Loss")
-                team_m["Age Wt"] = team_m["date"].apply(
-                    lambda d: age_weight(d, wex_cutoff))
-                team_m["Ev. Stk"] = team_m["prize_pool"].apply(event_stakes)
-                team_m["K_eff"] = team_m.apply(
-                    lambda r: BASE_K * r["Age Wt"], axis=1)
-                team_m["BO contrib"] = team_m.apply(
-                    lambda r: r["winner_prize"] * r["Age Wt"]
-                    if r["winner"] == ex_team else 0.0, axis=1)
+                if not team_m.empty:
+                    team_m["Age Wt"]  = team_m["date"].apply(lambda d: age_weight(d, wex_cutoff))
+                    team_m["Ev.Stk"]  = team_m["prize_pool"].apply(event_stakes)
+                    team_m["H2H K"]   = (BASE_K * team_m["Age Wt"]).round(2)
+                    team_m["BC entry"] = team_m["Ev.Stk"]  # proxy: ev_w (actual opp BO not stored)
 
-                disp = team_m.rename(columns={"date":"Date","event":"Event",
-                                               "prize_pool":"Pool"})[
-                    ["Date","Result","winner","loser","Event","Pool","is_lan",
-                     "Age Wt","Ev. Stk","K_eff","BO contrib"]].copy()
-                disp["Date"]       = disp["Date"].dt.strftime("%Y-%m-%d")
-                disp["Pool"]       = disp["Pool"].apply(lambda x: f"${float(x):,.0f}")
-                disp["Age Wt"]     = disp["Age Wt"].apply(lambda x: f"{x:.3f}")
-                disp["Ev. Stk"]    = disp["Ev. Stk"].apply(lambda x: f"{x:.3f}")
-                disp["K_eff"]      = disp["K_eff"].apply(lambda x: f"{x:.2f}")
-                disp["BO contrib"] = disp["BO contrib"].apply(
-                    lambda x: f"${float(x):,.0f}" if float(x) > 0 else "—")
-                disp.columns = ["Date","Result","Winner","Loser","Event","Pool",
-                                 "LAN","Age Wt","Ev.Stakes","H2H K","BO Contrib"]
-                st.dataframe(disp, use_container_width=True, hide_index=True, height=310)
-                st.caption(
-                    "**Age Wt**: flat 1.0 for ≤30d, then linear · "
-                    "**Ev.Stakes**: curve(pool/$1M), used by BC+ON · "
-                    "**H2H K**: K=32×Age Wt · "
-                    "**BO Contrib**: prize×age (wins only, no event stakes)"
-                )
+                    disp_cols = {
+                        "date":       "Date",
+                        "loser":      "Opponent",
+                        "is_lan":     "LAN",
+                        "prize_pool": "Pool (USD)",
+                        "Age Wt":     "Age Wt",
+                        "Ev.Stk":     "Ev.Stakes",
+                        "H2H K":      "H2H K",
+                    }
+                    disp = team_m[[c for c in disp_cols if c in team_m.columns]].rename(columns=disp_cols)
+                    disp["Date"]     = pd.to_datetime(disp["Date"]).dt.strftime("%Y-%m-%d")
+                    disp["Pool (USD)"] = disp["Pool (USD)"].apply(lambda x: f"${float(x):,.0f}")
+                    disp["Age Wt"]   = disp["Age Wt"].apply(lambda x: f"{x:.3f}")
+                    disp["Ev.Stakes"] = disp["Ev.Stakes"].apply(lambda x: f"{x:.3f}")
+                    st.dataframe(disp, use_container_width=True, hide_index=True, height=310)
+                    st.caption(
+                        f"**{len(team_m)} wins** shown · "
+                        "**Age Wt**: 1.0 for ≤30d, linear decay · "
+                        "**Ev.Stakes**: curve(pool/$1M) used by BC+ON · "
+                        "**H2H K**: 32 × Age Wt"
+                    )
+                else:
+                    st.info("No wins found in the match dataset for this team.")
             else:
-                st.info("No matches in current window.")
+                # Show factor-only summary when no raw matches available
+                st.info("Raw match data not available — factor scores are Valve's published values.")
+                fac_data = {
+                    "Factor": ["Bounty Offered", "Bounty Collected", "Opponent Network", "LAN Wins"],
+                    "Value":  [ex["bo_factor"], ex["bc_factor"], ex["on_factor"], ex["lan_factor"]],
+                    "Weight": ["25%","25%","25%","25%"],
+                    "Contribution": [ex["bo_factor"]*0.25, ex["bc_factor"]*0.25,
+                                     ex["on_factor"]*0.25, ex["lan_factor"]*0.25],
+                }
+                st.dataframe(pd.DataFrame(fac_data).style.format({"Value":"{:.4f}","Contribution":"{:.4f}"}),
+                             use_container_width=True, hide_index=True)
 
         st.markdown("---")
         st.markdown("### ⚔️ Phase 2 Summary")
