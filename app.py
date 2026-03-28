@@ -1182,7 +1182,25 @@ def _simulate_time_decay(
         return {"standings": pd.DataFrame(), "match_h2h": {}}
 
     # ── Factor 1: Bounty Offered (all teams, needed for BC/ON) ────
+    # USE VALVE'S PUBLISHED BO FACTORS FOR ALL TEAMS.
+    #
+    # Rationale: We don't have complete prize-pool data for every team
+    # (the "Top ten winnings" table is only parseable for ~40 teams).
+    # Mixing recalculated BO (with decay) for some teams with original
+    # BO for others creates an apples-to-oranges comparison.
+    #
+    # BO changes minimally over 30 days anyway (big prizes are recent).
+    # The real time-decay effect comes from BC, ON, LAN, and H2H where
+    # we DO have full match-level data and CAN properly shift age weights.
+    #
+    # This keeps the "opponent strength" baseline consistent for all teams.
+    orig_bo_map = standings.drop_duplicates("team").set_index("team")["bo_factor"].to_dict()
+    bo_f: dict[str, float] = {t: orig_bo_map.get(t, 0.0) for t in all_teams}
+
+    # Still compute bo_sum for the selected team's display (where prize data exists)
     bo_sum_new: dict[str, float] = {}
+    _bo_from_prizes = 0
+    _bo_from_fallback = 0
     for t in all_teams:
         prizes = bpm.get(t, [])
         contribs = []
@@ -1194,14 +1212,14 @@ def _simulate_time_decay(
             aw = age_weight(dt, new_cutoff)
             if aw > 0:
                 contribs.append(bp["prize_won"] * aw)
-        bo_sum_new[t] = top_n_sum(contribs, TOP_N)
-
-    sorted_bo = sorted(bo_sum_new.values(), reverse=True)
-    ref5 = sorted_bo[4] if len(sorted_bo) >= 5 else (sorted_bo[-1] if sorted_bo else 1.0)
-    ref5 = max(ref5, 1e-9)
-    bo_f: dict[str, float] = {
-        t: curve(min(1.0, bo_sum_new[t] / ref5)) for t in all_teams
-    }
+        if contribs:
+            bo_sum_new[t] = top_n_sum(contribs, TOP_N)
+            _bo_from_prizes += 1
+        else:
+            # Use original bo_sum for display purposes
+            bo_sum_new[t] = float(standings.loc[standings["team"] == t, "bo_sum"].iloc[0]
+                                  if t in standings["team"].values else 0.0)
+            _bo_from_fallback += 1
 
     # ── Factor 2: Bounty Collected ────────────────────────────────
     bc_f:   dict[str, float] = {}
@@ -1328,7 +1346,8 @@ def _simulate_time_decay(
               .reset_index(drop=True))
     result["rank"] = result.index + 1
     result = add_regional_rank(result)
-    return {"standings": result, "match_h2h": match_h2h}
+    return {"standings": result, "match_h2h": match_h2h,
+            "diag_bo_prizes": _bo_from_prizes, "diag_bo_fallback": _bo_from_fallback}
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1338,6 +1357,8 @@ def _simulate_time_decay(
 sim_active       = False
 sim_cutoff_dt    = None
 sim_match_h2h    = {}           # match_id → {winner, loser, w_delta, l_delta}
+_diag_prizes     = 0
+_diag_fallback   = 0
 original_standings = base_standings.copy()
 
 if sim_enabled:
@@ -1354,8 +1375,10 @@ if sim_enabled:
             base_standings, _snap_dt, sim_cutoff_dt,
         )
 
-    _sim_result  = _sim_out["standings"]
+    _sim_result   = _sim_out["standings"]
     sim_match_h2h = _sim_out["match_h2h"]
+    _diag_prizes  = _sim_out.get("diag_bo_prizes", 0)
+    _diag_fallback = _sim_out.get("diag_bo_fallback", 0)
 
     if not _sim_result.empty:
         original_standings = base_standings.copy()
@@ -1391,8 +1414,8 @@ if sim_active:
                      font-size:11px;font-weight:600">+{_days_fwd} days</span>
       </div>
       <div style="font-size:12px;color:#a78bfa;line-height:1.6;">
-        All factors recomputed with shifted age weights — no new matches assumed.
-        Shows the pure time-decay effect on rankings.<br>
+        BC, ON, LAN, and H2H fully recomputed with shifted age weights — no new matches assumed.<br>
+        BO uses Valve's published factors (consistent baseline; BO changes minimally over 30 days).<br>
         Matches near the old window edge may drop out entirely (age&nbsp;→&nbsp;0).
       </div>
     </div>""", unsafe_allow_html=True)
