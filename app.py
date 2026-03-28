@@ -989,6 +989,17 @@ def add_regional_rank(df: pd.DataFrame) -> pd.DataFrame:
 # ── Discover all available dates first (lightweight, cached 1h) ────
 _all_dates = _find_all_dates()   # [(date_str, year), ...]
 
+# ── Query-param navigation: must run BEFORE sidebar widgets ────────
+# Team links in the dashboard use href="?team=TeamName".
+# We intercept here, before the radio is instantiated, so we can
+# safely pre-set session_state["main_nav"] and rerun.
+_qp_team = st.query_params.get("team", "")
+if _qp_team:
+    st.query_params.clear()
+    st.session_state["main_nav"] = "🔍 Team Breakdown"
+    st.session_state["bd_team"]  = _qp_team
+    st.rerun()
+
 with st.sidebar:
     st.markdown("## 🎯 CS2 VRS Simulator")
     st.markdown("---")
@@ -1122,19 +1133,6 @@ def compute_standings(extra_matches: pd.DataFrame = None, cutoff: datetime = Non
 
 
 # ══════════════════════════════════════════════════════════════════
-# QUERY-PARAM NAVIGATION  (team link → Team Breakdown)
-# ══════════════════════════════════════════════════════════════════
-# Team names in the dashboard table are rendered as ?team=X links.
-# On load, if that param is present we set session state and rerun.
-
-_qp_team = st.query_params.get("team", "")
-if _qp_team and _qp_team in base_standings["team"].values:
-    st.query_params.clear()
-    st.session_state["main_nav"] = "🔍 Team Breakdown"
-    st.session_state["bd_team"]  = _qp_team
-    st.rerun()
-
-# ══════════════════════════════════════════════════════════════════
 # PAGE 1  ·  RANKING DASHBOARD
 # ══════════════════════════════════════════════════════════════════
 
@@ -1208,7 +1206,7 @@ if page == "📊 Ranking Dashboard":
             rows.append(f"""
             <tr style="border-bottom:1px solid #21262d;">
               <td style="padding:6px 4px;text-align:center">{rank_badge(rk)}</td>
-              <td style="padding:6px 4px">{flag} <a href="?team={team}" style="color:#e6edf3;text-decoration:none;font-weight:700" title="Open Team Breakdown">{team}</a></td>
+              <td style="padding:6px 4px">{flag} <a href="?team={team}" target="_self" style="color:#e6edf3;text-decoration:none;font-weight:700;cursor:pointer" title="Open Team Breakdown">{team}</a></td>
               <td style="padding:6px 4px;text-align:center">{reg}</td>
               <td style="padding:6px 8px;text-align:right;color:#58a6ff;font-weight:700;font-size:14px">{pts}</td>
               <td style="padding:6px 8px;text-align:right;color:#8b949e">{seed}</td>
