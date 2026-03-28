@@ -512,29 +512,38 @@ def _gh_get(url: str, timeout: int = 12) -> str | None:
         return None
 
 
-def _find_latest_date() -> tuple[str | None, str | None]:
+@st.cache_data(ttl=3600, show_spinner=False)
+def _find_all_dates() -> list[tuple[str, str]]:
     """
-    Use GitHub API to find the most recent standings date in the repo.
-    Tries 2026 then 2025.  Returns (date_str like "2026_03_02", year).
+    Discover all published VRS standing dates from the GitHub repo.
+    Returns list of (date_str, year) sorted newest-first.
+    e.g. [("2026_03_02","2026"), ("2026_02_03","2026"), ...]
     """
-    for year in ("2026", "2025"):
+    result = []
+    for year in ("2026", "2025", "2024"):
         text = _gh_get(f"{GITHUB_API}/{GH_FOLDER}/{year}")
         if not text:
             continue
         try:
             files = json.loads(text)
-            dates = sorted([
-                _re.search(r"(\d{4}_\d{2}_\d{2})", f["name"]).group(1)
-                for f in files
-                if isinstance(f, dict)
-                and "standings_global" in f.get("name", "")
-                and _re.search(r"\d{4}_\d{2}_\d{2}", f.get("name", ""))
-            ])
-            if dates:
-                return dates[-1], year
+            for f in files:
+                if not isinstance(f, dict):
+                    continue
+                if "standings_global" not in f.get("name", ""):
+                    continue
+                m = _re.search(r"(\d{4}_\d{2}_\d{2})", f.get("name", ""))
+                if m:
+                    result.append((m.group(1), year))
         except Exception:
             pass
-    return None, None
+    result.sort(key=lambda x: x[0], reverse=True)
+    return result
+
+
+def _find_latest_date() -> tuple[str | None, str | None]:
+    """Return the most recent (date_str, year) pair."""
+    dates = _find_all_dates()
+    return (dates[0][0], dates[0][1]) if dates else (None, None)
 
 
 def _parse_standings_index(text: str) -> list[dict]:
@@ -681,33 +690,37 @@ def _parse_detail_md(team: str, rank: int, valve_pts: int, text: str) -> dict:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def load_valve_github_data() -> dict:
+def load_valve_github_data(date_str: str | None = None,
+                            year: str | None = None) -> dict:
     """
-    Main entry point.  Fetches the latest VRS snapshot from GitHub.
+    Fetch a VRS snapshot from GitHub.  If date_str is None, use the latest.
 
     Returns
     -------
     dict with keys:
-        standings        pd.DataFrame   — one row per team, Valve's exact numbers
-        matches          pd.DataFrame   — match-level rows (for simulator)
-        cutoff_date      str            — e.g. "2026_03_02"
-        cutoff_datetime  datetime
-        total_teams      int
-        source           str            — "github" or "fallback"
-        error            str | None
+        standings           pd.DataFrame  — one row per team, Valve exact numbers
+        matches             pd.DataFrame  — win-level rows (for simulator)
+        team_match_history  dict[str, list[dict]]  — all matches per team incl losses
+        cutoff_date         str           — e.g. "2026_03_02"
+        cutoff_datetime     datetime
+        total_teams         int
+        source              str           — "github" or "fallback"
+        error               str | None
     """
     result = {
-        "standings":       pd.DataFrame(),
-        "matches":         pd.DataFrame(),
-        "cutoff_date":     "2026_03_02",
-        "cutoff_datetime": datetime(2026, 3, 2),
-        "total_teams":     0,
-        "source":          "fallback",
-        "error":           None,
+        "standings":          pd.DataFrame(),
+        "matches":            pd.DataFrame(),
+        "team_match_history": {},
+        "cutoff_date":        "2026_03_02",
+        "cutoff_datetime":    datetime(2026, 3, 2),
+        "total_teams":        0,
+        "source":             "fallback",
+        "error":              None,
     }
 
-    # ── Step 1: Find latest date ─────────────────────────────────────
-    date_str, year = _find_latest_date()
+    # ── Step 1: Resolve date ─────────────────────────────────────────
+    if not date_str:
+        date_str, year = _find_latest_date()
     if not date_str:
         result["error"] = "GitHub unreachable — using fallback data"
         return result
@@ -811,14 +824,20 @@ def load_valve_github_data() -> dict:
     except Exception:
         cutoff_dt_p = datetime(2026, 3, 2)
 
+    # ── Build per-team match history (wins + losses, for explainer) ─
+    team_match_history: dict[str, list[dict]] = {
+        d["team"]: d.get("matches", []) for d in parsed
+    }
+
     result.update({
-        "standings":       standings_df,
-        "matches":         matches_df,
-        "cutoff_date":     date_str,
-        "cutoff_datetime": cutoff_dt_p,
-        "total_teams":     len(standings_df),
-        "source":          "github",
-        "error":           None,
+        "standings":          standings_df,
+        "matches":            matches_df,
+        "team_match_history": team_match_history,
+        "cutoff_date":        date_str,
+        "cutoff_datetime":    cutoff_dt_p,
+        "total_teams":        len(standings_df),
+        "source":             "github",
+        "error":              None,
     })
     return result
 
@@ -931,6 +950,9 @@ def add_regional_rank(df: pd.DataFrame) -> pd.DataFrame:
 # SIDEBAR  +  DATA LOADING
 # ══════════════════════════════════════════════════════════════════
 
+# ── Discover all available dates first (lightweight, cached 1h) ────
+_all_dates = _find_all_dates()   # [(date_str, year), ...]
+
 with st.sidebar:
     st.markdown("## 🎯 CS2 VRS Simulator")
     st.markdown("---")
@@ -941,45 +963,64 @@ with st.sidebar:
         "📖 How VRS Works",
     ], label_visibility="collapsed")
     st.markdown("---")
-    st.markdown("**Engine v3.0** · Live GitHub data")
+
+    # ── Historical date selector ──────────────────────────────────
+    if _all_dates:
+        _date_labels = []
+        for ds, yr in _all_dates:
+            try:
+                d_obj = datetime.strptime(ds, "%Y_%m_%d")
+                label = d_obj.strftime("%B %d, %Y")
+            except Exception:
+                label = ds
+            _date_labels.append(label)
+        _date_labels[0] += "  ← latest"
+
+        _sel_label = st.selectbox(
+            "📅 VRS Snapshot",
+            _date_labels,
+            index=0,
+            help="Valve publishes new standings monthly. Select any historical snapshot.",
+        )
+        _sel_idx   = _date_labels.index(_sel_label)
+        _sel_date, _sel_year = _all_dates[_sel_idx]
+    else:
+        # GitHub unreachable — will use fallback
+        _sel_date, _sel_year = None, None
+        st.warning("⚠️ Could not reach GitHub")
+
+    st.markdown("---")
     st.markdown(
-        "📄 [Valve Repo](https://github.com/ValveSoftware/"
-        "counter-strike_regional_standings)"
+        "**Engine v3.0** · Live data · "
+        "[Valve Repo](https://github.com/ValveSoftware/counter-strike_regional_standings)"
     )
 
-# ── Load live data (cached 1 hour) ─────────────────────────────────
+# ── Load selected snapshot (each date cached independently) ────────
 _load_ph = st.empty()
 with _load_ph.container():
-    with st.spinner("⏳ Fetching live VRS data from Valve GitHub…"):
-        _gd = load_valve_github_data()
+    with st.spinner("⏳ Loading VRS data from Valve GitHub…"):
+        _gd = load_valve_github_data(_sel_date, _sel_year)
 
 _load_ph.empty()
 
 if _gd["error"]:
-    st.warning(f"⚠️ Live data unavailable: {_gd['error']}  —  App running on fallback data.")
+    st.warning(f"⚠️ {_gd['error']}")
 
-# Cutoff datetime from the latest ranking date (user can override below)
-_default_cutoff = _gd["cutoff_datetime"]
+cutoff_dt = _gd["cutoff_datetime"]
 
 with st.sidebar:
-    cutoff_date = st.date_input(
-        "📅 Standings Date",
-        value=_default_cutoff.date(),
-        help="Auto-set to the latest Valve ranking date. Change to view historical snapshots.",
-    )
-    cutoff_dt = datetime.combine(cutoff_date, datetime.min.time())
-
     if _gd["source"] == "github":
-        st.success(f"✅ Live data  ·  {_gd['total_teams']} teams  ·  {_gd['cutoff_date']}")
+        st.success(f"✅ {_gd['total_teams']} teams  ·  {_gd['cutoff_date']}")
     else:
-        st.error("❌ GitHub offline — fallback data")
+        st.error("❌ GitHub offline — limited data")
 
 # ══════════════════════════════════════════════════════════════════
 # BASE COMPUTATION
 # ══════════════════════════════════════════════════════════════════
 
-base_standings: pd.DataFrame = _gd["standings"]
-base_matches:   pd.DataFrame = _gd["matches"]
+base_standings:      pd.DataFrame         = _gd["standings"]
+base_matches:        pd.DataFrame         = _gd["matches"]
+team_match_history:  dict                 = _gd.get("team_match_history", {})
 
 # If GitHub load failed, base_standings will be empty
 if base_standings.empty:
@@ -1126,7 +1167,7 @@ if page == "📊 Ranking Dashboard":
               <th style="padding:9px 4px;text-align:left">Team</th>
               <th style="padding:9px 4px;text-align:center">Region</th>
               <th style="padding:9px 8px;text-align:right" title="Total = Seed + H2H">Total</th>
-              <th style="padding:9px 8px;text-align:right" title="Seeding score 400-2000">Seed</th>
+              <th style="padding:9px 8px;text-align:right" title="Starting VRS Points (400-2000)">VRS Pts</th>
               <th style="padding:9px 8px;text-align:right" title="Glicko H2H adjustment">H2H Δ</th>
               <th style="padding:9px 8px;text-align:left" title="Bounty Offered (prize money)">
                 <span style="color:#f0b429">■</span> BO</th>
@@ -1179,11 +1220,11 @@ if page == "📊 Ranking Dashboard":
     col1, col2 = st.columns(2)
 
     with col1:
-        st.subheader("🏆 Top 15 — Seed vs H2H Breakdown")
+        st.subheader("🏆 Top 15 — VRS Points Breakdown")
         top15 = base_standings.head(15).copy()
         fig = go.Figure()
         fig.add_trace(go.Bar(
-            name="Seed (400–2000)", x=top15["team"], y=top15["seed"],
+            name="VRS Pts (400–2000)", x=top15["team"], y=top15["seed"],
             marker_color="#79c0ff",
         ))
         fig.add_trace(go.Bar(
@@ -2248,7 +2289,7 @@ This proportional gap then influences the H2H expected scores in Phase 2.
         c5.metric("📝 Record",      f"{int(ex['wins'])}W / {int(ex['losses'])}L")
 
         st.markdown("---")
-        st.markdown("### 🌱 Phase 1: Factor Scores")
+        st.markdown("### 🌱 Phase 1: Factor Scores → VRS Seed Points")
 
         col_l, col_r = st.columns([2, 3])
         with col_l:
@@ -2285,64 +2326,91 @@ This proportional gap then influences the H2H expected scores in Phase 2.
               <div style="font-size:13px;color:#8b949e">Average = (BO+BC+ON+LAN)/4</div>
               <div style="font-size:26px;font-weight:700;color:#c9d1d9">{combined_val:.4f}</div>
               <div style="font-size:12px;color:#8b949e;margin-top:6px">
-                400 + ({combined_val:.4f} − min) / (max − min) × 1600</div>
+                → VRS Pts = 400 + ({combined_val:.4f} − min) / (max − min) × 1600</div>
               <div style="font-size:30px;font-weight:700;color:#58a6ff;margin-top:4px">
                 Seed = {seed_val:,.1f}</div>
             </div>""", unsafe_allow_html=True)
 
         with col_r:
-            st.markdown("#### Match history (wins, used for factor calculation)")
-            # base_matches from GitHub only contains wins (winner/loser rows)
-            if not base_matches.empty and "winner" in base_matches.columns:
-                wex_cutoff = cutoff_dt
-                wex_ws     = wex_cutoff - timedelta(days=DECAY_DAYS)
-                team_m = base_matches[
-                    (base_matches["winner"] == ex_team) &
-                    (base_matches["date"] >= wex_ws) &
-                    (base_matches["date"] <= wex_cutoff)
-                ].copy().sort_values("date", ascending=False)
+            st.markdown("#### All matches in the 6-month window")
 
-                if not team_m.empty:
-                    team_m["Age Wt"]  = team_m["date"].apply(lambda d: age_weight(d, wex_cutoff))
-                    team_m["Ev.Stk"]  = team_m["prize_pool"].apply(event_stakes)
-                    team_m["H2H K"]   = (BASE_K * team_m["Age Wt"]).round(2)
-                    team_m["BC entry"] = team_m["Ev.Stk"]  # proxy: ev_w (actual opp BO not stored)
+            def _mini_bar(val, color, width=55):
+                pct = max(0.0, min(1.0, float(val))) * 100
+                return (
+                    f'<div style="display:inline-flex;align-items:center;gap:4px;">' +
+                    f'<div style="width:{width}px;height:6px;background:#21262d;border-radius:3px;overflow:hidden;">' +
+                    f'<div style="width:{pct:.0f}%;height:100%;background:{color};border-radius:3px;"></div></div>' +
+                    f'<span style="font-size:11px;color:#8b949e">{float(val):.3f}</span>' +
+                    '</div>'
+                )
 
-                    disp_cols = {
-                        "date":       "Date",
-                        "loser":      "Opponent",
-                        "is_lan":     "LAN",
-                        "prize_pool": "Pool (USD)",
-                        "Age Wt":     "Age Wt",
-                        "Ev.Stk":     "Ev.Stakes",
-                        "H2H K":      "H2H K",
-                    }
-                    disp = team_m[[c for c in disp_cols if c in team_m.columns]].rename(columns=disp_cols)
-                    disp["Date"]     = pd.to_datetime(disp["Date"]).dt.strftime("%Y-%m-%d")
-                    disp["Pool (USD)"] = disp["Pool (USD)"].apply(lambda x: f"${float(x):,.0f}")
-                    disp["Age Wt"]   = disp["Age Wt"].apply(lambda x: f"{x:.3f}")
-                    disp["Ev.Stakes"] = disp["Ev.Stakes"].apply(lambda x: f"{x:.3f}")
-                    st.dataframe(disp, use_container_width=True, hide_index=True, height=310)
-                    st.caption(
-                        f"**{len(team_m)} wins** shown · "
-                        "**Age Wt**: 1.0 for ≤30d, linear decay · "
-                        "**Ev.Stakes**: curve(pool/$1M) used by BC+ON · "
-                        "**H2H K**: 32 × Age Wt"
+            raw_matches = team_match_history.get(ex_team, [])
+            if raw_matches:
+                m_rows_html = []
+                for m in sorted(raw_matches, key=lambda x: x["date"], reverse=True):
+                    is_win = (m["result"] == "W")
+                    res_badge = (
+                        '<span style="background:#1f4a1f;color:#3fb950;border-radius:4px;padding:2px 7px;font-size:11px;font-weight:700">W</span>'
+                        if is_win else
+                        '<span style="background:#4a1f1f;color:#f85149;border-radius:4px;padding:2px 7px;font-size:11px;font-weight:700">L</span>'
                     )
-                else:
-                    st.info("No wins found in the match dataset for this team.")
+                    h2h = m.get("h2h_adj", 0.0)
+                    h2h_cell = (
+                        f'<span style="color:#3fb950;font-weight:700">+{h2h:.1f}</span>'
+                        if h2h > 0 else
+                        f'<span style="color:#f85149;font-weight:700">{h2h:.1f}</span>'
+                        if h2h < 0 else
+                        '<span style="color:#8b949e">0.0</span>'
+                    )
+                    lan_icon = '🖥️' if m.get("is_lan") else '🌐'
+                    age_bar  = _mini_bar(m["age_w"],  "#f0b429")
+                    ev_bar   = _mini_bar(m["ev_w"],   "#79c0ff") if m["ev_w"] > 0 else '<span style="color:#484f58;font-size:11px">—</span>'
+                    m_rows_html.append(f"""<tr style="border-bottom:1px solid #21262d;">
+                      <td style="padding:5px 6px;color:#8b949e;font-size:11px">{m["date"].strftime("%Y-%m-%d")}</td>
+                      <td style="padding:5px 6px">{res_badge}</td>
+                      <td style="padding:5px 6px;color:#c9d1d9">{m["opponent"]}</td>
+                      <td style="padding:5px 6px;text-align:center">{lan_icon}</td>
+                      <td style="padding:5px 6px">{age_bar}</td>
+                      <td style="padding:5px 6px">{ev_bar}</td>
+                      <td style="padding:5px 6px;text-align:right">{h2h_cell}</td>
+                    </tr>""")
+
+                n_wins   = sum(1 for m in raw_matches if m["result"] == "W")
+                n_losses = len(raw_matches) - n_wins
+                total_h2h = sum(m.get("h2h_adj", 0.0) for m in raw_matches)
+                h2h_color = "#3fb950" if total_h2h >= 0 else "#f85149"
+
+                st.markdown(f"""
+                <div style="overflow-y:auto;max-height:320px;border:1px solid #30363d;border-radius:8px;">
+                <table style="width:100%;border-collapse:collapse;font-size:12px;">
+                  <thead style="position:sticky;top:0;background:#161b22;">
+                    <tr style="color:#8b949e;font-size:10px;text-transform:uppercase;">
+                      <th style="padding:7px 6px;text-align:left">Date</th>
+                      <th style="padding:7px 6px">W/L</th>
+                      <th style="padding:7px 6px;text-align:left">Opponent</th>
+                      <th style="padding:7px 6px;text-align:center" title="LAN or Online">Type</th>
+                      <th style="padding:7px 6px;text-align:left" title="Age Weight — recency of match">
+                        <span style="color:#f0b429">●</span> Age Wt</th>
+                      <th style="padding:7px 6px;text-align:left" title="Event Stakes — prize pool weight for BC/ON">
+                        <span style="color:#79c0ff">●</span> Ev.Stk</th>
+                      <th style="padding:7px 6px;text-align:right" title="H2H rating adjustment (Glicko)">H2H Δ pts</th>
+                    </tr>
+                  </thead>
+                  <tbody>{"".join(m_rows_html)}</tbody>
+                </table>
+                </div>
+                <div style="display:flex;justify-content:space-between;margin-top:8px;font-size:12px;color:#8b949e;padding:0 4px;">
+                  <span>{len(raw_matches)} matches  ·  {n_wins}W {n_losses}L</span>
+                  <span>Total H2H Δ: <strong style="color:{h2h_color}">{total_h2h:+.1f} pts</strong></span>
+                </div>
+                <div style="font-size:11px;color:#484f58;margin-top:4px;padding:0 4px;">
+                  <span style="color:#f0b429">● Age Wt</span>: 1.0 for ≤30d, linear decay to 0 at 180d &nbsp;·&nbsp;
+                  <span style="color:#79c0ff">● Ev.Stk</span>: curve(pool/$1M), used by BC+ON &nbsp;·&nbsp;
+                  H2H Δ: Glicko rating shift for this match
+                </div>
+                """, unsafe_allow_html=True)
             else:
-                # Show factor-only summary when no raw matches available
-                st.info("Raw match data not available — factor scores are Valve's published values.")
-                fac_data = {
-                    "Factor": ["Bounty Offered", "Bounty Collected", "Opponent Network", "LAN Wins"],
-                    "Value":  [ex["bo_factor"], ex["bc_factor"], ex["on_factor"], ex["lan_factor"]],
-                    "Weight": ["25%","25%","25%","25%"],
-                    "Contribution": [ex["bo_factor"]*0.25, ex["bc_factor"]*0.25,
-                                     ex["on_factor"]*0.25, ex["lan_factor"]*0.25],
-                }
-                st.dataframe(pd.DataFrame(fac_data).style.format({"Value":"{:.4f}","Contribution":"{:.4f}"}),
-                             use_container_width=True, hide_index=True)
+                st.info("No match data available for this team in the selected snapshot.")
 
         st.markdown("---")
         st.markdown("### ⚔️ Phase 2 Summary")
@@ -2352,7 +2420,7 @@ This proportional gap then influences the H2H expected scores in Phase 2.
         c3.metric("Final Score", f"{ex['total_points']:,.1f}")
 
         fig_fin = go.Figure()
-        fig_fin.add_trace(go.Bar(name="Seed", x=[ex_team], y=[ex["seed"]],
+        fig_fin.add_trace(go.Bar(name="VRS Pts", x=[ex_team], y=[ex["seed"]],
             marker_color="#79c0ff", text=[f"{ex['seed']:.0f}"], textposition="auto"))
         h2h_v = ex["h2h_delta"]
         fig_fin.add_trace(go.Bar(name="H2H Δ", x=[ex_team], y=[h2h_v],
