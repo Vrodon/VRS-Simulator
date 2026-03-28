@@ -1429,23 +1429,24 @@ if page == "📊 Ranking Dashboard":
     if sim_active:
         st.markdown("---")
         st.markdown("### 📉 Time-Decay Impact")
-        _orig_map  = original_standings.set_index("team")
-        _sim_map   = base_standings.set_index("team")
-        _both      = set(_orig_map.index) & set(_sim_map.index)
+        _orig_map  = original_standings.drop_duplicates("team").set_index("team")
+        _sim_map   = base_standings.drop_duplicates("team").set_index("team")
+        _both      = sorted(set(_orig_map.index) & set(_sim_map.index))
 
         _deltas = []
         for t in _both:
-            old_pts  = _orig_map.loc[t, "total_points"]
-            new_pts  = _sim_map.loc[t, "total_points"]
-            old_rank = int(_orig_map.loc[t, "rank"])
-            new_rank = int(_sim_map.loc[t, "rank"])
+            old_pts  = float(_orig_map.at[t, "total_points"])
+            new_pts  = float(_sim_map.at[t, "total_points"])
+            old_rank = int(_orig_map.at[t, "rank"])
+            new_rank = int(_sim_map.at[t, "rank"])
+            flag_v   = _sim_map.at[t, "flag"] if "flag" in _sim_map.columns else "🌍"
             _deltas.append({
                 "team": t,
                 "old_rank": old_rank, "new_rank": new_rank,
                 "rank_delta": old_rank - new_rank,
                 "old_pts": old_pts, "new_pts": new_pts,
                 "pts_delta": new_pts - old_pts,
-                "flag": _sim_map.loc[t, "flag"] if "flag" in _sim_map.columns else "🌍",
+                "flag": flag_v,
             })
         _deltas_df = pd.DataFrame(_deltas).sort_values("pts_delta")
 
