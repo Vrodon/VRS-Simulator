@@ -1162,7 +1162,10 @@ def _simulate_time_decay(
     Returns a new standings DataFrame with recalculated factor scores,
     seeds, and H2H adjustments reflecting the new age weights.
     """
-    all_teams = standings["team"].tolist()
+    # Deduplicate team names (some teams appear 2× due to roster changes)
+    # Keep highest-ranked version for reference data
+    _dedup_std = standings.sort_values("rank").drop_duplicates("team", keep="first")
+    all_teams = _dedup_std["team"].tolist()
     new_window_start = new_cutoff - timedelta(days=DECAY_DAYS)
 
     # ── Eligibility in the new window ─────────────────────────────
@@ -1194,7 +1197,7 @@ def _simulate_time_decay(
     # we DO have full match-level data and CAN properly shift age weights.
     #
     # This keeps the "opponent strength" baseline consistent for all teams.
-    orig_bo_map = standings.drop_duplicates("team").set_index("team")["bo_factor"].to_dict()
+    orig_bo_map = _dedup_std.set_index("team")["bo_factor"].to_dict()
     bo_f: dict[str, float] = {t: orig_bo_map.get(t, 0.0) for t in all_teams}
 
     # Still compute bo_sum for the selected team's display (where prize data exists)
@@ -1217,8 +1220,8 @@ def _simulate_time_decay(
             _bo_from_prizes += 1
         else:
             # Use original bo_sum for display purposes
-            bo_sum_new[t] = float(standings.loc[standings["team"] == t, "bo_sum"].iloc[0]
-                                  if t in standings["team"].values else 0.0)
+            bo_sum_new[t] = float(_dedup_std.loc[_dedup_std["team"] == t, "bo_sum"].iloc[0]
+                                  if t in _dedup_std["team"].values else 0.0)
             _bo_from_fallback += 1
 
     # ── Factor 2: Bounty Collected ────────────────────────────────
@@ -1237,22 +1240,31 @@ def _simulate_time_decay(
         bc_pre[t] = s
         bc_f[t]   = curve(s)
 
-    # ── Factor 3: Opponent Network (iterative) ────────────────────
-    on_f: dict[str, float] = dict(bo_f)   # seed with BO
-    for _ in range(ON_ITERS):
-        new_on: dict[str, float] = {}
-        for t in eligible:
-            entries = []
-            for m in tmh.get(t, []):
-                if m["result"] != "W" or m.get("ev_w", 0) <= 0:
-                    continue
-                if not (new_window_start <= m["date"] <= new_cutoff):
-                    continue
-                aw = age_weight(m["date"], new_cutoff)
-                entries.append(on_f.get(m["opponent"], 0.0) * aw * m["ev_w"])
-            new_on[t] = top_n_sum(entries, TOP_N) / TOP_N
-        on_f.update(new_on)
-    on_final: dict[str, float] = {t: on_f.get(t, 0.0) for t in eligible}
+    # ── Factor 3: Opponent Network ─────────────────────────────────
+    # Use Valve's published ON factors as the network baseline, then
+    # run a SINGLE iteration with new age weights to capture the decay.
+    #
+    # Why not 6 iterations from scratch?
+    # Each iteration contracts values by ~avg(age × ev_stakes).
+    # With the shifted cutoff, this factor is ~0.63 per iteration,
+    # so 6 iterations: 0.63^6 ≈ 0.06 → values collapse to near zero.
+    # Valve's published values are the converged result for the original
+    # window; 1 iteration from those shows the marginal decay effect.
+    orig_on_map = _dedup_std.set_index("team")["on_factor"].to_dict()
+    # Seed: Valve ON for all teams (eligible and ineligible)
+    on_seed: dict[str, float] = {t: orig_on_map.get(t, 0.0) for t in all_teams}
+
+    on_final: dict[str, float] = {}
+    for t in eligible:
+        entries = []
+        for m in tmh.get(t, []):
+            if m["result"] != "W" or m.get("ev_w", 0) <= 0:
+                continue
+            if not (new_window_start <= m["date"] <= new_cutoff):
+                continue
+            aw = age_weight(m["date"], new_cutoff)
+            entries.append(on_seed.get(m["opponent"], 0.0) * aw * m["ev_w"])
+        on_final[t] = top_n_sum(entries, TOP_N) / TOP_N
 
     # ── Factor 4: LAN Wins ────────────────────────────────────────
     lan_f:  dict[str, float] = {}
@@ -1311,9 +1323,9 @@ def _simulate_time_decay(
         match_h2h[mid] = {"winner": w, "loser": l, "w_delta": d_w, "l_delta": d_l}
 
     # ── Build DataFrame ───────────────────────────────────────────
-    region_map = standings.set_index("team")["region"].to_dict()
-    flag_map   = standings.set_index("team")["flag"].to_dict()
-    color_map  = standings.set_index("team")["color"].to_dict()
+    region_map = _dedup_std.set_index("team")["region"].to_dict()
+    flag_map   = _dedup_std.set_index("team")["flag"].to_dict()
+    color_map  = _dedup_std.set_index("team")["color"].to_dict()
 
     records = []
     for t in eligible:
@@ -1384,7 +1396,7 @@ if sim_enabled:
         original_standings = base_standings.copy()
         base_standings     = _sim_result
         # Compute rank delta (positive = climbed, negative = dropped)
-        _orig_rank_map = original_standings.set_index("team")["rank"].to_dict()
+        _orig_rank_map = original_standings.sort_values("rank").drop_duplicates("team", keep="first").set_index("team")["rank"].to_dict()
         base_standings["rank_delta"] = base_standings.apply(
             lambda r: int(_orig_rank_map.get(r["team"], r["rank"])) - int(r["rank"]),
             axis=1,
@@ -1462,8 +1474,8 @@ if page == "📊 Ranking Dashboard":
     if sim_active:
         st.markdown("---")
         st.markdown("### 📉 Time-Decay Impact")
-        _orig_map  = original_standings.drop_duplicates("team").set_index("team")
-        _sim_map   = base_standings.drop_duplicates("team").set_index("team")
+        _orig_map  = original_standings.sort_values("rank").drop_duplicates("team", keep="first").set_index("team")
+        _sim_map   = base_standings.sort_values("rank").drop_duplicates("team", keep="first").set_index("team")
         _both      = sorted(set(_orig_map.index) & set(_sim_map.index))
 
         _deltas = []
@@ -2730,7 +2742,8 @@ elif page == "🔍 Team Breakdown":
     # ── Original values for delta display (sim mode) ──────────────
     _orig_ex = None
     if sim_active and sel_team in original_standings["team"].values:
-        _orig_ex = original_standings[original_standings["team"] == sel_team].iloc[0]
+        _orig_matches = original_standings[original_standings["team"] == sel_team].sort_values("rank")
+        _orig_ex = _orig_matches.iloc[0]
 
     if sim_active:
         st.markdown(
