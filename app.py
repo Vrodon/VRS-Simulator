@@ -1162,10 +1162,20 @@ def _simulate_time_decay(
     Returns a new standings DataFrame with recalculated factor scores,
     seeds, and H2H adjustments reflecting the new age weights.
     """
-    # Deduplicate team names (some teams appear 2× due to roster changes)
-    # Keep highest-ranked version for reference data
-    _dedup_std = standings.sort_values("rank").drop_duplicates("team", keep="first")
-    all_teams = _dedup_std["team"].tolist()
+    # ── Detect duplicate team names (roster changes → 2 entries) ──
+    # These teams have unreliable match history (dict key collision)
+    # so we exclude them from simulation and keep their original values.
+    _name_counts = standings["team"].value_counts()
+    _dup_names   = set(_name_counts[_name_counts > 1].index)
+
+    # Work with deduplicated, non-duplicate teams only
+    _clean_std = standings[~standings["team"].isin(_dup_names)].copy()
+    _clean_std = _clean_std.sort_values("rank").reset_index(drop=True)
+    all_teams  = _clean_std["team"].tolist()
+
+    # Keep ALL original rows for reference data (BO/ON factors)
+    _ref_std = standings.sort_values("rank").drop_duplicates("team", keep="first")
+
     new_window_start = new_cutoff - timedelta(days=DECAY_DAYS)
 
     # ── Eligibility in the new window ─────────────────────────────
@@ -1182,7 +1192,7 @@ def _simulate_time_decay(
         if wins_ct.get(t, 0) > 0 and match_ct.get(t, 0) >= 5
     ]
     if not eligible:
-        return {"standings": pd.DataFrame(), "match_h2h": {}}
+        return {"standings": pd.DataFrame(), "match_h2h": {}, "dup_teams": _dup_names}
 
     # ── Factor 1: Bounty Offered (all teams, needed for BC/ON) ────
     # USE VALVE'S PUBLISHED BO FACTORS FOR ALL TEAMS.
@@ -1197,7 +1207,7 @@ def _simulate_time_decay(
     # we DO have full match-level data and CAN properly shift age weights.
     #
     # This keeps the "opponent strength" baseline consistent for all teams.
-    orig_bo_map = _dedup_std.set_index("team")["bo_factor"].to_dict()
+    orig_bo_map = _ref_std.set_index("team")["bo_factor"].to_dict()
     bo_f: dict[str, float] = {t: orig_bo_map.get(t, 0.0) for t in all_teams}
 
     # Still compute bo_sum for the selected team's display (where prize data exists)
@@ -1220,8 +1230,8 @@ def _simulate_time_decay(
             _bo_from_prizes += 1
         else:
             # Use original bo_sum for display purposes
-            bo_sum_new[t] = float(_dedup_std.loc[_dedup_std["team"] == t, "bo_sum"].iloc[0]
-                                  if t in _dedup_std["team"].values else 0.0)
+            bo_sum_new[t] = float(_ref_std.loc[_ref_std["team"] == t, "bo_sum"].iloc[0]
+                                  if t in _ref_std["team"].values else 0.0)
             _bo_from_fallback += 1
 
     # ── Factor 2: Bounty Collected ────────────────────────────────
@@ -1250,7 +1260,7 @@ def _simulate_time_decay(
     # so 6 iterations: 0.63^6 ≈ 0.06 → values collapse to near zero.
     # Valve's published values are the converged result for the original
     # window; 1 iteration from those shows the marginal decay effect.
-    orig_on_map = _dedup_std.set_index("team")["on_factor"].to_dict()
+    orig_on_map = _ref_std.set_index("team")["on_factor"].to_dict()
     # Seed: Valve ON for all teams (eligible and ineligible)
     on_seed: dict[str, float] = {t: orig_on_map.get(t, 0.0) for t in all_teams}
 
@@ -1323,9 +1333,9 @@ def _simulate_time_decay(
         match_h2h[mid] = {"winner": w, "loser": l, "w_delta": d_w, "l_delta": d_l}
 
     # ── Build DataFrame ───────────────────────────────────────────
-    region_map = _dedup_std.set_index("team")["region"].to_dict()
-    flag_map   = _dedup_std.set_index("team")["flag"].to_dict()
-    color_map  = _dedup_std.set_index("team")["color"].to_dict()
+    region_map = _ref_std.set_index("team")["region"].to_dict()
+    flag_map   = _ref_std.set_index("team")["flag"].to_dict()
+    color_map  = _ref_std.set_index("team")["color"].to_dict()
 
     records = []
     for t in eligible:
@@ -1353,13 +1363,24 @@ def _simulate_time_decay(
             "color":         color_map.get(t, "#58a6ff"),
         })
 
-    result = (pd.DataFrame(records)
-              .sort_values("total_points", ascending=False)
+    result = pd.DataFrame(records)
+
+    # ── Merge back duplicate teams (unchanged original values) ────
+    if _dup_names:
+        dup_rows = standings[standings["team"].isin(_dup_names)].copy()
+        # Ensure dup_rows have all required columns with defaults
+        for col in result.columns:
+            if col not in dup_rows.columns:
+                dup_rows[col] = 0
+        result = pd.concat([result, dup_rows[result.columns]], ignore_index=True)
+
+    result = (result.sort_values("total_points", ascending=False)
               .reset_index(drop=True))
     result["rank"] = result.index + 1
     result = add_regional_rank(result)
     return {"standings": result, "match_h2h": match_h2h,
-            "diag_bo_prizes": _bo_from_prizes, "diag_bo_fallback": _bo_from_fallback}
+            "diag_bo_prizes": _bo_from_prizes, "diag_bo_fallback": _bo_from_fallback,
+            "dup_teams": _dup_names}
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1371,6 +1392,7 @@ sim_cutoff_dt    = None
 sim_match_h2h    = {}           # match_id → {winner, loser, w_delta, l_delta}
 _diag_prizes     = 0
 _diag_fallback   = 0
+_sim_dup_teams   = set()
 original_standings = base_standings.copy()
 
 if sim_enabled:
@@ -1391,6 +1413,7 @@ if sim_enabled:
     sim_match_h2h = _sim_out["match_h2h"]
     _diag_prizes  = _sim_out.get("diag_bo_prizes", 0)
     _diag_fallback = _sim_out.get("diag_bo_fallback", 0)
+    _sim_dup_teams = _sim_out.get("dup_teams", set())
 
     if not _sim_result.empty:
         original_standings = base_standings.copy()
@@ -1398,7 +1421,8 @@ if sim_enabled:
         # Compute rank delta (positive = climbed, negative = dropped)
         _orig_rank_map = original_standings.sort_values("rank").drop_duplicates("team", keep="first").set_index("team")["rank"].to_dict()
         base_standings["rank_delta"] = base_standings.apply(
-            lambda r: int(_orig_rank_map.get(r["team"], r["rank"])) - int(r["rank"]),
+            lambda r: (int(_orig_rank_map.get(r["team"], r["rank"])) - int(r["rank"])
+                       if r["team"] not in _sim_dup_teams else 0),
             axis=1,
         ).astype(int)
         cutoff_dt          = sim_cutoff_dt
@@ -1427,8 +1451,8 @@ if sim_active:
       </div>
       <div style="font-size:12px;color:#a78bfa;line-height:1.6;">
         BC, ON, LAN, and H2H fully recomputed with shifted age weights — no new matches assumed.<br>
-        BO uses Valve's published factors (consistent baseline; BO changes minimally over 30 days).<br>
-        Matches near the old window edge may drop out entirely (age&nbsp;→&nbsp;0).
+        BO uses Valve's published factors (consistent baseline; BO changes minimally over 30 days).
+        {f'<br><span style="color:#8b949e;font-size:11px">{len(_sim_dup_teams)} teams with roster splits excluded from simulation (kept original values): {", ".join(sorted(_sim_dup_teams)[:8])}{"…" if len(_sim_dup_teams) > 8 else ""}</span>' if _sim_dup_teams else ''}
       </div>
     </div>""", unsafe_allow_html=True)
 
@@ -1476,7 +1500,8 @@ if page == "📊 Ranking Dashboard":
         st.markdown("### 📉 Time-Decay Impact")
         _orig_map  = original_standings.sort_values("rank").drop_duplicates("team", keep="first").set_index("team")
         _sim_map   = base_standings.sort_values("rank").drop_duplicates("team", keep="first").set_index("team")
-        _both      = sorted(set(_orig_map.index) & set(_sim_map.index))
+        # Only compare teams that were actually simulated (exclude roster-split teams)
+        _both      = sorted((set(_orig_map.index) & set(_sim_map.index)) - _sim_dup_teams)
 
         _deltas = []
         for t in _both:
