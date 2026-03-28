@@ -6,9 +6,9 @@ Source: https://github.com/ValveSoftware/counter-strike_regional_standings
 
 Architecture
 ────────────
-  Final Score = Seeding Score (400–2000) + Glicko H2H Adjustments
+  Final Score = VRS Score (400–2000) + Glicko H2H Adjustments
 
-Seeding Factors  (Top-10 "bucket" results over a 6-month window)
+VRS Score Factors  (Top-10 "bucket" results over a 6-month window)
   1. Bounty Offered   — scaled prize winnings ÷ 5th-highest normalization
   2. Bounty Collected — sum of opponents' Bounty Offered scores
   3. Opponent Network — distinct opponents beaten × time modifier (top-10)
@@ -609,10 +609,42 @@ def _parse_detail_md(team: str, rank: int, valve_pts: int, text: str) -> dict:
     if m:
         d["seed_combined"] = float(m.group(1))
 
-    # ── BO sum (from BO table header) ───────────────────────────────
+    # ── BO sum + prize table ────────────────────────────────────────
     m = _re.search(r"sum of their top 10 scaled winnings \(\$([\d,]+\.\d+)\)", text)
     if m:
         d["bo_sum"] = float(m.group(1).replace(",", ""))
+
+    # Parse the BO prize rows (table below "Top ten winnings for this roster:")
+    bo_prizes: list[dict] = []
+    in_bo_table = False
+    for line in text.splitlines():
+        if "Top ten winnings for this roster" in line:
+            in_bo_table = True
+            continue
+        if in_bo_table:
+            if not line.strip().startswith("|"):
+                if bo_prizes:   # non-table line after we've collected rows → done
+                    break
+                continue
+            cells = [c.strip() for c in line.split("|")[1:-1]]
+            if len(cells) < 4:
+                continue
+            if "---" in cells[0] or "Event Date" in cells[0]:
+                continue
+            try:
+                ev_date = cells[0]
+                age_w_p = float(cells[1])
+                prize_s = cells[2].replace("$", "").replace(",", "")
+                scaled_s = cells[3].replace("$", "").replace(",", "")
+                bo_prizes.append({
+                    "event_date":     ev_date,
+                    "age_weight":     age_w_p,
+                    "prize_won":      float(prize_s),
+                    "scaled_prize":   float(scaled_s),
+                })
+            except (ValueError, IndexError):
+                continue
+    d["bo_prizes"] = bo_prizes
 
     # ── bc_pre_curve (back-calculate from bc_factor via curve inverse) ─
     bf = d["bc_factor"]
@@ -793,6 +825,8 @@ def load_valve_github_data(date_str: str | None = None,
         "flag":          "🌍",
         "color":         "#58a6ff",
     } for d in parsed]
+    # store bo_prizes per team for explainer page
+    _bo_prizes_map: dict[str, list] = {d["team"]: d.get("bo_prizes", []) for d in parsed}
 
     standings_df = (pd.DataFrame(rows)
                     .sort_values("rank")
@@ -833,6 +867,7 @@ def load_valve_github_data(date_str: str | None = None,
         "standings":          standings_df,
         "matches":            matches_df,
         "team_match_history": team_match_history,
+        "bo_prizes_map":      _bo_prizes_map,
         "cutoff_date":        date_str,
         "cutoff_datetime":    cutoff_dt_p,
         "total_teams":        len(standings_df),
@@ -1006,7 +1041,8 @@ _load_ph.empty()
 if _gd["error"]:
     st.warning(f"⚠️ {_gd['error']}")
 
-cutoff_dt = _gd["cutoff_datetime"]
+cutoff_dt   = _gd["cutoff_datetime"]
+cutoff_date = cutoff_dt   # alias used in page display
 
 with st.sidebar:
     if _gd["source"] == "github":
@@ -1021,6 +1057,7 @@ with st.sidebar:
 base_standings:      pd.DataFrame         = _gd["standings"]
 base_matches:        pd.DataFrame         = _gd["matches"]
 team_match_history:  dict                 = _gd.get("team_match_history", {})
+bo_prizes_map:       dict                 = _gd.get("bo_prizes_map", {})
 
 # If GitHub load failed, base_standings will be empty
 if base_standings.empty:
@@ -1047,7 +1084,7 @@ def compute_standings(extra_matches: pd.DataFrame = None, cutoff: datetime = Non
     For the scenario simulator.
     Starts from Valve's published final scores (exact) and applies
     H2H deltas for any hypothetical extra_matches.
-    Seeding factors (BO/BC/ON/LAN) are held constant from Valve's snapshot.
+    VRS Score factors (BO/BC/ON/LAN) are held constant from Valve's snapshot.
     """
     result = base_standings.copy()
     if extra_matches is None or extra_matches.empty:
@@ -1090,7 +1127,7 @@ if page == "📊 Ranking Dashboard":
     st.title("📊 CS2 Valve Regional Standings")
     st.caption(
         f"Simulated standings · cutoff **{cutoff_date.strftime('%B %d, %Y')}** · "
-        "Two-phase VRS engine (Seed + Glicko H2H) · "
+        "Two-phase VRS engine (VRS Score + Glicko H2H) · "
         "Source: [Valve GitHub](https://github.com/ValveSoftware/counter-strike_regional_standings)"
     )
 
@@ -1166,8 +1203,8 @@ if page == "📊 Ranking Dashboard":
               <th style="padding:9px 4px;text-align:center">Rank</th>
               <th style="padding:9px 4px;text-align:left">Team</th>
               <th style="padding:9px 4px;text-align:center">Region</th>
-              <th style="padding:9px 8px;text-align:right" title="Total = Seed + H2H">Total</th>
-              <th style="padding:9px 8px;text-align:right" title="Starting VRS Points (400-2000)">VRS Pts</th>
+              <th style="padding:9px 8px;text-align:right" title="VRS Score + H2H adjustment">Total</th>
+              <th style="padding:9px 8px;text-align:right" title="VRS Score (400–2000)">VRS Score</th>
               <th style="padding:9px 8px;text-align:right" title="Glicko H2H adjustment">H2H Δ</th>
               <th style="padding:9px 8px;text-align:left" title="Bounty Offered (prize money)">
                 <span style="color:#f0b429">■</span> BO</th>
@@ -1188,7 +1225,7 @@ if page == "📊 Ranking Dashboard":
           <span style="color:#3fb950">■ BC</span> Bounty Collected &nbsp;·&nbsp;
           <span style="color:#79c0ff">■ ON</span> Opponent Network &nbsp;·&nbsp;
           <span style="color:#f85149">■ LAN</span> LAN Wins &nbsp;·&nbsp;
-          Each bar = 0.000 → 1.000, averaged to produce Seed score
+          Each bar = 0.000 → 1.000, averaged to produce VRS Score
         </div>
         """, unsafe_allow_html=True)
 
@@ -1220,11 +1257,11 @@ if page == "📊 Ranking Dashboard":
     col1, col2 = st.columns(2)
 
     with col1:
-        st.subheader("🏆 Top 15 — VRS Points Breakdown")
+        st.subheader("🏆 Top 15 — VRS Score Breakdown")
         top15 = base_standings.head(15).copy()
         fig = go.Figure()
         fig.add_trace(go.Bar(
-            name="VRS Pts (400–2000)", x=top15["team"], y=top15["seed"],
+            name="VRS Score (400–2000)", x=top15["team"], y=top15["seed"],
             marker_color="#79c0ff",
         ))
         fig.add_trace(go.Bar(
@@ -1243,7 +1280,7 @@ if page == "📊 Ranking Dashboard":
         st.plotly_chart(fig, use_container_width=True)
 
     with col2:
-        st.subheader("🕸️ Top 10 — Seeding Factor Radar")
+        st.subheader("🕸️ Top 10 — Factor Radar")
         top10 = base_standings.head(10)
         pillar_cols = ["bo_factor", "bc_factor", "on_factor", "lan_factor"]
         pillar_labels = ["Bounty Offered", "Bounty Collected", "Opp. Network", "LAN Wins"]
@@ -1483,7 +1520,7 @@ elif page == "⚔️ Team Comparison":
     col1, col2 = st.columns(2)
 
     with col1:
-        st.subheader("🕸️ Seeding Factor Radar")
+        st.subheader("🕸️ Factor Radar")
         fig_r = go.Figure()
         fig_r.add_trace(go.Scatterpolar(
             r=a_vals + [a_vals[0]], theta=labels + [labels[0]],
@@ -1633,7 +1670,7 @@ elif page == "📖 How VRS Works":
         "🕸️ Opp. Network",
         "🖥️ LAN Wins",
         "⚔️ H2H (Glicko)",
-        "🌱 Seeding",
+        "🌱 VRS Score",
         "🔍 Worked Example",
     ])
 
@@ -1647,11 +1684,11 @@ The VRS is computed in **two sequential phases** that are simply added together:
 """)
             st.latex(
                 r"\text{Final Score} = "
-                r"\underbrace{\text{Seed}_{[400,\;2000]}}_{\text{Phase 1 — Seeding}} "
+                r"\underbrace{\text{VRS Score}_{[400,\;2000]}}_{\text{Phase 1 — Seeding}} "
                 r"+ \;\underbrace{\Delta_{\text{H2H}}}_{\text{Phase 2 — Head-to-Head}}"
             )
             st.markdown("""
-**Phase 1 — Seeding** asks: *"What is this team's overall quality over the last 6 months?"*
+**Phase 1 — VRS Score** asks: *"What is this team's overall quality over the last 6 months?"*
 
 Four factors are computed, averaged (25% each), and mapped to [400, 2000]. This is the
 team's **starting rank value** for Phase 2.
@@ -1671,9 +1708,9 @@ excluded entirely. Within the window, **age weight** scales contributions contin
             fig = go.Figure()
             nodes = [
                 (0.5, 0.88, "180-day match history", "#21262d", "#8b949e", 13),
-                (0.25, 0.65, "Phase 1\nSeeding\n(4 factors)", "#0d1a2e", "#58a6ff", 14),
+                (0.25, 0.65, "Phase 1\nVRS Score\n(4 factors)", "#0d1a2e", "#58a6ff", 14),
                 (0.75, 0.65, "Phase 2\nHead-to-Head\n(Glicko, chronological)", "#0d1a0d", "#3fb950", 13),
-                (0.5,  0.40, "Seed + H2H Δ", "#1c1c1c", "#c9d1d9", 13),
+                (0.5,  0.40, "VRS Score + H2H Δ", "#1c1c1c", "#c9d1d9", 13),
                 (0.5,  0.17, "Final VRS Score", "#2d1f00", "#f0b429", 15),
             ]
             for x, y, text, bg, fc, fs in nodes:
@@ -2218,7 +2255,7 @@ produce different, incorrect results.
 
     # ══════════════════════════════════════════════════════════════
     with tab_seed:
-        st.subheader("🌱 Phase 1 — Combining Factors → Seed Score")
+        st.subheader("🌱 Phase 1 — Combining Factors → VRS Score")
         st.markdown(
             '<span class="tag-v">✓ VERIFIED — simple average (25% each) confirmed from Vitality data</span>',
             unsafe_allow_html=True,
@@ -2234,7 +2271,7 @@ $$\text{average} = \frac{\text{BO} + \text{BC} + \text{ON} + \text{LAN}}{4}$$
 **Step 2.** Find the minimum and maximum average across all eligible teams.
 
 **Step 3.** Linearly interpolate (lerp) to [400, 2000]:
-$$\text{Seed} = 400 + \frac{\text{average} - \text{avg}_{\min}}{\text{avg}_{\max} - \text{avg}_{\min}} \times 1600$$
+$$\text{VRS Score} = 400 + \frac{\text{average} - \text{avg}_{\min}}{\text{avg}_{\max} - \text{avg}_{\min}} \times 1600$$
 
 The **worst eligible team** always gets seed = **400**.
 The **best eligible team** always gets seed = **2000**.
@@ -2244,7 +2281,7 @@ All others are spaced proportionally between them.
 $$\frac{1.000 + 0.923 + 0.460 + 1.000}{4} = 0.846$$
 
 Since Vitality has the highest average, they are the reference maximum:
-$$\text{Seed} = 400 + \frac{0.846 - 0.000}{0.846 - 0.000} \times 1600 = \mathbf{2000.0} \checkmark$$
+$$\text{VRS Score} = 400 + \frac{0.846 - 0.000}{0.846 - 0.000} \times 1600 = \mathbf{2000.0} \checkmark$$
 """)
         with col_r:
             st.markdown("#### Factor importance — equal weights confirmed")
@@ -2284,12 +2321,12 @@ This proportional gap then influences the H2H expected scores in Phase 2.
         c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("🏆 Rank",       f"#{int(ex['rank'])}")
         c2.metric("🎯 Final Score", f"{ex['total_points']:,.1f}")
-        c3.metric("🌱 Seed",        f"{ex['seed']:,.1f}")
+        c3.metric("🌱 VRS Score",        f"{ex['seed']:,.1f}")
         c4.metric("⚔️ H2H Δ",      f"{ex['h2h_delta']:+.1f}")
         c5.metric("📝 Record",      f"{int(ex['wins'])}W / {int(ex['losses'])}L")
 
         st.markdown("---")
-        st.markdown("### 🌱 Phase 1: Factor Scores → VRS Seed Points")
+        st.markdown("### 🌱 Phase 1: Factor Scores → VRS Score")
 
         col_l, col_r = st.columns([2, 3])
         with col_l:
@@ -2326,9 +2363,9 @@ This proportional gap then influences the H2H expected scores in Phase 2.
               <div style="font-size:13px;color:#8b949e">Average = (BO+BC+ON+LAN)/4</div>
               <div style="font-size:26px;font-weight:700;color:#c9d1d9">{combined_val:.4f}</div>
               <div style="font-size:12px;color:#8b949e;margin-top:6px">
-                → VRS Pts = 400 + ({combined_val:.4f} − min) / (max − min) × 1600</div>
+                → VRS Score = 400 + ({combined_val:.4f} − min) / (max − min) × 1600</div>
               <div style="font-size:30px;font-weight:700;color:#58a6ff;margin-top:4px">
-                Seed = {seed_val:,.1f}</div>
+                VRS Score = {seed_val:,.1f}</div>
             </div>""", unsafe_allow_html=True)
 
         with col_r:
@@ -2412,15 +2449,67 @@ This proportional gap then influences the H2H expected scores in Phase 2.
             else:
                 st.info("No match data available for this team in the selected snapshot.")
 
+
+        # ── BO Prize Table ───────────────────────────────────────────
+        st.markdown("---")
+        st.markdown("### 🏆 Bounty Offered — Prize History")
+        st.markdown(
+            "Top-10 prize winnings used to calculate the **Bounty Offered** factor. "
+            "Each prize is scaled by Age Weight; the sum is compared against the 5th-highest team."
+        )
+        _bo_prizes = bo_prizes_map.get(ex_team, [])
+        if _bo_prizes:
+            _bp_rows = []
+            for i, bp in enumerate(_bo_prizes, 1):
+                age_pct = max(0.0, min(1.0, bp["age_weight"])) * 100
+                age_col = ("#3fb950" if bp["age_weight"] > 0.8
+                           else "#f0b429" if bp["age_weight"] > 0.4 else "#f85149")
+                age_bar = (
+                    f'<div style="display:inline-flex;align-items:center;gap:4px;">' +
+                    f'<div style="width:60px;height:7px;background:#21262d;border-radius:3px;overflow:hidden;">' +
+                    f'<div style="width:{age_pct:.0f}%;height:100%;background:{age_col};border-radius:3px;"></div></div>' +
+                    f'<span style="font-size:11px;color:#8b949e">{bp["age_weight"]:.3f}</span></div>'
+                )
+                _bp_rows.append(
+                    f'<tr style="border-bottom:1px solid #21262d;">' +
+                    f'<td style="padding:6px 8px;color:#8b949e;text-align:center">{i}</td>' +
+                    f'<td style="padding:6px 8px;color:#c9d1d9">{bp["event_date"]}</td>' +
+                    f'<td style="padding:6px 8px;text-align:right;color:#f0b429;font-weight:600">${bp["prize_won"]:,.0f}</td>' +
+                    f'<td style="padding:6px 8px">{age_bar}</td>' +
+                    f'<td style="padding:6px 8px;text-align:right;color:#3fb950;font-weight:700">${bp["scaled_prize"]:,.2f}</td>' +
+                    '</tr>'
+                )
+            _bo_total = sum(b["scaled_prize"] for b in _bo_prizes)
+            st.markdown(
+                '<table style="width:100%;border-collapse:collapse;font-size:13px;">' +
+                '<thead><tr style="background:#161b22;color:#8b949e;font-size:10px;text-transform:uppercase;">' +
+                '<th style="padding:8px;text-align:center">#</th>' +
+                '<th style="padding:8px;text-align:left">Event Date</th>' +
+                '<th style="padding:8px;text-align:right">Prize Won</th>' +
+                '<th style="padding:8px;text-align:left">Age Weight</th>' +
+                '<th style="padding:8px;text-align:right">Scaled (Prize × Age)</th>' +
+                '</tr></thead><tbody>' + "".join(_bp_rows) + '</tbody>' +
+                f'<tfoot><tr style="background:#161b22;border-top:2px solid #30363d;">' +
+                f'<td colspan="4" style="padding:8px;color:#8b949e;font-size:12px">BO Sum (top-10 total)</td>' +
+                f'<td style="padding:8px;text-align:right;color:#f0b429;font-weight:700;font-size:14px">${_bo_total:,.2f}</td>' +
+                '</tr></tfoot></table>' +
+                '<div style="font-size:11px;color:#484f58;margin-top:4px">' +
+                f'BO Sum = ${_bo_total:,.2f} · BO factor = curve(min(1.0, BO Sum / ref₅)) = ' +
+                f'<strong style="color:#f0b429">{ex["bo_factor"]:.4f}</strong></div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.info("Bounty Offered prize data not available for this snapshot.")
+
         st.markdown("---")
         st.markdown("### ⚔️ Phase 2 Summary")
         c1, c2, c3 = st.columns(3)
-        c1.metric("Seed",        f"{ex['seed']:,.1f}")
+        c1.metric("VRS Score",        f"{ex['seed']:,.1f}")
         c2.metric("H2H Δ",       f"{ex['h2h_delta']:+.1f}")
         c3.metric("Final Score", f"{ex['total_points']:,.1f}")
 
         fig_fin = go.Figure()
-        fig_fin.add_trace(go.Bar(name="VRS Pts", x=[ex_team], y=[ex["seed"]],
+        fig_fin.add_trace(go.Bar(name="VRS Score", x=[ex_team], y=[ex["seed"]],
             marker_color="#79c0ff", text=[f"{ex['seed']:.0f}"], textposition="auto"))
         h2h_v = ex["h2h_delta"]
         fig_fin.add_trace(go.Bar(name="H2H Δ", x=[ex_team], y=[h2h_v],
