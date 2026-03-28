@@ -685,6 +685,22 @@ def _parse_detail_md(team: str, rank: int, valve_pts: int, text: str) -> dict:
             is_lan = (lan_s not in ("-", "") and not lan_s.startswith("0"))
             h2h_a  = float(h2h_s) if h2h_s not in ("-", "") else 0.0
 
+            # Extract opponent BO from Bounty Collected column: "0.017 (0.002)"
+            bc_s = cells[7] if len(cells) > 7 else "-"
+            opp_bo = 0.0
+            if bc_s not in ("-", ""):
+                _obo_m = _re.match(r"([\d.]+)", bc_s)
+                if _obo_m:
+                    opp_bo = float(_obo_m.group(1))
+
+            # Extract opponent ON from Opponent Network column: "0.349 (0.050)"
+            on_s = cells[8] if len(cells) > 8 else "-"
+            opp_on = 0.0
+            if on_s not in ("-", ""):
+                _oon_m = _re.match(r"([\d.]+)", on_s)
+                if _oon_m:
+                    opp_on = float(_oon_m.group(1))
+
             # Approximate prize_pool from event_weight (curve inverse)
             if 0 < ev_w <= 1.0:
                 pool = round(10 ** (1.0 - 1.0 / ev_w) * 1_000_000)
@@ -710,6 +726,8 @@ def _parse_detail_md(team: str, rank: int, valve_pts: int, text: str) -> dict:
                 "prize_pool": float(pool),
                 "is_lan":    is_lan,
                 "h2h_adj":   h2h_a,
+                "opp_bo":    opp_bo,
+                "opp_on":    opp_on,
             })
         except (ValueError, IndexError):
             continue
@@ -724,7 +742,7 @@ def _parse_detail_md(team: str, rank: int, valve_pts: int, text: str) -> dict:
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_valve_github_data(date_str: str | None = None,
                             year: str | None = None,
-                            _cache_v: int = 2) -> dict:
+                            _cache_v: int = 3) -> dict:
     """
     Fetch a VRS snapshot from GitHub.  If date_str is None, use the latest.
 
@@ -1236,6 +1254,9 @@ def _simulate_time_decay(
             _bo_from_fallback += 1
 
     # ── Factor 2: Bounty Collected ────────────────────────────────
+    # Use bo_f for opponents in standings; fall back to the per-match
+    # opp_bo parsed from Valve's detail page (covers small teams not
+    # in the published standings).
     bc_f:   dict[str, float] = {}
     bc_pre: dict[str, float] = {}
     for t in eligible:
@@ -1246,7 +1267,8 @@ def _simulate_time_decay(
             if not (new_window_start <= m["date"] <= new_cutoff):
                 continue
             aw = age_weight(m["date"], new_cutoff)
-            entries.append(bo_f.get(m["opponent"], 0.0) * aw * m["ev_w"])
+            opp_bo_val = bo_f.get(m["opponent"], m.get("opp_bo", 0.0))
+            entries.append(opp_bo_val * aw * m["ev_w"])
         s = top_n_sum(entries, TOP_N) / TOP_N
         bc_pre[t] = s
         bc_f[t]   = curve(s)
@@ -1254,15 +1276,8 @@ def _simulate_time_decay(
     # ── Factor 3: Opponent Network ─────────────────────────────────
     # Use Valve's published ON factors as the network baseline, then
     # run a SINGLE iteration with new age weights to capture the decay.
-    #
-    # Why not 6 iterations from scratch?
-    # Each iteration contracts values by ~avg(age × ev_stakes).
-    # With the shifted cutoff, this factor is ~0.63 per iteration,
-    # so 6 iterations: 0.63^6 ≈ 0.06 → values collapse to near zero.
-    # Valve's published values are the converged result for the original
-    # window; 1 iteration from those shows the marginal decay effect.
+    # Fall back to per-match opp_on for opponents not in standings.
     orig_on_map = _ref_std.set_index("team")["on_factor"].to_dict()
-    # Seed: Valve ON for all teams (eligible and ineligible)
     on_seed: dict[str, float] = {t: orig_on_map.get(t, 0.0) for t in all_teams}
 
     on_final: dict[str, float] = {}
@@ -1274,7 +1289,8 @@ def _simulate_time_decay(
             if not (new_window_start <= m["date"] <= new_cutoff):
                 continue
             aw = age_weight(m["date"], new_cutoff)
-            entries.append(on_seed.get(m["opponent"], 0.0) * aw * m["ev_w"])
+            opp_on_val = on_seed.get(m["opponent"], m.get("opp_on", 0.0))
+            entries.append(opp_on_val * aw * m["ev_w"])
         on_final[t] = top_n_sum(entries, TOP_N) / TOP_N
 
     # ── Factor 4: LAN Wins ────────────────────────────────────────
@@ -3104,7 +3120,9 @@ When the eligible pool changes (teams drop out due to inactivity or window expir
         col_bc_l, col_bc_r = st.columns([1, 1])
         bc_matches = [m for m in raw_ms if m["result"] == "W" and m.get("ev_w", 0) > 0]
         bc_entries = sorted(
-            [(opp_bo_map.get(m["opponent"],0.0)*_eff_age(m)*m["ev_w"], m, opp_bo_map.get(m["opponent"],0.0))
+            [((opp_bo_map.get(m["opponent"], m.get("opp_bo", 0.0)))*_eff_age(m)*m["ev_w"],
+              m,
+              opp_bo_map.get(m["opponent"], m.get("opp_bo", 0.0)))
              for m in bc_matches],
             key=lambda x: x[0], reverse=True
         )
@@ -3154,7 +3172,9 @@ When the eligible pool changes (teams drop out due to inactivity or window expir
         col_on_l, col_on_r = st.columns([1, 1])
         on_matches = [m for m in raw_ms if m["result"] == "W" and m.get("ev_w", 0) > 0]
         on_entries = sorted(
-            [(opp_on_map.get(m["opponent"],0.0)*_eff_age(m)*m["ev_w"], m, opp_on_map.get(m["opponent"],0.0))
+            [((opp_on_map.get(m["opponent"], m.get("opp_on", 0.0)))*_eff_age(m)*m["ev_w"],
+              m,
+              opp_on_map.get(m["opponent"], m.get("opp_on", 0.0)))
              for m in on_matches],
             key=lambda x: x[0], reverse=True
         )
