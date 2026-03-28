@@ -1012,6 +1012,14 @@ with st.sidebar:
     ], label_visibility="collapsed", key="main_nav")
     st.markdown("---")
 
+    # ── Simulation toggle ─────────────────────────────────────────
+    sim_enabled = st.toggle(
+        "🔮 Simulate next month",
+        value=False,
+        key="sim_toggle",
+        help="Shift the cutoff forward ~1 month (no new matches). Shows pure time-decay effect on standings.",
+    )
+
     # ── Historical date selector ──────────────────────────────────
     if _all_dates:
         _date_labels = []
@@ -1028,10 +1036,16 @@ with st.sidebar:
             "📅 VRS Snapshot",
             _date_labels,
             index=0,
-            help="Valve publishes new standings monthly. Select any historical snapshot.",
+            disabled=sim_enabled,
+            help=("⚠️ Fixiert auf letzten Snapshot während Simulation."
+                  if sim_enabled else
+                  "Valve publishes new standings monthly. Select any historical snapshot."),
         )
-        _sel_idx   = _date_labels.index(_sel_label)
-        _sel_date, _sel_year = _all_dates[_sel_idx]
+        if sim_enabled:
+            _sel_date, _sel_year = _all_dates[0]
+        else:
+            _sel_idx   = _date_labels.index(_sel_label)
+            _sel_date, _sel_year = _all_dates[_sel_idx]
     else:
         # GitHub unreachable — will use fallback
         _sel_date, _sel_year = None, None
@@ -1058,7 +1072,9 @@ cutoff_dt   = _gd["cutoff_datetime"]
 cutoff_date = cutoff_dt   # alias used in page display
 
 with st.sidebar:
-    if _gd["source"] == "github":
+    if sim_active:
+        st.info(f"🔮 Simulation  ·  {sim_cutoff_dt.strftime('%Y_%m_%d')}")
+    elif _gd["source"] == "github":
         st.success(f"✅ {_gd['total_teams']} teams  ·  {_gd['cutoff_date']}")
     else:
         st.error("❌ GitHub offline — limited data")
@@ -1130,6 +1146,254 @@ def compute_standings(extra_matches: pd.DataFrame = None, cutoff: datetime = Non
     return result
 
 
+# ══════════════════════════════════════════════════════════════════
+# ████████████  TIME-DECAY SIMULATION  █████████████████████████████
+# ══════════════════════════════════════════════════════════════════
+#
+# Recomputes ALL four factors + H2H with a shifted cutoff date.
+# The only thing that changes is the age_weight of each match —
+# no new matches are added.  This shows the pure decay effect.
+# ══════════════════════════════════════════════════════════════════
+
+def _simulate_time_decay(
+    tmh: dict,                   # team_match_history
+    bpm: dict,                   # bo_prizes_map
+    standings: pd.DataFrame,     # current base_standings (for meta)
+    old_cutoff: datetime,
+    new_cutoff: datetime,
+) -> pd.DataFrame:
+    """
+    Full VRS recomputation with a shifted cutoff date.
+
+    Returns a new standings DataFrame with recalculated factor scores,
+    seeds, and H2H adjustments reflecting the new age weights.
+    """
+    all_teams = standings["team"].tolist()
+    new_window_start = new_cutoff - timedelta(days=DECAY_DAYS)
+
+    # ── Eligibility in the new window ─────────────────────────────
+    wins_ct:  dict[str, int] = {}
+    match_ct: dict[str, int] = {}
+    for t in all_teams:
+        ms = tmh.get(t, [])
+        in_w = [m for m in ms if new_window_start <= m["date"] <= new_cutoff]
+        match_ct[t] = len(in_w)
+        wins_ct[t]  = sum(1 for m in in_w if m["result"] == "W")
+
+    eligible = [
+        t for t in all_teams
+        if wins_ct.get(t, 0) > 0 and match_ct.get(t, 0) >= 5
+    ]
+    if not eligible:
+        return pd.DataFrame()
+
+    # ── Factor 1: Bounty Offered (all teams, needed for BC/ON) ────
+    bo_sum_new: dict[str, float] = {}
+    for t in all_teams:
+        prizes = bpm.get(t, [])
+        contribs = []
+        for bp in prizes:
+            try:
+                dt = datetime.strptime(str(bp["event_date"]).strip(), "%Y-%m-%d")
+            except Exception:
+                continue
+            aw = age_weight(dt, new_cutoff)
+            if aw > 0:
+                contribs.append(bp["prize_won"] * aw)
+        bo_sum_new[t] = top_n_sum(contribs, TOP_N)
+
+    sorted_bo = sorted(bo_sum_new.values(), reverse=True)
+    ref5 = sorted_bo[4] if len(sorted_bo) >= 5 else (sorted_bo[-1] if sorted_bo else 1.0)
+    ref5 = max(ref5, 1e-9)
+    bo_f: dict[str, float] = {
+        t: curve(min(1.0, bo_sum_new[t] / ref5)) for t in all_teams
+    }
+
+    # ── Factor 2: Bounty Collected ────────────────────────────────
+    bc_f:   dict[str, float] = {}
+    bc_pre: dict[str, float] = {}
+    for t in eligible:
+        entries = []
+        for m in tmh.get(t, []):
+            if m["result"] != "W" or m.get("ev_w", 0) <= 0:
+                continue
+            if not (new_window_start <= m["date"] <= new_cutoff):
+                continue
+            aw = age_weight(m["date"], new_cutoff)
+            entries.append(bo_f.get(m["opponent"], 0.0) * aw * m["ev_w"])
+        s = top_n_sum(entries, TOP_N) / TOP_N
+        bc_pre[t] = s
+        bc_f[t]   = curve(s)
+
+    # ── Factor 3: Opponent Network (iterative) ────────────────────
+    on_f: dict[str, float] = dict(bo_f)   # seed with BO
+    for _ in range(ON_ITERS):
+        new_on: dict[str, float] = {}
+        for t in eligible:
+            entries = []
+            for m in tmh.get(t, []):
+                if m["result"] != "W" or m.get("ev_w", 0) <= 0:
+                    continue
+                if not (new_window_start <= m["date"] <= new_cutoff):
+                    continue
+                aw = age_weight(m["date"], new_cutoff)
+                entries.append(on_f.get(m["opponent"], 0.0) * aw * m["ev_w"])
+            new_on[t] = top_n_sum(entries, TOP_N) / TOP_N
+        on_f.update(new_on)
+    on_final: dict[str, float] = {t: on_f.get(t, 0.0) for t in eligible}
+
+    # ── Factor 4: LAN Wins ────────────────────────────────────────
+    lan_f:  dict[str, float] = {}
+    lan_ct: dict[str, int]   = {}
+    for t in eligible:
+        lw = [m for m in tmh.get(t, [])
+              if m["result"] == "W" and m.get("is_lan")
+              and new_window_start <= m["date"] <= new_cutoff]
+        lan_ct[t] = len(lw)
+        entries   = [age_weight(m["date"], new_cutoff) for m in lw]
+        lan_f[t]  = top_n_sum(entries, TOP_N) / TOP_N
+
+    # ── Combine → Seed ────────────────────────────────────────────
+    combined: dict[str, float] = {
+        t: (bo_f.get(t, 0) + bc_f.get(t, 0)
+            + on_final.get(t, 0) + lan_f.get(t, 0)) / 4.0
+        for t in eligible
+    }
+    avg_vals = list(combined.values())
+    min_avg  = min(avg_vals)
+    max_avg  = max(avg_vals)
+    span     = max(max_avg - min_avg, 1e-9)
+    seeds: dict[str, float] = {
+        t: lerp(SEED_MIN, SEED_MAX, (combined[t] - min_avg) / span)
+        for t in eligible
+    }
+
+    # ── H2H (chronological) ──────────────────────────────────────
+    ratings: dict[str, float] = {t: seeds[t] for t in eligible}
+    h2h_d:   dict[str, float] = {t: 0.0     for t in eligible}
+
+    seen_ids: set[int] = set()
+    all_ms: list[tuple] = []
+    for t in eligible:
+        for m in tmh.get(t, []):
+            if m["match_id"] in seen_ids or m["result"] != "W":
+                continue
+            if not (new_window_start <= m["date"] <= new_cutoff):
+                continue
+            seen_ids.add(m["match_id"])
+            all_ms.append((m["date"], t, m["opponent"]))
+    all_ms.sort()
+
+    for dt, w, l in all_ms:
+        if w not in ratings or l not in ratings:
+            continue
+        E_w = expected_win(ratings[w], ratings[l])
+        K   = BASE_K * age_weight(dt, new_cutoff)
+        d_w =  K * (1.0 - E_w)
+        d_l = -K * E_w
+        ratings[w] += d_w;  ratings[l] += d_l
+        h2h_d[w]   += d_w;  h2h_d[l]   += d_l
+
+    # ── Build DataFrame ───────────────────────────────────────────
+    region_map = standings.set_index("team")["region"].to_dict()
+    flag_map   = standings.set_index("team")["flag"].to_dict()
+    color_map  = standings.set_index("team")["color"].to_dict()
+
+    records = []
+    for t in eligible:
+        seed = seeds[t]
+        h2h  = h2h_d[t]
+        records.append({
+            "team":          t,
+            "total_points":  round(seed + h2h, 1),
+            "seed":          round(seed, 1),
+            "h2h_delta":     round(h2h, 1),
+            "bo_sum":        round(bo_sum_new.get(t, 0), 2),
+            "bo_factor":     round(bo_f.get(t, 0), 4),
+            "bc_pre_curve":  round(bc_pre.get(t, 0), 4),
+            "bc_factor":     round(bc_f.get(t, 0), 4),
+            "on_factor":     round(on_final.get(t, 0), 4),
+            "on_raw":        round(on_final.get(t, 0), 4),
+            "lan_factor":    round(lan_f.get(t, 0), 4),
+            "lan_wins":      lan_ct.get(t, 0),
+            "seed_combined": round(combined.get(t, 0), 4),
+            "wins":          wins_ct.get(t, 0),
+            "losses":        match_ct.get(t, 0) - wins_ct.get(t, 0),
+            "total_matches": match_ct.get(t, 0),
+            "region":        region_map.get(t, "Global"),
+            "flag":          flag_map.get(t, "🌍"),
+            "color":         color_map.get(t, "#58a6ff"),
+        })
+
+    result = (pd.DataFrame(records)
+              .sort_values("total_points", ascending=False)
+              .reset_index(drop=True))
+    result["rank"] = result.index + 1
+    result = add_regional_rank(result)
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════
+# SIMULATION EXECUTION
+# ══════════════════════════════════════════════════════════════════
+
+sim_active       = False
+sim_cutoff_dt    = None
+original_standings = base_standings.copy()
+
+if sim_enabled:
+    # Compute simulated cutoff: 1st of the month AFTER the snapshot
+    _snap_dt = _gd["cutoff_datetime"]
+    if _snap_dt.month == 12:
+        sim_cutoff_dt = datetime(_snap_dt.year + 1, 1, 1)
+    else:
+        sim_cutoff_dt = datetime(_snap_dt.year, _snap_dt.month + 1, 1)
+
+    with st.spinner("🔮 Recalculating all factors with shifted cutoff…"):
+        _sim_result = _simulate_time_decay(
+            team_match_history, bo_prizes_map,
+            base_standings, _snap_dt, sim_cutoff_dt,
+        )
+
+    if not _sim_result.empty:
+        original_standings = base_standings.copy()
+        base_standings     = _sim_result
+        # Compute rank delta (positive = climbed, negative = dropped)
+        _orig_rank_map = original_standings.set_index("team")["rank"].to_dict()
+        base_standings["rank_delta"] = base_standings.apply(
+            lambda r: int(_orig_rank_map.get(r["team"], r["rank"])) - int(r["rank"]),
+            axis=1,
+        ).astype(int)
+        cutoff_dt          = sim_cutoff_dt
+        cutoff_date        = sim_cutoff_dt
+        sim_active         = True
+
+# ── Simulation banner (shown on all pages) ────────────────────────
+if sim_active:
+    _days_fwd = (sim_cutoff_dt - _gd["cutoff_datetime"]).days
+    # Merge original ranks for quick delta display
+    _orig_rank = original_standings.set_index("team")["rank"].to_dict()
+    _new_top5  = base_standings.head(5)
+    _top5_info = " · ".join(
+        f'**#{int(r["rank"])}** {r["team"]} ({r["total_points"]:,.0f})'
+        for _, r in _new_top5.iterrows()
+    )
+    st.markdown(f"""
+    <div style="background:linear-gradient(135deg,#1a1040,#0d1117);border:1px solid #7c3aed;
+                border-radius:10px;padding:16px 20px;margin-bottom:16px;">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
+        <span style="font-size:22px">🔮</span>
+        <span style="font-size:16px;font-weight:700;color:#c4b5fd;">
+          Simulation: Cutoff → {sim_cutoff_dt.strftime('%B %d, %Y')}</span>
+        <span style="background:#7c3aed;color:#fff;border-radius:12px;padding:2px 10px;
+                     font-size:11px;font-weight:600">+{_days_fwd} days</span>
+      </div>
+      <div style="font-size:12px;color:#a78bfa;line-height:1.6;">
+        All factors recomputed with shifted age weights — no new matches assumed.
+        Shows the pure time-decay effect on rankings.<br>
+        Matches near the old window edge may drop out entirely (age&nbsp;→&nbsp;0).
+      </div>
+    </div>""", unsafe_allow_html=True)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1160,6 +1424,67 @@ if page == "📊 Ranking Dashboard":
     c3.metric("🌎 Americas #1", am["team"],   f'{am["total_points"]:,.0f} pts')
     c4.metric("🌏 Asia #1",     asia["team"], f'{asia["total_points"]:,.0f} pts')
 
+    # ── Simulation impact summary (only when sim is active) ────────
+    if sim_active:
+        st.markdown("---")
+        st.markdown("### 📉 Time-Decay Impact")
+        _orig_map  = original_standings.set_index("team")
+        _sim_map   = base_standings.set_index("team")
+        _both      = set(_orig_map.index) & set(_sim_map.index)
+
+        _deltas = []
+        for t in _both:
+            old_pts  = _orig_map.loc[t, "total_points"]
+            new_pts  = _sim_map.loc[t, "total_points"]
+            old_rank = int(_orig_map.loc[t, "rank"])
+            new_rank = int(_sim_map.loc[t, "rank"])
+            _deltas.append({
+                "team": t,
+                "old_rank": old_rank, "new_rank": new_rank,
+                "rank_delta": old_rank - new_rank,
+                "old_pts": old_pts, "new_pts": new_pts,
+                "pts_delta": new_pts - old_pts,
+                "flag": _sim_map.loc[t, "flag"] if "flag" in _sim_map.columns else "🌍",
+            })
+        _deltas_df = pd.DataFrame(_deltas).sort_values("pts_delta")
+
+        # KPI: average decay, biggest winner/loser
+        avg_decay   = _deltas_df["pts_delta"].mean()
+        biggest_drop = _deltas_df.iloc[0]
+        biggest_rise = _deltas_df.iloc[-1]
+        teams_dropped = int((_deltas_df["rank_delta"] < 0).sum())
+        teams_rose    = int((_deltas_df["rank_delta"] > 0).sum())
+
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("Ø Pts Change", f"{avg_decay:+.1f}")
+        s2.metric("Biggest Drop",
+                  f'{biggest_drop["team"]}',
+                  f'{biggest_drop["pts_delta"]:+.1f} pts')
+        s3.metric("Biggest Rise",
+                  f'{biggest_rise["team"]}',
+                  f'{biggest_rise["pts_delta"]:+.1f} pts')
+        s4.metric("Rank Changes", f"↑{teams_rose}  ↓{teams_dropped}")
+
+        # Top movers bar chart
+        movers = pd.concat([_deltas_df.head(10), _deltas_df.tail(10)]).drop_duplicates("team")
+        movers = movers.sort_values("pts_delta")
+        fig_decay = go.Figure(go.Bar(
+            x=movers["pts_delta"], y=movers["team"], orientation="h",
+            marker_color=["#f85149" if v < 0 else "#3fb950" for v in movers["pts_delta"]],
+            text=[f"{v:+.1f}" for v in movers["pts_delta"]],
+            textposition="outside",
+        ))
+        fig_decay.update_layout(
+            title="Points Change (Top Movers — Simulation vs Actual)",
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            font=dict(color="#c9d1d9"),
+            xaxis=dict(gridcolor="#21262d", title="Δ Points"),
+            yaxis=dict(gridcolor="#21262d"),
+            margin=dict(l=10, r=80, t=40, b=10),
+            height=max(300, len(movers) * 26),
+        )
+        st.plotly_chart(fig_decay, use_container_width=True)
+
     st.markdown("---")
 
     # ── Table renderer ────────────────────────────────────────────
@@ -1186,6 +1511,10 @@ if page == "📊 Ranking Dashboard":
         rows = []
         for _, row in display.iterrows():
             rk   = int(row["rank"])
+            rd   = int(row.get("rank_delta", 0)) if sim_active else 0
+            rd_s = (f' <span class="change-up" style="font-size:10px">▲{rd}</span>' if rd > 0 else
+                    f' <span class="change-down" style="font-size:10px">▼{abs(rd)}</span>' if rd < 0 else
+                    '') if rd != 0 else ''
             flag = row.get("flag", "🌍")
             team = row["team"]
             pts  = f'{row["total_points"]:,.1f}'
@@ -1205,7 +1534,7 @@ if page == "📊 Ranking Dashboard":
             lan  = factor_bar(row.get("lan_factor", 0), "#f85149", max_val=_lan_max)
             rows.append(f"""
             <tr style="border-bottom:1px solid #21262d;">
-              <td style="padding:6px 4px;text-align:center">{rank_badge(rk)}</td>
+              <td style="padding:6px 4px;text-align:center">{rank_badge(rk)}{rd_s}</td>
               <td style="padding:6px 4px">{flag} <a href="?team={team}" target="_self" style="color:#e6edf3;text-decoration:none;font-weight:700;cursor:pointer" title="Open Team Breakdown">{team}</a></td>
               <td style="padding:6px 4px;text-align:center">{reg}</td>
               <td style="padding:6px 8px;text-align:right;color:#58a6ff;font-weight:700;font-size:14px">{pts}</td>
@@ -1261,16 +1590,31 @@ if page == "📊 Ranking Dashboard":
     with tab_eu:
         eu_df = base_standings[base_standings["region"] == "Europe"].reset_index(drop=True)
         eu_df["rank"] = eu_df.index + 1
+        if sim_active:
+            _orig_eu = original_standings[original_standings["region"] == "Europe"].sort_values("total_points", ascending=False).reset_index(drop=True)
+            _orig_eu["rank"] = _orig_eu.index + 1
+            _oem = _orig_eu.set_index("team")["rank"].to_dict()
+            eu_df["rank_delta"] = eu_df.apply(lambda r: int(_oem.get(r["team"], r["rank"])) - int(r["rank"]), axis=1)
         render_table(eu_df, show_all=True)
 
     with tab_am:
         am_df = base_standings[base_standings["region"] == "Americas"].reset_index(drop=True)
         am_df["rank"] = am_df.index + 1
+        if sim_active:
+            _orig_am = original_standings[original_standings["region"] == "Americas"].sort_values("total_points", ascending=False).reset_index(drop=True)
+            _orig_am["rank"] = _orig_am.index + 1
+            _oam = _orig_am.set_index("team")["rank"].to_dict()
+            am_df["rank_delta"] = am_df.apply(lambda r: int(_oam.get(r["team"], r["rank"])) - int(r["rank"]), axis=1)
         render_table(am_df, show_all=True)
 
     with tab_as:
         as_df = base_standings[base_standings["region"] == "Asia"].reset_index(drop=True)
         as_df["rank"] = as_df.index + 1
+        if sim_active:
+            _orig_as = original_standings[original_standings["region"] == "Asia"].sort_values("total_points", ascending=False).reset_index(drop=True)
+            _orig_as["rank"] = _orig_as.index + 1
+            _oas = _orig_as.set_index("team")["rank"].to_dict()
+            as_df["rank_delta"] = as_df.apply(lambda r: int(_oas.get(r["team"], r["rank"])) - int(r["rank"]), axis=1)
         render_table(as_df, show_all=True)
 
     st.markdown("---")
@@ -2347,6 +2691,17 @@ elif page == "🔍 Team Breakdown":
     ex        = base_standings[base_standings["team"] == sel_team].iloc[0]
     raw_ms    = team_match_history.get(sel_team, [])
     bo_prizes = bo_prizes_map.get(sel_team, [])
+
+    if sim_active:
+        st.markdown(
+            '<div style="background:#1a1040;border:1px solid #7c3aed;border-radius:8px;'
+            'padding:10px 14px;font-size:12px;color:#c4b5fd;margin-bottom:12px;">'
+            '🔮 <strong>Simulation active</strong> — Factor scores and rankings reflect the '
+            f'simulated cutoff ({sim_cutoff_dt.strftime("%b %d, %Y")}). '
+            'Match-level tables below show original data; age weights have been recalculated internally.'
+            '</div>',
+            unsafe_allow_html=True,
+        )
 
     # Pre-compute globals needed for calculation boxes
     all_avgs       = base_standings["seed_combined"].tolist()
