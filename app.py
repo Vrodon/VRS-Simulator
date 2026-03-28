@@ -1122,6 +1122,19 @@ def compute_standings(extra_matches: pd.DataFrame = None, cutoff: datetime = Non
 
 
 # ══════════════════════════════════════════════════════════════════
+# QUERY-PARAM NAVIGATION  (team link → Team Breakdown)
+# ══════════════════════════════════════════════════════════════════
+# Team names in the dashboard table are rendered as ?team=X links.
+# On load, if that param is present we set session state and rerun.
+
+_qp_team = st.query_params.get("team", "")
+if _qp_team and _qp_team in base_standings["team"].values:
+    st.query_params.clear()
+    st.session_state["main_nav"] = "🔍 Team Breakdown"
+    st.session_state["bd_team"]  = _qp_team
+    st.rerun()
+
+# ══════════════════════════════════════════════════════════════════
 # PAGE 1  ·  RANKING DASHBOARD
 # ══════════════════════════════════════════════════════════════════
 
@@ -1195,7 +1208,7 @@ if page == "📊 Ranking Dashboard":
             rows.append(f"""
             <tr style="border-bottom:1px solid #21262d;">
               <td style="padding:6px 4px;text-align:center">{rank_badge(rk)}</td>
-              <td style="padding:6px 4px">{flag} <strong style="color:#e6edf3">{team}</strong></td>
+              <td style="padding:6px 4px">{flag} <a href="?team={team}" style="color:#e6edf3;text-decoration:none;font-weight:700" title="Open Team Breakdown">{team}</a></td>
               <td style="padding:6px 4px;text-align:center">{reg}</td>
               <td style="padding:6px 8px;text-align:right;color:#58a6ff;font-weight:700;font-size:14px">{pts}</td>
               <td style="padding:6px 8px;text-align:right;color:#8b949e">{seed}</td>
@@ -1240,65 +1253,27 @@ if page == "📊 Ranking Dashboard":
         </div>
         """, unsafe_allow_html=True)
 
-    def _nav_to_team(team_name: str):
-        """Navigate to Team Breakdown with the given team pre-selected."""
-        st.session_state["main_nav"]  = "🔍 Team Breakdown"
-        st.session_state["bd_team"]   = team_name
-        st.rerun()
-
-    def _click_table(df: pd.DataFrame, tab_key: str):
-        """Render a native st.dataframe below the HTML table for row-click navigation."""
-        click_df = df[["rank","team","total_points","seed","h2h_delta","wins","losses"]].copy()
-        click_df.columns = ["#","Team","Final Score","Factor Score","H2H Δ","W","L"]
-        click_df["Final Score"]  = click_df["Final Score"].round(1)
-        click_df["Factor Score"] = click_df["Factor Score"].round(1)
-        click_df["H2H Δ"]        = click_df["H2H Δ"].round(1)
-        st.caption("👆 Click a row below to open that team's full breakdown:")
-        event = st.dataframe(
-            click_df,
-            use_container_width=True,
-            hide_index=True,
-            on_select="rerun",
-            selection_mode="single-row",
-            key=f"sel_{tab_key}",
-            height=min(400, 35 + len(click_df) * 35),
-        )
-        sel = event.selection.rows
-        if sel:
-            chosen_team = click_df.iloc[sel[0]]["Team"]
-            st.button(
-                f"🔍 Open breakdown for **{chosen_team}**",
-                on_click=_nav_to_team,
-                args=(chosen_team,),
-                key=f"nav_btn_{tab_key}",
-                type="primary",
-            )
-
     tab_gl, tab_eu, tab_am, tab_as = st.tabs(
         ["🌍 Global", "🇪🇺 Europe", "🌎 Americas", "🌏 Asia"])
 
     with tab_gl:
         show_all = st.checkbox("Show all teams", key="chk_global")
         render_table(base_standings, show_all=show_all)
-        _click_table(base_standings if show_all else base_standings.head(50), "gl")
 
     with tab_eu:
         eu_df = base_standings[base_standings["region"] == "Europe"].reset_index(drop=True)
         eu_df["rank"] = eu_df.index + 1
         render_table(eu_df, show_all=True)
-        _click_table(eu_df, "eu")
 
     with tab_am:
         am_df = base_standings[base_standings["region"] == "Americas"].reset_index(drop=True)
         am_df["rank"] = am_df.index + 1
         render_table(am_df, show_all=True)
-        _click_table(am_df, "am")
 
     with tab_as:
         as_df = base_standings[base_standings["region"] == "Asia"].reset_index(drop=True)
         as_df["rank"] = as_df.index + 1
         render_table(as_df, show_all=True)
-        _click_table(as_df, "as")
 
     st.markdown("---")
 
