@@ -472,245 +472,417 @@ def compute_vrs(matches_df: pd.DataFrame, cutoff: datetime = None) -> pd.DataFra
 
 
 # ══════════════════════════════════════════════════════════════════
-# ████████████  SEED DATA  ██████████████████████████████████████████
+# ████████████  GITHUB DATA LOADER  ████████████████████████████████
+# ══════════════════════════════════════════════════════════════════
+#
+# Fetches live data from Valve's public GitHub repo.
+# All 300-400 team detail files are fetched in parallel (20 workers)
+# and cached for 1 hour via @st.cache_data.
+#
+# Data flow:
+#   1. GitHub API  → discover latest standings date
+#   2. standings_global_*.md → get team list + detail file paths  
+#   3. Parallel fetch all detail *.md files (ThreadPoolExecutor)
+#   4. Parse each file:
+#      · Pre-computed factor values (Valve's exact numbers)
+#      · Match history (for H2H simulation)
 # ══════════════════════════════════════════════════════════════════
 
-TEAM_META: dict[str, dict] = {
-    # Europe
-    "Vitality":    {"region": "Europe",   "flag": "🇫🇷", "color": "#F5A623"},
-    "PARIVISION":  {"region": "Europe",   "flag": "🇷🇺", "color": "#E91E63"},
-    "NAVI":        {"region": "Europe",   "flag": "🇺🇦", "color": "#FFD600"},
-    "Spirit":      {"region": "Europe",   "flag": "🇷🇺", "color": "#7B68EE"},
-    "MOUZ":        {"region": "Europe",   "flag": "🇩🇪", "color": "#E53935"},
-    "FaZe":        {"region": "Europe",   "flag": "🌍",  "color": "#EC407A"},
-    "Aurora":      {"region": "Europe",   "flag": "🇷🇺", "color": "#00BCD4"},
-    "G2":          {"region": "Europe",   "flag": "🇪🇸", "color": "#F44336"},
-    "3DMAX":       {"region": "Europe",   "flag": "🇫🇷", "color": "#607D8B"},
-    "Astralis":    {"region": "Europe",   "flag": "🇩🇰", "color": "#1565C0"},
-    "NIP":         {"region": "Europe",   "flag": "🇸🇪", "color": "#1A237E"},
-    "B8":          {"region": "Europe",   "flag": "🇺🇦", "color": "#4CAF50"},
-    "GamerLegion": {"region": "Europe",   "flag": "🇩🇰", "color": "#9C27B0"},
-    "Falcons":     {"region": "Europe",   "flag": "🇸🇦", "color": "#0288D1"},
-    "FUT":         {"region": "Europe",   "flag": "🇹🇷", "color": "#FF9800"},
-    # Americas
-    "FURIA":       {"region": "Americas", "flag": "🇧🇷", "color": "#F5A623"},
-    "Liquid":      {"region": "Americas", "flag": "🇺🇸", "color": "#00B0FF"},
-    "NRG":         {"region": "Americas", "flag": "🇺🇸", "color": "#FF5722"},
-    "M80":         {"region": "Americas", "flag": "🇺🇸", "color": "#78909C"},
-    "Imperial":    {"region": "Americas", "flag": "🇧🇷", "color": "#7B1FA2"},
-    "paiN":        {"region": "Americas", "flag": "🇧🇷", "color": "#D32F2F"},
-    "9z":          {"region": "Americas", "flag": "🇦🇷", "color": "#1976D2"},
-    "Cloud9":      {"region": "Americas", "flag": "🇺🇸", "color": "#29B6F6"},
-    # Asia
-    "MongolZ":     {"region": "Asia",     "flag": "🇲🇳", "color": "#FF6F00"},
-    "TYLOO":       {"region": "Asia",     "flag": "🇨🇳", "color": "#C62828"},
-    "Rare Atom":   {"region": "Asia",     "flag": "🇨🇳", "color": "#00897B"},
-    "ThunderPick": {"region": "Asia",     "flag": "🇦🇺", "color": "#5E35B1"},
-    "Grayhound":   {"region": "Asia",     "flag": "🇦🇺", "color": "#546E7A"},
+import json
+import re as _re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+GITHUB_RAW  = ("https://raw.githubusercontent.com/ValveSoftware/"
+               "counter-strike_regional_standings/refs/heads/main")
+GITHUB_API  = ("https://api.github.com/repos/ValveSoftware/"
+               "counter-strike_regional_standings/contents")
+GH_FOLDER   = "invitation"   # "invitation" = ranked; "live" = continuous
+GH_WORKERS  = 20
+
+
+# ── Internal helpers ───────────────────────────────────────────────
+
+def _gh_get(url: str, timeout: int = 12) -> str | None:
+    """Fetch a URL; return text on 200, else None."""
+    try:
+        r = requests.get(url, timeout=timeout,
+                         headers={"User-Agent": "VRS-Simulator/1.0"})
+        return r.text if r.status_code == 200 else None
+    except Exception:
+        return None
+
+
+def _find_latest_date() -> tuple[str | None, str | None]:
+    """
+    Use GitHub API to find the most recent standings date in the repo.
+    Tries 2026 then 2025.  Returns (date_str like "2026_03_02", year).
+    """
+    for year in ("2026", "2025"):
+        text = _gh_get(f"{GITHUB_API}/{GH_FOLDER}/{year}")
+        if not text:
+            continue
+        try:
+            files = json.loads(text)
+            dates = sorted([
+                _re.search(r"(\d{4}_\d{2}_\d{2})", f["name"]).group(1)
+                for f in files
+                if isinstance(f, dict)
+                and "standings_global" in f.get("name", "")
+                and _re.search(r"\d{4}_\d{2}_\d{2}", f.get("name", ""))
+            ])
+            if dates:
+                return dates[-1], year
+        except Exception:
+            pass
+    return None, None
+
+
+def _parse_standings_index(text: str) -> list[dict]:
+    """
+    Parse standings_global_*.md.
+    Returns list of {rank, points, team, detail_path}.
+    """
+    rows = []
+    for line in text.splitlines():
+        m = _re.match(
+            r"\|\s*(\d+)\s*\|\s*(\d+)\s*\|\s*([^|]+?)\s*"
+            r"\|[^|]*\|\s*\[details\]\(([^)]+)\)",
+            line,
+        )
+        if m:
+            rows.append({
+                "rank":        int(m.group(1)),
+                "points":      int(m.group(2)),
+                "team":        m.group(3).strip(),
+                "detail_path": m.group(4).strip(),
+            })
+    return rows
+
+
+def _parse_detail_md(team: str, rank: int, valve_pts: int, text: str) -> dict:
+    """
+    Parse one team detail markdown file.
+    Extracts pre-computed factor values and match history.
+    """
+    d: dict = {
+        "team": team, "rank": rank, "valve_points": valve_pts,
+        "total_points": float(valve_pts), "seed": float(valve_pts),
+        "h2h_delta": 0.0,
+        "bo_factor": 0.0, "bc_factor": 0.0, "on_factor": 0.0, "lan_factor": 0.0,
+        "seed_combined": 0.0, "bo_sum": 0.0, "bc_pre_curve": 0.0,
+        "wins": 0, "losses": 0, "lan_wins": 0, "total_matches": 0,
+        "matches": [],
+    }
+
+    # ── Score breakdown ─────────────────────────────────────────────
+    m = _re.search(
+        r"Final Rank Value[^(]*\(([-\d.]+)\)[^=]*=.*?"
+        r"Starting Rank Value[^(]*\(([-\d.]+)\).*?"
+        r"Head To Head Adjustments[^(]*\(([-\d.]+)\)",
+        text, _re.DOTALL,
+    )
+    if m:
+        d["total_points"] = float(m.group(1))
+        d["seed"]         = float(m.group(2))
+        d["h2h_delta"]    = float(m.group(3))
+
+    # ── Four factors ────────────────────────────────────────────────
+    for key, label in [
+        ("bo_factor", "Bounty Offered"), ("bc_factor", "Bounty Collected"),
+        ("on_factor", "Opponent Network"), ("lan_factor", "LAN Wins"),
+    ]:
+        m = _re.search(rf"- {label}:\s*([\d.]+)", text)
+        if m:
+            d[key] = float(m.group(1))
+
+    # ── Average (seed_combined) ──────────────────────────────────────
+    m = _re.search(r"average of these factors is ([\d.]+)", text)
+    if m:
+        d["seed_combined"] = float(m.group(1))
+
+    # ── BO sum (from BO table header) ───────────────────────────────
+    m = _re.search(r"sum of their top 10 scaled winnings \(\$([\d,]+\.\d+)\)", text)
+    if m:
+        d["bo_sum"] = float(m.group(1).replace(",", ""))
+
+    # ── bc_pre_curve (back-calculate from bc_factor via curve inverse) ─
+    bf = d["bc_factor"]
+    if 0 < bf < 1.0:
+        try:
+            d["bc_pre_curve"] = round(10 ** (1.0 - 1.0 / bf), 4)
+        except Exception:
+            d["bc_pre_curve"] = bf
+    else:
+        d["bc_pre_curve"] = 1.0 if bf >= 1.0 else 0.0
+
+    # ── Match table ─────────────────────────────────────────────────
+    wins = losses = lan_wins = 0
+    for line in text.splitlines():
+        if not line.strip().startswith("|"):
+            continue
+        cells = [c.strip() for c in line.split("|")[1:-1]]
+        if len(cells) < 11:
+            continue
+        # Must start with a sequence integer
+        if not _re.match(r"^\d+$", cells[0].lstrip("-").strip()):
+            continue
+        try:
+            match_id = int(cells[1])
+            date_s   = cells[2]
+            opponent = cells[3]
+            result   = cells[4]
+            age_w_s  = cells[5]
+            ev_w_s   = cells[6]
+            lan_s    = cells[9]
+            h2h_s    = cells[10]
+
+            if not _re.match(r"\d{4}-\d{2}-\d{2}", date_s):
+                continue
+
+            age_w  = float(age_w_s)
+            ev_w   = float(ev_w_s) if ev_w_s not in ("-", "") else 0.0
+            is_lan = (lan_s not in ("-", ""))
+            h2h_a  = float(h2h_s) if h2h_s not in ("-", "") else 0.0
+
+            # Approximate prize_pool from event_weight (curve inverse)
+            if 0 < ev_w <= 1.0:
+                pool = round(10 ** (1.0 - 1.0 / ev_w) * 1_000_000)
+            else:
+                pool = 0
+
+            dt = datetime.strptime(date_s, "%Y-%m-%d")
+
+            if result == "W":
+                wins += 1
+                if is_lan:
+                    lan_wins += 1
+            else:
+                losses += 1
+
+            d["matches"].append({
+                "match_id":  match_id,
+                "date":      dt,
+                "opponent":  opponent,
+                "result":    result,
+                "age_w":     age_w,
+                "ev_w":      ev_w,
+                "prize_pool": float(pool),
+                "is_lan":    is_lan,
+                "h2h_adj":   h2h_a,
+            })
+        except (ValueError, IndexError):
+            continue
+
+    d["wins"]          = wins
+    d["losses"]        = losses
+    d["lan_wins"]      = lan_wins
+    d["total_matches"] = wins + losses
+    return d
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_valve_github_data() -> dict:
+    """
+    Main entry point.  Fetches the latest VRS snapshot from GitHub.
+
+    Returns
+    -------
+    dict with keys:
+        standings        pd.DataFrame   — one row per team, Valve's exact numbers
+        matches          pd.DataFrame   — match-level rows (for simulator)
+        cutoff_date      str            — e.g. "2026_03_02"
+        cutoff_datetime  datetime
+        total_teams      int
+        source           str            — "github" or "fallback"
+        error            str | None
+    """
+    result = {
+        "standings":       pd.DataFrame(),
+        "matches":         pd.DataFrame(),
+        "cutoff_date":     "2026_03_02",
+        "cutoff_datetime": datetime(2026, 3, 2),
+        "total_teams":     0,
+        "source":          "fallback",
+        "error":           None,
+    }
+
+    # ── Step 1: Find latest date ─────────────────────────────────────
+    date_str, year = _find_latest_date()
+    if not date_str:
+        result["error"] = "GitHub unreachable — using fallback data"
+        return result
+
+    # ── Step 2: Fetch standings index ───────────────────────────────
+    idx_url = f"{GITHUB_RAW}/{GH_FOLDER}/{year}/standings_global_{date_str}.md"
+    idx_text = _gh_get(idx_url)
+    if not idx_text:
+        result["error"] = f"Could not fetch standings index for {date_str}"
+        return result
+
+    teams = _parse_standings_index(idx_text)
+    if not teams:
+        result["error"] = "Standings index parsed 0 teams"
+        return result
+
+    # Also fetch regional standings to get region mapping
+    region_map: dict[str, str] = {}
+    for region_tag, region_label in [
+        ("europe", "Europe"), ("americas", "Americas"),
+        ("asia", "Asia"), ("asia-pacific", "Asia"),
+        ("middle-east", "Middle East"),
+    ]:
+        r_url = f"{GITHUB_RAW}/{GH_FOLDER}/{year}/standings_{region_tag}_{date_str}.md"
+        r_text = _gh_get(r_url)
+        if r_text:
+            for row in _parse_standings_index(r_text):
+                region_map.setdefault(row["team"], region_label)
+
+    # ── Step 3: Parallel-fetch all detail files ───────────────────
+    detail_base = f"{GITHUB_RAW}/{GH_FOLDER}/{year}/"
+
+    def _fetch_one(t: dict) -> tuple[dict, str | None]:
+        return t, _gh_get(detail_base + t["detail_path"])
+
+    parsed: list[dict] = []
+    with ThreadPoolExecutor(max_workers=GH_WORKERS) as ex:
+        futs = {ex.submit(_fetch_one, t): t for t in teams}
+        for fut in as_completed(futs):
+            t, text = fut.result()
+            if text:
+                d = _parse_detail_md(t["team"], t["rank"], t["points"], text)
+                d["region"] = region_map.get(t["team"], "Global")
+                parsed.append(d)
+
+    if not parsed:
+        result["error"] = "Could not parse any detail files"
+        return result
+
+    # ── Step 4: Build standings DataFrame ───────────────────────────
+    rows = [{
+        "team":          d["team"],
+        "rank":          d["rank"],
+        "total_points":  d["total_points"],
+        "seed":          d["seed"],
+        "h2h_delta":     d["h2h_delta"],
+        "bo_factor":     d["bo_factor"],
+        "bc_factor":     d["bc_factor"],
+        "on_factor":     d["on_factor"],
+        "lan_factor":    d["lan_factor"],
+        "bo_sum":        d["bo_sum"],
+        "bc_pre_curve":  d["bc_pre_curve"],
+        "on_raw":        d["on_factor"],
+        "lan_wins":      d["lan_wins"],
+        "seed_combined": d["seed_combined"],
+        "wins":          d["wins"],
+        "losses":        d["losses"],
+        "total_matches": d["total_matches"],
+        "region":        d["region"],
+        "flag":          "🌍",
+        "color":         "#58a6ff",
+    } for d in parsed]
+
+    standings_df = (pd.DataFrame(rows)
+                    .sort_values("rank")
+                    .reset_index(drop=True))
+
+    # ── Step 5: Build match DataFrame (deduplicated) ─────────────────
+    seen: set[int] = set()
+    match_rows = []
+    for d in parsed:
+        for m in d.get("matches", []):
+            mid = m["match_id"]
+            if m["result"] == "W" and mid not in seen:
+                seen.add(mid)
+                match_rows.append({
+                    "date":         m["date"],
+                    "winner":       d["team"],
+                    "loser":        m["opponent"],
+                    "prize_pool":   m["prize_pool"],
+                    "winner_prize": 0.0,
+                    "loser_prize":  0.0,
+                    "is_lan":       m["is_lan"],
+                    "event":        "",
+                })
+
+    matches_df = pd.DataFrame(match_rows) if match_rows else pd.DataFrame()
+
+    try:
+        cutoff_dt_p = datetime.strptime(date_str, "%Y_%m_%d")
+    except Exception:
+        cutoff_dt_p = datetime(2026, 3, 2)
+
+    result.update({
+        "standings":       standings_df,
+        "matches":         matches_df,
+        "cutoff_date":     date_str,
+        "cutoff_datetime": cutoff_dt_p,
+        "total_teams":     len(standings_df),
+        "source":          "github",
+        "error":           None,
+    })
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════
+# TEAM META  —  region / flag / colour (overrides for known teams)
+# ══════════════════════════════════════════════════════════════════
+
+_KNOWN_META: dict[str, dict] = {
+    "Vitality":       {"flag": "🇫🇷", "color": "#F5A623"},
+    "PARIVISION":     {"flag": "🇷🇺", "color": "#E91E63"},
+    "Natus Vincere":  {"flag": "🇺🇦", "color": "#FFD600"},
+    "Spirit":         {"flag": "🇷🇺", "color": "#7B68EE"},
+    "MOUZ":           {"flag": "🇩🇪", "color": "#E53935"},
+    "FaZe":           {"flag": "🌍",  "color": "#EC407A"},
+    "Aurora":         {"flag": "🇷🇺", "color": "#00BCD4"},
+    "G2":             {"flag": "🇪🇸", "color": "#F44336"},
+    "3DMAX":          {"flag": "🇫🇷", "color": "#607D8B"},
+    "Astralis":       {"flag": "🇩🇰", "color": "#1565C0"},
+    "Falcons":        {"flag": "🇸🇦", "color": "#0288D1"},
+    "FURIA":          {"flag": "🇧🇷", "color": "#F5A623"},
+    "Liquid":         {"flag": "🇺🇸", "color": "#00B0FF"},
+    "NRG":            {"flag": "🇺🇸", "color": "#FF5722"},
+    "paiN":           {"flag": "🇧🇷", "color": "#D32F2F"},
+    "The MongolZ":    {"flag": "🇲🇳", "color": "#FF6F00"},
+    "TYLOO":          {"flag": "🇨🇳", "color": "#C62828"},
+    "Rare Atom":      {"flag": "🇨🇳", "color": "#00897B"},
+    "GamerLegion":    {"flag": "🇩🇰", "color": "#9C27B0"},
+    "FUT":            {"flag": "🇹🇷", "color": "#FF9800"},
+    "B8":             {"flag": "🇺🇦", "color": "#4CAF50"},
+    "Gentle Mates":   {"flag": "🇪🇸", "color": "#AB47BC"},
+    "HEROIC":         {"flag": "🇩🇰", "color": "#FF7043"},
+    "Monte":          {"flag": "🇺🇦", "color": "#26C6DA"},
+    "BetBoom":        {"flag": "🇷🇺", "color": "#EF5350"},
+    "MIBR":           {"flag": "🇧🇷", "color": "#43A047"},
+    "9z":             {"flag": "🇦🇷", "color": "#1976D2"},
+    "BC.Game":        {"flag": "🌍",  "color": "#7E57C2"},
+    "Virtus.pro":     {"flag": "🇷🇺", "color": "#FF8F00"},
 }
 
-# Prize placement splits (winner's share of total pool)
-PRIZE_SPLITS = {1: 0.35, 2: 0.20, 3: 0.12, 4: 0.08,
-                5: 0.05, 6: 0.04, 7: 0.03, 8: 0.02}
-
-
-def placement_prize(pool: float, place: int) -> float:
-    return pool * PRIZE_SPLITS.get(place, 0.01)
-
-
-# Event catalogue  —  (name, prize_pool_usd, is_lan, date_str)
-EVENT_LIST = [
-    ("IEM Krakow 2026",           1_000_000, True,  "2026-01-22"),
-    ("PGL Cluj-Napoca 2026",      1_000_000, True,  "2026-02-16"),
-    ("ESL Pro League S21",          750_000, True,  "2026-01-10"),
-    ("BLAST Bounty S1 Finals",      500_000, True,  "2025-12-18"),
-    ("BLAST Premier Fall 2025",     500_000, True,  "2025-11-08"),
-    ("IEM Dallas 2025",           1_000_000, True,  "2025-10-12"),
-    ("PGL Astana 2025",           1_000_000, True,  "2025-09-20"),
-    ("BLAST Open Rotterdam 2026",   250_000, True,  "2026-03-14"),
-    ("CCT Season 3 EU Finals",      200_000, False, "2026-02-02"),
-    ("ESL Challenger S47",          100_000, False, "2026-01-05"),
-    ("Fragadelphia Miami 2026",      50_000, True,  "2026-01-12"),
-    ("ESEA Premier S52 AM",          30_000, False, "2025-12-05"),
-    ("ESL Challenger AM S47",        80_000, False, "2025-11-20"),
-    ("PGL Wallachia S4",            200_000, True,  "2025-10-28"),
-    ("IEM Sydney 2025",             250_000, True,  "2025-09-05"),
+# Colour palette for teams not in the known list (cycles)
+_COLOR_CYCLE = [
+    "#58a6ff","#3fb950","#f0b429","#f85149","#79c0ff",
+    "#56d364","#e3b341","#ff7b72","#bc8cff","#39c5cf",
 ]
-
-_EVENT_LOOKUP = {name: (pool, lan, date) for name, pool, lan, date in EVENT_LIST}
-
-
-def _match(winner, loser, event_name, w_place, l_place):
-    """Helper to build a single match record dict."""
-    pool, lan, date_str = _EVENT_LOOKUP[event_name]
-    base = datetime.strptime(date_str, "%Y-%m-%d")
-    # Stagger by place so final rounds are a few days after group stage
-    return dict(
-        date=base + timedelta(days=max(w_place, l_place)),
-        winner=winner, loser=loser, event=event_name,
-        prize_pool=float(pool),
-        winner_prize=placement_prize(pool, w_place),
-        loser_prize=placement_prize(pool, l_place),
-        is_lan=lan,
-    )
+_color_idx = 0
 
 
-@st.cache_data
-def generate_seed_matches() -> pd.DataFrame:
-    """
-    Realistic match history producing VRS standings close to the
-    real-world March 2026 snapshot.
-    """
-    M = _match  # alias for brevity
+def get_team_meta(team: str, region: str = "Global") -> dict:
+    """Return {flag, color, region} for any team name."""
+    global _color_idx
+    known = _KNOWN_META.get(team, {})
+    flag  = known.get("flag", "🌍")
+    color = known.get("color", _COLOR_CYCLE[_color_idx % len(_COLOR_CYCLE)])
+    if team not in _KNOWN_META:
+        _color_idx += 1
+    return {"flag": flag, "color": color, "region": region}
 
-    blueprints = [
-        # ─── IEM Krakow 2026  (Jan 2026, $1M LAN) ──────────────────
-        M("Vitality",   "PARIVISION", "IEM Krakow 2026", 1, 2),
-        M("Vitality",   "NAVI",       "IEM Krakow 2026", 1, 3),
-        M("PARIVISION", "NAVI",       "IEM Krakow 2026", 2, 3),
-        M("PARIVISION", "Spirit",     "IEM Krakow 2026", 2, 4),
-        M("NAVI",       "Falcons",    "IEM Krakow 2026", 3, 5),
-        M("Spirit",     "Falcons",    "IEM Krakow 2026", 4, 5),
-        M("Spirit",     "MOUZ",       "IEM Krakow 2026", 4, 6),
-        M("Falcons",    "MOUZ",       "IEM Krakow 2026", 5, 6),
-        M("MOUZ",       "G2",         "IEM Krakow 2026", 6, 7),
-        M("G2",         "Aurora",     "IEM Krakow 2026", 7, 8),
-        M("FURIA",      "Liquid",     "IEM Krakow 2026", 7, 8),
 
-        # ─── PGL Cluj-Napoca 2026  (Feb 2026, $1M LAN) ─────────────
-        M("Vitality",   "PARIVISION", "PGL Cluj-Napoca 2026", 1, 2),
-        M("Vitality",   "Falcons",    "PGL Cluj-Napoca 2026", 1, 4),
-        M("PARIVISION", "NAVI",       "PGL Cluj-Napoca 2026", 2, 3),
-        M("PARIVISION", "Falcons",    "PGL Cluj-Napoca 2026", 2, 4),
-        M("NAVI",       "Spirit",     "PGL Cluj-Napoca 2026", 3, 5),
-        M("Falcons",    "Aurora",     "PGL Cluj-Napoca 2026", 4, 6),
-        M("Spirit",     "FaZe",       "PGL Cluj-Napoca 2026", 5, 7),
-        M("Aurora",     "B8",         "PGL Cluj-Napoca 2026", 6, 8),
-        M("FURIA",      "Liquid",     "PGL Cluj-Napoca 2026", 7, 8),
-
-        # ─── ESL Pro League S21  (Jan 2026, $750k LAN) ─────────────
-        M("NAVI",      "G2",          "ESL Pro League S21", 1, 2),
-        M("G2",        "MOUZ",        "ESL Pro League S21", 2, 3),
-        M("MOUZ",      "FaZe",        "ESL Pro League S21", 3, 4),
-        M("FaZe",      "Astralis",    "ESL Pro League S21", 4, 5),
-        M("Astralis",  "3DMAX",       "ESL Pro League S21", 5, 6),
-        M("3DMAX",     "NIP",         "ESL Pro League S21", 6, 7),
-        M("FURIA",     "NRG",         "ESL Pro League S21", 1, 2),
-        M("NRG",       "Liquid",      "ESL Pro League S21", 2, 3),
-        M("Liquid",    "M80",         "ESL Pro League S21", 3, 4),
-        M("MongolZ",   "TYLOO",       "ESL Pro League S21", 1, 2),
-        M("TYLOO",     "Rare Atom",   "ESL Pro League S21", 2, 3),
-
-        # ─── BLAST Bounty S1 Finals  (Dec 2025, $500k LAN) ─────────
-        M("PARIVISION","Vitality",    "BLAST Bounty S1 Finals", 1, 2),
-        M("Vitality",  "Falcons",     "BLAST Bounty S1 Finals", 2, 3),
-        M("Falcons",   "NAVI",        "BLAST Bounty S1 Finals", 3, 4),
-        M("NAVI",      "FaZe",        "BLAST Bounty S1 Finals", 4, 5),
-        M("FaZe",      "Spirit",      "BLAST Bounty S1 Finals", 5, 6),
-        M("Spirit",    "MOUZ",        "BLAST Bounty S1 Finals", 6, 7),
-        M("FURIA",     "Liquid",      "BLAST Bounty S1 Finals", 5, 6),
-        M("MongolZ",   "TYLOO",       "BLAST Bounty S1 Finals", 3, 4),
-
-        # ─── BLAST Premier Fall 2025  (Nov 2025, $500k LAN) ────────
-        M("Spirit",    "MOUZ",        "BLAST Premier Fall 2025", 1, 2),
-        M("MOUZ",      "FaZe",        "BLAST Premier Fall 2025", 2, 3),
-        M("FaZe",      "G2",          "BLAST Premier Fall 2025", 3, 4),
-        M("G2",        "Astralis",    "BLAST Premier Fall 2025", 4, 5),
-        M("Astralis",  "NAVI",        "BLAST Premier Fall 2025", 5, 6),
-        M("NAVI",      "Vitality",    "BLAST Premier Fall 2025", 6, 7),
-        M("Vitality",  "3DMAX",       "BLAST Premier Fall 2025", 7, 8),
-        M("FURIA",     "Liquid",      "BLAST Premier Fall 2025", 1, 2),
-        M("Liquid",    "NRG",         "BLAST Premier Fall 2025", 2, 3),
-        M("MongolZ",   "TYLOO",       "BLAST Premier Fall 2025", 1, 2),
-        M("TYLOO",     "Rare Atom",   "BLAST Premier Fall 2025", 2, 3),
-
-        # ─── IEM Dallas 2025  (Oct 2025, $1M LAN) ──────────────────
-        M("Spirit",    "NAVI",        "IEM Dallas 2025", 1, 2),
-        M("NAVI",      "Vitality",    "IEM Dallas 2025", 2, 3),
-        M("Vitality",  "FaZe",        "IEM Dallas 2025", 3, 4),
-        M("FaZe",      "MOUZ",        "IEM Dallas 2025", 4, 5),
-        M("MOUZ",      "G2",          "IEM Dallas 2025", 5, 6),
-        M("G2",        "Aurora",      "IEM Dallas 2025", 6, 7),
-        M("FURIA",     "Liquid",      "IEM Dallas 2025", 1, 2),
-        M("Liquid",    "NRG",         "IEM Dallas 2025", 2, 3),
-        M("NRG",       "M80",         "IEM Dallas 2025", 3, 4),
-        M("MongolZ",   "Rare Atom",   "IEM Dallas 2025", 1, 2),
-        M("TYLOO",     "ThunderPick", "IEM Dallas 2025", 3, 4),
-
-        # ─── PGL Astana 2025  (Sep 2025, $1M LAN – near decay edge) ─
-        M("MOUZ",      "Spirit",      "PGL Astana 2025", 1, 2),
-        M("Spirit",    "NAVI",        "PGL Astana 2025", 2, 3),
-        M("NAVI",      "G2",          "PGL Astana 2025", 3, 4),
-        M("G2",        "FaZe",        "PGL Astana 2025", 4, 5),
-        M("FaZe",      "Falcons",     "PGL Astana 2025", 5, 6),
-        M("FURIA",     "NRG",         "PGL Astana 2025", 1, 2),
-        M("NRG",       "Liquid",      "PGL Astana 2025", 2, 3),
-        M("MongolZ",   "TYLOO",       "PGL Astana 2025", 1, 2),
-        M("Rare Atom", "ThunderPick", "PGL Astana 2025", 3, 4),
-
-        # ─── BLAST Open Rotterdam 2026  (Mar 2026, $250k LAN) ──────
-        M("Vitality",   "PARIVISION", "BLAST Open Rotterdam 2026", 1, 4),
-        M("NAVI",       "Spirit",     "BLAST Open Rotterdam 2026", 2, 3),
-        M("Spirit",     "Aurora",     "BLAST Open Rotterdam 2026", 3, 5),
-        M("MongolZ",    "TYLOO",      "BLAST Open Rotterdam 2026", 1, 6),
-        M("FURIA",      "NRG",        "BLAST Open Rotterdam 2026", 2, 7),
-        M("Falcons",    "B8",         "BLAST Open Rotterdam 2026", 4, 8),
-
-        # ─── CCT Season 3 EU Finals  (Feb 2026, $200k online) ──────
-        M("B8",         "GamerLegion","CCT Season 3 EU Finals", 1, 2),
-        M("GamerLegion","3DMAX",      "CCT Season 3 EU Finals", 2, 3),
-        M("3DMAX",      "FUT",        "CCT Season 3 EU Finals", 3, 4),
-        M("FUT",        "NIP",        "CCT Season 3 EU Finals", 4, 5),
-        M("NIP",        "Astralis",   "CCT Season 3 EU Finals", 5, 6),
-        M("Aurora",     "FaZe",       "CCT Season 3 EU Finals", 1, 2),
-
-        # ─── ESL Challenger S47  (Jan 2026, $100k online) ──────────
-        M("3DMAX",      "GamerLegion","ESL Challenger S47", 1, 2),
-        M("GamerLegion","B8",         "ESL Challenger S47", 2, 3),
-        M("B8",         "NIP",        "ESL Challenger S47", 3, 4),
-        M("NIP",        "FUT",        "ESL Challenger S47", 4, 5),
-        M("Grayhound",  "ThunderPick","ESL Challenger S47", 1, 2),
-        M("TYLOO",      "Grayhound",  "ESL Challenger S47", 1, 2),
-
-        # ─── Fragadelphia Miami 2026  (Jan 2026, $50k LAN) ─────────
-        M("NRG",       "M80",         "Fragadelphia Miami 2026", 1, 2),
-        M("M80",       "Cloud9",      "Fragadelphia Miami 2026", 2, 3),
-        M("Cloud9",    "9z",          "Fragadelphia Miami 2026", 3, 4),
-        M("9z",        "Imperial",    "Fragadelphia Miami 2026", 4, 5),
-        M("Imperial",  "paiN",        "Fragadelphia Miami 2026", 5, 6),
-
-        # ─── ESEA Premier S52 AM  (Dec 2025, $30k online) ──────────
-        M("Liquid",    "NRG",         "ESEA Premier S52 AM", 1, 2),
-        M("NRG",       "M80",         "ESEA Premier S52 AM", 2, 3),
-        M("M80",       "Cloud9",      "ESEA Premier S52 AM", 3, 4),
-        M("Cloud9",    "paiN",        "ESEA Premier S52 AM", 4, 5),
-        M("paiN",      "9z",          "ESEA Premier S52 AM", 5, 6),
-        M("9z",        "Imperial",    "ESEA Premier S52 AM", 6, 7),
-
-        # ─── ESL Challenger AM S47  (Nov 2025, $80k online) ────────
-        M("FURIA",     "NRG",         "ESL Challenger AM S47", 1, 2),
-        M("NRG",       "Liquid",      "ESL Challenger AM S47", 2, 3),
-        M("Liquid",    "M80",         "ESL Challenger AM S47", 3, 4),
-        M("M80",       "Cloud9",      "ESL Challenger AM S47", 4, 5),
-        M("Imperial",  "paiN",        "ESL Challenger AM S47", 5, 6),
-
-        # ─── PGL Wallachia S4  (Oct 2025, $200k LAN) ───────────────
-        M("Spirit",    "Falcons",     "PGL Wallachia S4", 1, 2),
-        M("Falcons",   "MOUZ",        "PGL Wallachia S4", 2, 3),
-        M("MOUZ",      "Aurora",      "PGL Wallachia S4", 3, 4),
-        M("Aurora",    "B8",          "PGL Wallachia S4", 4, 5),
-        M("B8",        "GamerLegion", "PGL Wallachia S4", 5, 6),
-        M("GamerLegion","3DMAX",      "PGL Wallachia S4", 6, 7),
-
-        # ─── IEM Sydney 2025  (Sep 2025, $250k LAN) ─────────────────
-        M("MongolZ",   "Rare Atom",   "IEM Sydney 2025", 1, 2),
-        M("Rare Atom", "TYLOO",       "IEM Sydney 2025", 2, 3),
-        M("TYLOO",     "ThunderPick", "IEM Sydney 2025", 3, 4),
-        M("ThunderPick","Grayhound",  "IEM Sydney 2025", 4, 5),
-        M("Grayhound", "ThunderPick", "IEM Sydney 2025", 5, 6),
-    ]
-
-    return pd.DataFrame(blueprints)
+# ── Kept for backward-compatibility with display code ─────────────
+TEAM_META: dict[str, dict] = {
+    t: {**v, "region": "Global"}
+    for t, v in _KNOWN_META.items()
+}
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -737,8 +909,13 @@ def change_arrow(delta: int) -> str:
 
 def add_meta(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df["region"] = df["team"].map(lambda t: TEAM_META.get(t, {}).get("region", "Europe"))
-    df["flag"]   = df["team"].map(lambda t: TEAM_META.get(t, {}).get("flag", "🌍"))
+    if "region" not in df.columns:
+        df["region"] = df["team"].map(lambda t: TEAM_META.get(t, {}).get("region", "Global"))
+    df["flag"] = df["team"].map(
+        lambda t: _KNOWN_META.get(t, {}).get("flag",
+                  df.loc[df["team"]==t, "flag"].iloc[0]
+                  if "flag" in df.columns and (df["team"]==t).any() else "🌍")
+    )
     return df
 
 
@@ -750,33 +927,8 @@ def add_regional_rank(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-@st.cache_data(ttl=3600)
-def fetch_live_standings(region: str) -> pd.DataFrame | None:
-    rmap = {"Europe": "standings_europe.md",
-            "Americas": "standings_americas.md",
-            "Asia": "standings_asia.md"}
-    url = (f"https://raw.githubusercontent.com/ValveSoftware/"
-           f"counter-strike_regional_standings/main/{rmap.get(region,'')}")
-    try:
-        r = requests.get(url, timeout=5)
-        if r.status_code != 200:
-            return None
-        lines = [l for l in r.text.splitlines() if l.startswith("|") and "---" not in l]
-        if len(lines) < 2:
-            return None
-        headers = [h.strip() for h in lines[0].split("|") if h.strip()]
-        records = []
-        for line in lines[1:]:
-            cells = [c.strip() for c in line.split("|") if c.strip()]
-            if len(cells) == len(headers):
-                records.append(dict(zip(headers, cells)))
-        return pd.DataFrame(records) if records else None
-    except Exception:
-        return None
-
-
 # ══════════════════════════════════════════════════════════════════
-# SIDEBAR
+# SIDEBAR  +  DATA LOADING
 # ══════════════════════════════════════════════════════════════════
 
 with st.sidebar:
@@ -789,50 +941,104 @@ with st.sidebar:
         "📖 How VRS Works",
     ], label_visibility="collapsed")
     st.markdown("---")
+    st.markdown("**Engine v3.0** · Live GitHub data")
+    st.markdown(
+        "📄 [Valve Repo](https://github.com/ValveSoftware/"
+        "counter-strike_regional_standings)"
+    )
+
+# ── Load live data (cached 1 hour) ─────────────────────────────────
+_load_ph = st.empty()
+with _load_ph.container():
+    with st.spinner("⏳ Fetching live VRS data from Valve GitHub…"):
+        _gd = load_valve_github_data()
+
+_load_ph.empty()
+
+if _gd["error"]:
+    st.warning(f"⚠️ Live data unavailable: {_gd['error']}  —  App running on fallback data.")
+
+# Cutoff datetime from the latest ranking date (user can override below)
+_default_cutoff = _gd["cutoff_datetime"]
+
+with st.sidebar:
     cutoff_date = st.date_input(
-        "📅 Standings Cutoff Date",
-        value=datetime(2026, 3, 2),
-        help="View how standings looked at any point in time.",
+        "📅 Standings Date",
+        value=_default_cutoff.date(),
+        help="Auto-set to the latest Valve ranking date. Change to view historical snapshots.",
     )
     cutoff_dt = datetime.combine(cutoff_date, datetime.min.time())
-    st.markdown("---")
-    st.markdown(
-        """
-**Engine v2.0**
-- ✅ Two-phase: Seed + H2H
-- ✅ Correct time decay (0→1)
-- ✅ Curve function f(x)
-- ✅ Top-10 buckets per factor
-- ✅ Glicko H2H (RD=75)
-- ✅ Event stakes
-- ✅ Eligibility filter
 
-📄 [Valve Repo](https://github.com/ValveSoftware/counter-strike_regional_standings)
-""")
-
+    if _gd["source"] == "github":
+        st.success(f"✅ Live data  ·  {_gd['total_teams']} teams  ·  {_gd['cutoff_date']}")
+    else:
+        st.error("❌ GitHub offline — fallback data")
 
 # ══════════════════════════════════════════════════════════════════
 # BASE COMPUTATION
 # ══════════════════════════════════════════════════════════════════
 
-base_matches = generate_seed_matches()
+base_standings: pd.DataFrame = _gd["standings"]
+base_matches:   pd.DataFrame = _gd["matches"]
+
+# If GitHub load failed, base_standings will be empty
+if base_standings.empty:
+    st.error(
+        "No standings data available. "
+        "Check your internet connection and reload the app."
+    )
+    st.stop()
+
+# Ensure required columns present (add defaults for any missing)
+for _col, _default in [
+    ("region","Global"), ("flag","🌍"), ("color","#58a6ff"),
+    ("regional_rank", 0),
+]:
+    if _col not in base_standings.columns:
+        base_standings[_col] = _default
+
+if "regional_rank" not in base_standings.columns or base_standings["regional_rank"].eq(0).all():
+    base_standings = add_regional_rank(base_standings)
 
 
-def compute_standings(extra_matches: pd.DataFrame = None, cutoff: datetime = None):
-    if cutoff is None:
-        cutoff = cutoff_dt
-    matches = base_matches.copy()
-    if extra_matches is not None and not extra_matches.empty:
-        matches = pd.concat([matches, extra_matches], ignore_index=True)
-    result = compute_vrs(matches, cutoff=cutoff)
-    if result.empty:
+def compute_standings(extra_matches: pd.DataFrame = None, cutoff: datetime = None) -> pd.DataFrame:
+    """
+    For the scenario simulator.
+    Starts from Valve's published final scores (exact) and applies
+    H2H deltas for any hypothetical extra_matches.
+    Seeding factors (BO/BC/ON/LAN) are held constant from Valve's snapshot.
+    """
+    result = base_standings.copy()
+    if extra_matches is None or extra_matches.empty:
         return result
-    result = add_meta(result)
-    result = add_regional_rank(result)
+
+    # Build mutable score dict starting from Valve's published totals
+    scores: dict[str, float] = result.set_index("team")["total_points"].to_dict()
+    h2h_extra: dict[str, float] = {t: 0.0 for t in scores}
+
+    # Process hypothetical matches chronologically
+    for _, row in extra_matches.sort_values("date").iterrows():
+        w, l = str(row["winner"]), str(row["loser"])
+        if w not in scores or l not in scores:
+            continue
+        E_w = expected_win(scores[w], scores[l])
+        K   = BASE_K * 1.0   # new match → age_weight = 1.0
+        d_w =  K * (1.0 - E_w)
+        d_l = -K * E_w
+        scores[w]     += d_w
+        scores[l]     += d_l
+        h2h_extra[w]  += d_w
+        h2h_extra[l]  += d_l
+
+    result["total_points"] = result["team"].map(scores).fillna(result["total_points"])
+    result["h2h_delta"]    = result["team"].map(
+        lambda t: result.loc[result["team"]==t, "h2h_delta"].iloc[0] + h2h_extra.get(t, 0.0)
+    )
+    result = result.sort_values("total_points", ascending=False).reset_index(drop=True)
+    result["rank"] = result.index + 1
     return result
 
 
-base_standings = compute_standings()
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1408,11 +1614,15 @@ excluded entirely. Within the window, **age weight** scales contributions contin
                 fig.add_annotation(x=x, y=y, text=text, showarrow=False,
                     bgcolor=bg, bordercolor=fc, borderwidth=1.5, borderpad=9,
                     font=dict(color=fc, size=fs), xref="paper", yref="paper", align="center")
-            for x0, y0, x1, y1 in [
-                (0.5,0.84,0.3,0.76),(0.5,0.84,0.7,0.76),
-                (0.3,0.55,0.44,0.47),(0.7,0.55,0.56,0.47),(0.5,0.33,0.5,0.24)]:
-                fig.add_annotation(ax=x0, ay=y0, x=x1, y=y1,
-                    axref="paper", ayref="paper", xref="paper", yref="paper",
+            # Arrows: head at (x1,y1); ax/ay are pixel offsets to tail
+            # axref="pixel" is required in newer Plotly (axref="paper" removed)
+            for x1, y1, ax_px, ay_px in [
+                (0.3,0.76,  68, -29), (0.7,0.76, -68, -29),
+                (0.44,0.47,-48, -29), (0.56,0.47, 48, -29),
+                (0.5,0.24,   0, -32),
+            ]:
+                fig.add_annotation(ax=ax_px, ay=ay_px, x=x1, y=y1,
+                    axref="pixel", ayref="pixel", xref="paper", yref="paper",
                     arrowhead=2, arrowwidth=1.5, arrowcolor="#8b949e", showarrow=True, text="")
             fig.update_layout(
                 paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
