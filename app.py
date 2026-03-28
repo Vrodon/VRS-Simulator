@@ -2970,116 +2970,7 @@ elif page == "🔍 Team Breakdown":
             )
             st.plotly_chart(fig_wf, use_container_width=True)
 
-            # ── Compact explanation table ──────────────────────
-            def _driver_row(emoji, name, pts_d, factor_d, color):
-                """One row of the driver table."""
-                if abs(pts_d) < 0.05:
-                    impact = '<span style="color:#8b949e">—</span>'
-                    bar = ""
-                elif pts_d > 0:
-                    impact = f'<span style="color:#3fb950;font-weight:700">+{pts_d:.1f} pts</span>'
-                    bw = min(abs(pts_d) / max(abs(_d_total), 1) * 100, 100)
-                    bar = f'<div style="width:{bw:.0f}%;height:5px;background:#3fb950;border-radius:3px;margin-top:3px"></div>'
-                else:
-                    impact = f'<span style="color:#f85149;font-weight:700">{pts_d:.1f} pts</span>'
-                    bw = min(abs(pts_d) / max(abs(_d_total), 1) * 100, 100)
-                    bar = f'<div style="width:{bw:.0f}%;height:5px;background:#f85149;border-radius:3px;margin-top:3px"></div>'
-                factor_s = f'{factor_d:+.4f}' if factor_d is not None else "—"
-                return (
-                    f'<tr style="border-bottom:1px solid #21262d;">'
-                    f'<td style="padding:8px 10px;font-size:13px">{emoji} {name}</td>'
-                    f'<td style="padding:8px 10px;text-align:right;font-family:monospace;font-size:12px;color:#8b949e">{factor_s}</td>'
-                    f'<td style="padding:8px 10px;text-align:right;min-width:90px">{impact}{bar}</td>'
-                    f'</tr>'
-                )
-
-            _explain_rows = (
-                _driver_row("🏆", "Bounty Offered", _pts_bo, ex["bo_factor"] - _orig_ex["bo_factor"], "#f0b429") +
-                _driver_row("💰", "Bounty Collected", _pts_bc, ex["bc_factor"] - _orig_ex["bc_factor"], "#3fb950") +
-                _driver_row("🕸️", "Opp. Network", _pts_on, ex["on_factor"] - _orig_ex["on_factor"], "#79c0ff") +
-                _driver_row("🖥️", "LAN Wins", _pts_lan, ex["lan_factor"] - _orig_ex["lan_factor"], "#f85149") +
-                _driver_row("📐", "Lerp Normalization", _pts_lerp, None, "#c9d1d9") +
-                _driver_row("⚔️", "H2H (Glicko)", _d_h2h, None, "#58a6ff")
-            )
-            _total_color = "#3fb950" if _d_total >= 0 else "#f85149"
-
-            st.markdown(f"""
-            <table style="width:100%;border-collapse:collapse;font-size:13px;margin-top:4px;">
-              <thead>
-                <tr style="background:#161b22;color:#8b949e;font-size:10px;text-transform:uppercase;">
-                  <th style="padding:8px 10px;text-align:left">Driver</th>
-                  <th style="padding:8px 10px;text-align:right">Factor Δ</th>
-                  <th style="padding:8px 10px;text-align:right">Points Impact</th>
-                </tr>
-              </thead>
-              <tbody>{_explain_rows}</tbody>
-              <tfoot>
-                <tr style="border-top:2px solid #30363d;">
-                  <td style="padding:10px;font-weight:700;font-size:14px" colspan="2">
-                    Total Score Change</td>
-                  <td style="padding:10px;text-align:right;font-weight:700;font-size:16px;color:{_total_color}">
-                    {_d_total:+.1f} pts</td>
-                </tr>
-              </tfoot>
-            </table>
-            """, unsafe_allow_html=True)
-
-            # ── Lerp Shift explainer (always show when significant) ────
-            if abs(_pts_lerp) > 1.0:
-                # Compute context numbers
-                _orig_pool = original_standings["team"].nunique()
-                _sim_pool  = base_standings[~base_standings["team"].isin(_sim_dup_teams)]["team"].nunique()
-                _dropped   = max(0, _orig_pool - _sim_pool)
-
-                _orig_min_avg = original_standings["seed_combined"].min()
-                _orig_max_avg = original_standings["seed_combined"].max()
-
-                _lerp_dir = "upward" if _pts_lerp > 0 else "downward"
-                _lerp_color = "#3fb950" if _pts_lerp > 0 else "#f85149"
-
-                st.markdown(f"""
-                <div style="background:#1c1a00;border:1px solid #f0b429;border-left:4px solid #f0b429;
-                            border-radius:8px;padding:14px 18px;margin-top:12px;">
-                  <div style="font-size:14px;font-weight:700;color:#f0b429;margin-bottom:8px">
-                    📐 What is the Lerp Shift?</div>
-                  <div style="font-size:12px;color:#c9d1d9;line-height:1.7">
-                    The VRS maps each team's factor average to a score between <b>400</b> and <b>2000</b>
-                    using min-max normalization. The worst eligible team always gets 400, the best always 2000.
-                    <br><br>
-                    <b>This is not a simulation artifact</b> — Valve does this every month with the then-current
-                    pool. But it means that score changes don't just come from a team's own performance:
-                    <br><br>
-                    <div style="background:#0d1117;border-radius:6px;padding:10px 14px;margin:6px 0;font-family:monospace;font-size:12px;">
-                      Factor Score = 400 + (team_avg − <span style="color:#f85149">min_avg</span>) / (<span style="color:#3fb950">max_avg</span> − <span style="color:#f85149">min_avg</span>) × 1600
-                    </div>
-                    When the eligible pool changes (teams drop out due to inactivity or window expiry),
-                    <span style="color:#f85149">min_avg</span> and <span style="color:#3fb950">max_avg</span>
-                    shift — and <b>every team's score shifts with them</b>, even if their own factors didn't change.
-                    <br><br>
-                    <div style="display:flex;gap:20px;margin-top:4px;">
-                      <div style="flex:1;background:#161b22;border-radius:6px;padding:8px 12px;text-align:center;">
-                        <div style="font-size:10px;color:#8b949e">Pool size</div>
-                        <div style="font-size:15px;font-weight:700;color:#c9d1d9">{_orig_pool} → {_sim_pool}</div>
-                        <div style="font-size:10px;color:#f85149">{_dropped} teams dropped</div>
-                      </div>
-                      <div style="flex:1;background:#161b22;border-radius:6px;padding:8px 12px;text-align:center;">
-                        <div style="font-size:10px;color:#8b949e">min avg</div>
-                        <div style="font-size:15px;font-weight:700;color:#c9d1d9">{_orig_min_avg:.4f} → {min_avg:.4f}</div>
-                      </div>
-                      <div style="flex:1;background:#161b22;border-radius:6px;padding:8px 12px;text-align:center;">
-                        <div style="font-size:10px;color:#8b949e">max avg</div>
-                        <div style="font-size:15px;font-weight:700;color:#c9d1d9">{_orig_max_avg:.4f} → {max_avg:.4f}</div>
-                      </div>
-                      <div style="flex:1;background:#161b22;border-radius:6px;padding:8px 12px;text-align:center;">
-                        <div style="font-size:10px;color:#8b949e">Lerp effect</div>
-                        <div style="font-size:15px;font-weight:700;color:{_lerp_color}">{_pts_lerp:+.0f} pts</div>
-                        <div style="font-size:10px;color:#8b949e">{_lerp_dir}</div>
-                      </div>
-                    </div>
-                  </div>
-                </div>""", unsafe_allow_html=True)
-
-            # ── Insight text ──────────────────────────────────
+            # ── Insight text (directly under waterfall) ───────
             _drivers = [
                 ("BC decay", _pts_bc), ("ON decay", _pts_on),
                 ("LAN decay", _pts_lan), ("Lerp shift", _pts_lerp),
@@ -3108,10 +2999,32 @@ elif page == "🔍 Team Breakdown":
             else:
                 _insight = "➡️ This team is relatively stable — factor decay and normalization largely cancel out."
 
+            # Lerp tooltip data
+            _orig_pool = original_standings["team"].nunique()
+            _sim_pool  = base_standings[~base_standings["team"].isin(_sim_dup_teams)]["team"].nunique()
+            _dropped   = max(0, _orig_pool - _sim_pool)
+            _orig_min_avg = original_standings["seed_combined"].min()
+            _orig_max_avg = original_standings["seed_combined"].max()
+            _lerp_color = "#3fb950" if _pts_lerp > 0 else "#f85149"
+
+            _lerp_tooltip = (
+                f"Lerp Shift = {_pts_lerp:+.0f} pts&#10;&#10;"
+                f"The VRS maps factor averages to [400, 2000] via min-max normalization. "
+                f"When teams drop out of the pool, min/max shift and every remaining team&#39;s score changes.&#10;&#10;"
+                f"Pool: {_orig_pool} → {_sim_pool} ({_dropped} dropped)&#10;"
+                f"min avg: {_orig_min_avg:.4f} → {min_avg:.4f}&#10;"
+                f"max avg: {_orig_max_avg:.4f} → {max_avg:.4f}&#10;&#10;"
+                f"This is not a simulation artifact — Valve does this every month."
+            )
+
             st.markdown(
                 f'<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;'
-                f'padding:12px 16px;font-size:12px;color:#c9d1d9;margin-top:8px;line-height:1.6">'
-                f'{_insight}</div>',
+                f'padding:12px 16px;font-size:12px;color:#c9d1d9;line-height:1.6;'
+                f'display:flex;align-items:flex-start;gap:10px;">'
+                f'<div style="flex:1">{_insight}</div>'
+                f'<span title="{_lerp_tooltip}" style="cursor:help;font-size:16px;'
+                f'color:#f0b429;flex-shrink:0;line-height:1" aria-label="Lerp Shift info">ⓘ</span>'
+                f'</div>',
                 unsafe_allow_html=True,
             )
 
