@@ -682,7 +682,7 @@ def _parse_detail_md(team: str, rank: int, valve_pts: int, text: str) -> dict:
 
             age_w  = float(age_w_s)
             ev_w   = float(ev_w_s) if ev_w_s not in ("-", "") else 0.0
-            is_lan = (lan_s not in ("-", ""))
+            is_lan = (lan_s not in ("-", "") and not lan_s.startswith("0"))
             h2h_a  = float(h2h_s) if h2h_s not in ("-", "") else 0.0
 
             # Approximate prize_pool from event_weight (curve inverse)
@@ -3022,6 +3022,61 @@ elif page == "🔍 Team Breakdown":
               </tfoot>
             </table>
             """, unsafe_allow_html=True)
+
+            # ── Lerp Shift explainer (always show when significant) ────
+            if abs(_pts_lerp) > 1.0:
+                # Compute context numbers
+                _orig_pool = original_standings["team"].nunique()
+                _sim_pool  = base_standings[~base_standings["team"].isin(_sim_dup_teams)]["team"].nunique()
+                _dropped   = max(0, _orig_pool - _sim_pool)
+
+                _orig_min_avg = original_standings["seed_combined"].min()
+                _orig_max_avg = original_standings["seed_combined"].max()
+
+                _lerp_dir = "upward" if _pts_lerp > 0 else "downward"
+                _lerp_color = "#3fb950" if _pts_lerp > 0 else "#f85149"
+
+                st.markdown(f"""
+                <div style="background:#1c1a00;border:1px solid #f0b429;border-left:4px solid #f0b429;
+                            border-radius:8px;padding:14px 18px;margin-top:12px;">
+                  <div style="font-size:14px;font-weight:700;color:#f0b429;margin-bottom:8px">
+                    📐 What is the Lerp Shift?</div>
+                  <div style="font-size:12px;color:#c9d1d9;line-height:1.7">
+                    The VRS maps each team's factor average to a score between <b>400</b> and <b>2000</b>
+                    using min-max normalization. The worst eligible team always gets 400, the best always 2000.
+                    <br><br>
+                    <b>This is not a simulation artifact</b> — Valve does this every month with the then-current
+                    pool. But it means that score changes don't just come from a team's own performance:
+                    <br><br>
+                    <div style="background:#0d1117;border-radius:6px;padding:10px 14px;margin:6px 0;font-family:monospace;font-size:12px;">
+                      Factor Score = 400 + (team_avg − <span style="color:#f85149">min_avg</span>) / (<span style="color:#3fb950">max_avg</span> − <span style="color:#f85149">min_avg</span>) × 1600
+                    </div>
+                    When the eligible pool changes (teams drop out due to inactivity or window expiry),
+                    <span style="color:#f85149">min_avg</span> and <span style="color:#3fb950">max_avg</span>
+                    shift — and <b>every team's score shifts with them</b>, even if their own factors didn't change.
+                    <br><br>
+                    <div style="display:flex;gap:20px;margin-top:4px;">
+                      <div style="flex:1;background:#161b22;border-radius:6px;padding:8px 12px;text-align:center;">
+                        <div style="font-size:10px;color:#8b949e">Pool size</div>
+                        <div style="font-size:15px;font-weight:700;color:#c9d1d9">{_orig_pool} → {_sim_pool}</div>
+                        <div style="font-size:10px;color:#f85149">{_dropped} teams dropped</div>
+                      </div>
+                      <div style="flex:1;background:#161b22;border-radius:6px;padding:8px 12px;text-align:center;">
+                        <div style="font-size:10px;color:#8b949e">min avg</div>
+                        <div style="font-size:15px;font-weight:700;color:#c9d1d9">{_orig_min_avg:.4f} → {min_avg:.4f}</div>
+                      </div>
+                      <div style="flex:1;background:#161b22;border-radius:6px;padding:8px 12px;text-align:center;">
+                        <div style="font-size:10px;color:#8b949e">max avg</div>
+                        <div style="font-size:15px;font-weight:700;color:#c9d1d9">{_orig_max_avg:.4f} → {max_avg:.4f}</div>
+                      </div>
+                      <div style="flex:1;background:#161b22;border-radius:6px;padding:8px 12px;text-align:center;">
+                        <div style="font-size:10px;color:#8b949e">Lerp effect</div>
+                        <div style="font-size:15px;font-weight:700;color:{_lerp_color}">{_pts_lerp:+.0f} pts</div>
+                        <div style="font-size:10px;color:#8b949e">{_lerp_dir}</div>
+                      </div>
+                    </div>
+                  </div>
+                </div>""", unsafe_allow_html=True)
 
             # ── Insight text ──────────────────────────────────
             _drivers = [
