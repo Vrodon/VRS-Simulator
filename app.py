@@ -995,9 +995,11 @@ _all_dates = _find_all_dates()   # [(date_str, year), ...]
 # safely pre-set session_state["main_nav"] and rerun.
 _qp_team = st.query_params.get("team", "")
 if _qp_team:
+    _preserve_sim = st.session_state.get("sim_toggle", False)
     st.query_params.clear()
     st.session_state["main_nav"] = "🔍 Team Breakdown"
     st.session_state["bd_team"]  = _qp_team
+    st.session_state["sim_toggle"] = _preserve_sim
     st.rerun()
 
 with st.sidebar:
@@ -1177,7 +1179,7 @@ def _simulate_time_decay(
         if wins_ct.get(t, 0) > 0 and match_ct.get(t, 0) >= 5
     ]
     if not eligible:
-        return pd.DataFrame()
+        return {"standings": pd.DataFrame(), "match_h2h": {}}
 
     # ── Factor 1: Bounty Offered (all teams, needed for BC/ON) ────
     bo_sum_new: dict[str, float] = {}
@@ -1273,10 +1275,13 @@ def _simulate_time_decay(
             if not (new_window_start <= m["date"] <= new_cutoff):
                 continue
             seen_ids.add(m["match_id"])
-            all_ms.append((m["date"], t, m["opponent"]))
+            all_ms.append((m["date"], t, m["opponent"], m["match_id"]))
     all_ms.sort()
 
-    for dt, w, l in all_ms:
+    # Per-match H2H tracking for team breakdown display
+    match_h2h: dict[int, dict] = {}   # match_id → {winner, loser, w_delta, l_delta}
+
+    for dt, w, l, mid in all_ms:
         if w not in ratings or l not in ratings:
             continue
         E_w = expected_win(ratings[w], ratings[l])
@@ -1285,6 +1290,7 @@ def _simulate_time_decay(
         d_l = -K * E_w
         ratings[w] += d_w;  ratings[l] += d_l
         h2h_d[w]   += d_w;  h2h_d[l]   += d_l
+        match_h2h[mid] = {"winner": w, "loser": l, "w_delta": d_w, "l_delta": d_l}
 
     # ── Build DataFrame ───────────────────────────────────────────
     region_map = standings.set_index("team")["region"].to_dict()
@@ -1322,7 +1328,7 @@ def _simulate_time_decay(
               .reset_index(drop=True))
     result["rank"] = result.index + 1
     result = add_regional_rank(result)
-    return result
+    return {"standings": result, "match_h2h": match_h2h}
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1331,6 +1337,7 @@ def _simulate_time_decay(
 
 sim_active       = False
 sim_cutoff_dt    = None
+sim_match_h2h    = {}           # match_id → {winner, loser, w_delta, l_delta}
 original_standings = base_standings.copy()
 
 if sim_enabled:
@@ -1342,10 +1349,13 @@ if sim_enabled:
         sim_cutoff_dt = datetime(_snap_dt.year, _snap_dt.month + 1, 1)
 
     with st.spinner("🔮 Recalculating all factors with shifted cutoff…"):
-        _sim_result = _simulate_time_decay(
+        _sim_out = _simulate_time_decay(
             team_match_history, bo_prizes_map,
             base_standings, _snap_dt, sim_cutoff_dt,
         )
+
+    _sim_result  = _sim_out["standings"]
+    sim_match_h2h = _sim_out["match_h2h"]
 
     if not _sim_result.empty:
         original_standings = base_standings.copy()
@@ -2694,16 +2704,51 @@ elif page == "🔍 Team Breakdown":
     raw_ms    = team_match_history.get(sel_team, [])
     bo_prizes = bo_prizes_map.get(sel_team, [])
 
+    # ── Original values for delta display (sim mode) ──────────────
+    _orig_ex = None
+    if sim_active and sel_team in original_standings["team"].values:
+        _orig_ex = original_standings[original_standings["team"] == sel_team].iloc[0]
+
     if sim_active:
         st.markdown(
             '<div style="background:#1a1040;border:1px solid #7c3aed;border-radius:8px;'
             'padding:10px 14px;font-size:12px;color:#c4b5fd;margin-bottom:12px;">'
-            '🔮 <strong>Simulation active</strong> — Factor scores and rankings reflect the '
+            '🔮 <strong>Simulation active</strong> — All values reflect the '
             f'simulated cutoff ({sim_cutoff_dt.strftime("%b %d, %Y")}). '
-            'Match-level tables below show original data; age weights have been recalculated internally.'
+            'Age weights, H2H adjustments, and factor scores are fully recalculated.'
             '</div>',
             unsafe_allow_html=True,
         )
+
+    def _delta_str(new_val, old_val, fmt="+.1f", small=True):
+        """Return HTML span with +/- delta, or empty string if no sim."""
+        if _orig_ex is None:
+            return ""
+        d = new_val - old_val
+        if abs(d) < 0.01:
+            return ""
+        c = "#3fb950" if d > 0 else "#f85149"
+        fs = "10px" if small else "12px"
+        return f' <span style="color:{c};font-size:{fs};font-weight:600">({d:{fmt}})</span>'
+
+    def _eff_age(m):
+        """Return the effective age weight for a match (sim-aware)."""
+        if sim_active:
+            return age_weight(m["date"], sim_cutoff_dt)
+        return m["age_w"]
+
+    def _eff_h2h(m, team):
+        """Return the effective H2H adjustment for a match (sim-aware)."""
+        if sim_active:
+            mid = m.get("match_id")
+            if mid in sim_match_h2h:
+                entry = sim_match_h2h[mid]
+                if m["result"] == "W":
+                    return entry["w_delta"]
+                else:
+                    return entry["l_delta"]
+            return 0.0
+        return m.get("h2h_adj", 0.0)
 
     # Pre-compute globals needed for calculation boxes
     all_avgs       = base_standings["seed_combined"].tolist()
@@ -2711,8 +2756,8 @@ elif page == "🔍 Team Breakdown":
     min_avg        = min(all_avgs) if all_avgs else 0.0
     bo_sums_sorted = sorted(base_standings["bo_sum"].tolist(), reverse=True)
     ref5_bo        = bo_sums_sorted[4] if len(bo_sums_sorted) >= 5 else (bo_sums_sorted[-1] if bo_sums_sorted else 1.0)
-    opp_bo_map     = base_standings.set_index("team")["bo_factor"].to_dict()
-    opp_on_map     = base_standings.set_index("team")["on_factor"].to_dict()
+    opp_bo_map     = base_standings.drop_duplicates("team").set_index("team")["bo_factor"].to_dict()
+    opp_on_map     = base_standings.drop_duplicates("team").set_index("team")["on_factor"].to_dict()
 
     # ── Helpers ───────────────────────────────────────────────────
     # Per-factor max for relative bar scaling in breakdown
@@ -2737,7 +2782,7 @@ elif page == "🔍 Team Breakdown":
             lines_html + '</div>'
         )
 
-    def _factor_band(emoji, name, value, color, max_val=1.0):
+    def _factor_band(emoji, name, value, color, max_val=1.0, delta_html=""):
         pct = max(0.0, min(1.0, float(value) / max(float(max_val), 1e-9))) * 100
         return (
             f'<div style="display:flex;justify-content:space-between;align-items:center;' +
@@ -2748,6 +2793,7 @@ elif page == "🔍 Team Breakdown":
             f'<span style="display:inline-block;width:100px;height:8px;background:#21262d;border-radius:4px;overflow:hidden;">' +
             f'<span style="display:block;width:{pct:.0f}%;height:100%;background:{color};border-radius:4px;"></span></span>' +
             f'<span style="font-size:20px;font-weight:700;color:{color};min-width:50px;text-align:right">{float(value):.4f}</span>' +
+            f'{delta_html}' +
             f'</span></div>'
         )
 
@@ -2762,10 +2808,14 @@ elif page == "🔍 Team Breakdown":
 
         # ── KPI header ────────────────────────────────────────────
         k1, k2, k3, k4, k5 = st.columns(5)
-        k1.metric("🌍 Global Rank",   f"#{int(ex['rank'])}")
-        k2.metric("🎯 Final Score",   f"{ex['total_points']:,.1f}")
-        k3.metric("🌱 Factor Score",     f"{ex['seed']:,.1f}")
-        k4.metric("⚔️ H2H Adj.",      f"{ex['h2h_delta']:+.1f}")
+        _rk_d = f" ({int(_orig_ex['rank']) - int(ex['rank']):+d})" if _orig_ex is not None and int(ex['rank']) != int(_orig_ex['rank']) else ""
+        k1.metric("🌍 Global Rank",   f"#{int(ex['rank'])}{_rk_d}")
+        k2.metric("🎯 Final Score",   f"{ex['total_points']:,.1f}",
+                  delta=f"{ex['total_points'] - _orig_ex['total_points']:+.1f}" if _orig_ex is not None else None)
+        k3.metric("🌱 Factor Score",  f"{ex['seed']:,.1f}",
+                  delta=f"{ex['seed'] - _orig_ex['seed']:+.1f}" if _orig_ex is not None else None)
+        k4.metric("⚔️ H2H Adj.",      f"{ex['h2h_delta']:+.1f}",
+                  delta=f"{ex['h2h_delta'] - _orig_ex['h2h_delta']:+.1f}" if _orig_ex is not None else None)
         k5.metric("📝 Record",        f"{int(ex['wins'])}W / {int(ex['losses'])}L")
 
         # Global context (compact)
@@ -2784,7 +2834,8 @@ elif page == "🔍 Team Breakdown":
         st.markdown("### 🌱 Phase 1 — Four Factors")
 
         # ── BOUNTY OFFERED ────────────────────────────────────────
-        st.markdown(_factor_band("🏆", "Bounty Offered", ex["bo_factor"], "#f0b429", _bd_bo_max), unsafe_allow_html=True)
+        st.markdown(_factor_band("🏆", "Bounty Offered", ex["bo_factor"], "#f0b429", _bd_bo_max,
+            _delta_str(ex["bo_factor"], _orig_ex["bo_factor"], "+.4f") if _orig_ex is not None else ""), unsafe_allow_html=True)
         col_bo_l, col_bo_r = st.columns([1, 1])
         with col_bo_l:
             ratio_bo = ex["bo_sum"] / max(ref5_bo, 1.0)
@@ -2795,6 +2846,18 @@ elif page == "🔍 Team Breakdown":
             ), unsafe_allow_html=True)
         with col_bo_r:
             if bo_prizes:
+                # Recalculate age weights for simulation if active
+                _disp_bo = []
+                for bp in bo_prizes:
+                    bp_copy = dict(bp)
+                    if sim_active:
+                        try:
+                            dt = datetime.strptime(str(bp["event_date"]).strip(), "%Y-%m-%d")
+                            bp_copy["age_weight"] = age_weight(dt, sim_cutoff_dt)
+                            bp_copy["scaled_prize"] = bp["prize_won"] * bp_copy["age_weight"]
+                        except Exception:
+                            pass
+                    _disp_bo.append(bp_copy)
                 bp_html = "".join(
                     f'<tr style="border-bottom:1px solid #21262d;">' +
                     f'<td style="padding:4px 6px;color:#8b949e;font-size:11px">{bp["event_date"]}</td>' +
@@ -2802,9 +2865,9 @@ elif page == "🔍 Team Breakdown":
                     f'<td style="padding:4px 6px">{_bar(bp["age_weight"],"#f0b429",40)}</td>' +
                     f'<td style="padding:4px 6px;text-align:right;color:#f0b429;font-size:11px;font-weight:600">${bp["scaled_prize"]:,.0f}</td>' +
                     f'</tr>'
-                    for bp in bo_prizes
+                    for bp in _disp_bo
                 )
-                total_sc = sum(b["scaled_prize"] for b in bo_prizes)
+                total_sc = sum(b["scaled_prize"] for b in _disp_bo)
                 st.markdown(
                     '<div style="overflow-y:auto;max-height:180px;border:1px solid #30363d;border-radius:6px;">' +
                     '<table style="width:100%;border-collapse:collapse;">' +
@@ -2824,11 +2887,12 @@ elif page == "🔍 Team Breakdown":
         st.markdown("<div style='margin:10px 0'>", unsafe_allow_html=True)
 
         # ── BOUNTY COLLECTED ──────────────────────────────────────
-        st.markdown(_factor_band("💰", "Bounty Collected", ex["bc_factor"], "#3fb950", _bd_bc_max), unsafe_allow_html=True)
+        st.markdown(_factor_band("💰", "Bounty Collected", ex["bc_factor"], "#3fb950", _bd_bc_max,
+            _delta_str(ex["bc_factor"], _orig_ex["bc_factor"], "+.4f") if _orig_ex is not None else ""), unsafe_allow_html=True)
         col_bc_l, col_bc_r = st.columns([1, 1])
         bc_matches = [m for m in raw_ms if m["result"] == "W" and m.get("ev_w", 0) > 0]
         bc_entries = sorted(
-            [(opp_bo_map.get(m["opponent"],0.0)*m["age_w"]*m["ev_w"], m, opp_bo_map.get(m["opponent"],0.0))
+            [(opp_bo_map.get(m["opponent"],0.0)*_eff_age(m)*m["ev_w"], m, opp_bo_map.get(m["opponent"],0.0))
              for m in bc_matches],
             key=lambda x: x[0], reverse=True
         )
@@ -2846,7 +2910,7 @@ elif page == "🔍 Team Breakdown":
                     f'<td style="padding:4px 5px;color:#8b949e;font-size:10px">{m["date"].strftime("%m-%d")}</td>' +
                     f'<td style="padding:4px 5px;color:#c9d1d9;font-size:10px">{m["opponent"][:14]}</td>' +
                     f'<td style="padding:4px 5px;font-size:10px">{_bar(ob,"#f0b429",30,_bd_bo_max)}</td>' +
-                    f'<td style="padding:4px 5px;font-size:10px">{_bar(m["age_w"],"#e6b430",30)}</td>' +
+                    f'<td style="padding:4px 5px;font-size:10px">{_bar(_eff_age(m),"#e6b430",30)}</td>' +
                     f'<td style="padding:4px 5px;font-size:10px">{_bar(m["ev_w"],"#79c0ff",30)}</td>' +
                     f'<td style="padding:4px 5px;text-align:right;color:#3fb950;font-size:10px;font-weight:600">{e:.3f}</td>' +
                     f'</tr>'
@@ -2873,11 +2937,12 @@ elif page == "🔍 Team Breakdown":
         st.markdown("<div style='margin:10px 0'>", unsafe_allow_html=True)
 
         # ── OPPONENT NETWORK ──────────────────────────────────────
-        st.markdown(_factor_band("🕸️", "Opponent Network", ex["on_factor"], "#79c0ff", _bd_on_max), unsafe_allow_html=True)
+        st.markdown(_factor_band("🕸️", "Opponent Network", ex["on_factor"], "#79c0ff", _bd_on_max,
+            _delta_str(ex["on_factor"], _orig_ex["on_factor"], "+.4f") if _orig_ex is not None else ""), unsafe_allow_html=True)
         col_on_l, col_on_r = st.columns([1, 1])
         on_matches = [m for m in raw_ms if m["result"] == "W" and m.get("ev_w", 0) > 0]
         on_entries = sorted(
-            [(opp_on_map.get(m["opponent"],0.0)*m["age_w"]*m["ev_w"], m, opp_on_map.get(m["opponent"],0.0))
+            [(opp_on_map.get(m["opponent"],0.0)*_eff_age(m)*m["ev_w"], m, opp_on_map.get(m["opponent"],0.0))
              for m in on_matches],
             key=lambda x: x[0], reverse=True
         )
@@ -2895,7 +2960,7 @@ elif page == "🔍 Team Breakdown":
                     f'<td style="padding:4px 5px;color:#8b949e;font-size:10px">{m["date"].strftime("%m-%d")}</td>' +
                     f'<td style="padding:4px 5px;color:#c9d1d9;font-size:10px">{m["opponent"][:14]}</td>' +
                     f'<td style="padding:4px 5px;font-size:10px">{_bar(on_v,"#79c0ff",30,_bd_on_max)}</td>' +
-                    f'<td style="padding:4px 5px;font-size:10px">{_bar(m["age_w"],"#e6b430",30)}</td>' +
+                    f'<td style="padding:4px 5px;font-size:10px">{_bar(_eff_age(m),"#e6b430",30)}</td>' +
                     f'<td style="padding:4px 5px;font-size:10px">{_bar(m["ev_w"],"#58a6ff",30)}</td>' +
                     f'<td style="padding:4px 5px;text-align:right;color:#79c0ff;font-size:10px;font-weight:600">{e:.3f}</td>' +
                     f'</tr>'
@@ -2922,13 +2987,14 @@ elif page == "🔍 Team Breakdown":
         st.markdown("<div style='margin:10px 0'>", unsafe_allow_html=True)
 
         # ── LAN WINS ──────────────────────────────────────────────
-        st.markdown(_factor_band("🖥️", "LAN Wins", ex["lan_factor"], "#f85149", _bd_lan_max), unsafe_allow_html=True)
+        st.markdown(_factor_band("🖥️", "LAN Wins", ex["lan_factor"], "#f85149", _bd_lan_max,
+            _delta_str(ex["lan_factor"], _orig_ex["lan_factor"], "+.4f") if _orig_ex is not None else ""), unsafe_allow_html=True)
         col_lan_l, col_lan_r = st.columns([1, 1])
         lan_wins_list = sorted(
             [m for m in raw_ms if m["result"] == "W" and m.get("is_lan")],
-            key=lambda m: m["age_w"], reverse=True
+            key=lambda m: _eff_age(m), reverse=True
         )
-        sum10_lan = sum(m["age_w"] for m in lan_wins_list[:10])
+        sum10_lan = sum(_eff_age(m) for m in lan_wins_list[:10])
         with col_lan_l:
             st.markdown(_calc_box(
                 f'<div>LAN wins in window: <strong style="color:#f85149">{len(lan_wins_list)}</strong></div>' +
@@ -2941,7 +3007,7 @@ elif page == "🔍 Team Breakdown":
                     f'<tr style="border-bottom:1px solid #21262d;{" " if i<10 else "opacity:0.35;"}">' +
                     f'<td style="padding:4px 6px;color:#8b949e;font-size:11px">{m["date"].strftime("%Y-%m-%d")}</td>' +
                     f'<td style="padding:4px 6px;color:#c9d1d9;font-size:11px">{m["opponent"][:16]}</td>' +
-                    f'<td style="padding:4px 6px">{_bar(m["age_w"],"#f85149",55)}</td>' +
+                    f'<td style="padding:4px 6px">{_bar(_eff_age(m),"#f85149",55)}</td>' +
                     f'</tr>'
                     for i,m in enumerate(lan_wins_list)
                 )
@@ -3024,12 +3090,19 @@ elif page == "🔍 Team Breakdown":
 
         # All matches for H2H (newest first)
         if raw_ms:
+            # Filter to matches in the sim window if active
+            _h2h_ms = raw_ms
+            if sim_active:
+                _new_ws = sim_cutoff_dt - timedelta(days=DECAY_DAYS)
+                _h2h_ms = [m for m in raw_ms if _new_ws <= m["date"] <= sim_cutoff_dt]
+
             m_rows = []
             total_h2h = 0.0
-            for m in sorted(raw_ms, key=lambda x: x["date"], reverse=True):
-                h2h      = m.get("h2h_adj", 0.0)
+            for m in sorted(_h2h_ms, key=lambda x: x["date"], reverse=True):
+                h2h      = _eff_h2h(m, sel_team)
                 total_h2h += h2h
                 is_win   = m["result"] == "W"
+                aw_disp  = _eff_age(m)
                 res_b    = (
                     '<span style="background:#1f4a1f;color:#3fb950;border-radius:3px;padding:1px 6px;font-size:10px;font-weight:700">W</span>'
                     if is_win else
@@ -3046,12 +3119,12 @@ elif page == "🔍 Team Breakdown":
                     f'<td style="padding:4px 7px">{res_b}</td>' +
                     f'<td style="padding:4px 7px;color:#c9d1d9;font-size:11px">{m["opponent"]}</td>' +
                     f'<td style="padding:4px 7px;text-align:center;font-size:11px">{"🖥️" if (is_win and m.get("is_lan")) else "🌐" if is_win else ""}</td>' +
-                    f'<td style="padding:4px 7px">{_bar(m["age_w"],"#f0b429",45)}</td>' +
+                    f'<td style="padding:4px 7px">{_bar(aw_disp,"#f0b429",45)}</td>' +
                     f'<td style="padding:4px 7px;text-align:right">{h2h_c}</td>' +
                     f'</tr>'
                 )
-            n_w = sum(1 for m in raw_ms if m["result"]=="W")
-            n_l = len(raw_ms) - n_w
+            n_w = sum(1 for m in _h2h_ms if m["result"]=="W")
+            n_l = len(_h2h_ms) - n_w
             h2h_col = "#3fb950" if total_h2h >= 0 else "#f85149"
             st.markdown(
                 '<div style="overflow-y:auto;max-height:340px;border:1px solid #30363d;border-radius:8px;">' +
@@ -3064,7 +3137,7 @@ elif page == "🔍 Team Breakdown":
                 '<th style="padding:7px;text-align:right">H2H Δ</th>' +
                 '</tr></thead><tbody>' + "".join(m_rows) + '</tbody></table></div>' +
                 f'<div style="display:flex;justify-content:space-between;margin-top:5px;font-size:11px;color:#8b949e;">' +
-                f'<span>{len(raw_ms)} matches · {n_w}W {n_l}L</span>' +
+                f'<span>{len(_h2h_ms)} matches · {n_w}W {n_l}L</span>' +
                 f'<span>Total H2H: <strong style="color:{h2h_col}">{total_h2h:+.1f} pts</strong></span></div>',
                 unsafe_allow_html=True
             )
@@ -3089,7 +3162,7 @@ elif page == "🔍 Team Breakdown":
                         continue
                     rows.append({
                         "date":         dt,
-                        "date_label":   dt.strftime("%b %Y"),
+                        "date_label":   dt.strftime("%b %d, %Y"),
                         "rank":         int(row["rank"]),
                         "total_points": float(row["total_points"]),
                         "seed":         float(row["seed"]),
@@ -3108,6 +3181,28 @@ elif page == "🔍 Team Breakdown":
         with st.spinner(f"Loading history for {sel_team}…"):
             hist_df = _load_team_history(sel_team, tuple(_hist_dates))
 
+        # ── Append simulated data point if sim is active ─────────
+        if sim_active and not hist_df.empty and sel_team in base_standings["team"].values:
+            _sim_row = base_standings[base_standings["team"] == sel_team].iloc[0]
+            sim_point = {
+                "date":         sim_cutoff_dt,
+                "date_label":   "🔮 " + sim_cutoff_dt.strftime("%b %d, %Y"),
+                "rank":         int(_sim_row["rank"]),
+                "total_points": float(_sim_row["total_points"]),
+                "seed":         float(_sim_row["seed"]),
+                "h2h_delta":    float(_sim_row["h2h_delta"]),
+                "bo_factor":    float(_sim_row.get("bo_factor", 0)),
+                "bc_factor":    float(_sim_row.get("bc_factor", 0)),
+                "on_factor":    float(_sim_row.get("on_factor", 0)),
+                "lan_factor":   float(_sim_row.get("lan_factor", 0)),
+                "wins":         int(_sim_row.get("wins", 0)),
+                "losses":       int(_sim_row.get("losses", 0)),
+                "is_sim":       True,
+            }
+            hist_df["is_sim"] = False
+            hist_df = pd.concat([hist_df, pd.DataFrame([sim_point])], ignore_index=True)
+            hist_df = hist_df.sort_values("date").reset_index(drop=True)
+
         if hist_df.empty:
             st.info(f"No historical data found for {sel_team}.")
         else:
@@ -3117,13 +3212,13 @@ elif page == "🔍 Team Breakdown":
             st.markdown("#### 📊 Rank & Factor Score over time")
             fig_dual = _go2.Figure()
 
-            # Factor Score as bars (left axis)
+            _bar_colors = ["#7c3aed" if hist_df.iloc[i].get("is_sim", False)
+                           else "#79c0ff" for i in range(len(hist_df))]
             fig_dual.add_trace(_go2.Bar(
                 x=hist_df["date_label"], y=hist_df["total_points"],
-                name="Final Score", marker_color="#79c0ff",
+                name="Final Score", marker_color=_bar_colors,
                 opacity=0.75, yaxis="y1",
             ))
-            # Rank as line (right axis, inverted)
             fig_dual.add_trace(_go2.Scatter(
                 x=hist_df["date_label"], y=hist_df["rank"],
                 name="Global Rank", mode="lines+markers",
@@ -3142,7 +3237,7 @@ elif page == "🔍 Team Breakdown":
                     title="Global Rank",
                     gridcolor="#21262d", color="#f0b429",
                     side="right", overlaying="y",
-                    autorange="reversed",  # lower rank number = better = top
+                    autorange="reversed",
                     showgrid=False,
                 ),
                 xaxis=dict(gridcolor="#21262d"),
@@ -3196,9 +3291,10 @@ elif page == "🔍 Team Breakdown":
 
             st.markdown("---")
 
-            # ── Summary table ─────────────────────────────────────────
+            # ── Summary table (sorted by date descending) ─────────────
             st.markdown("#### 📋 All snapshots")
-            disp = hist_df[[
+            _tbl = hist_df.copy().sort_values("date", ascending=False)
+            disp = _tbl[[
                 "date_label","rank","total_points","seed","h2h_delta",
                 "bo_factor","bc_factor","on_factor","lan_factor","wins","losses"
             ]].rename(columns={
@@ -3206,5 +3302,5 @@ elif page == "🔍 Team Breakdown":
                 "seed":"Factor Score","h2h_delta":"H2H Δ",
                 "bo_factor":"BO","bc_factor":"BC","on_factor":"ON","lan_factor":"LAN",
                 "wins":"W","losses":"L",
-            }).sort_values("Date", ascending=False)
+            })
             st.dataframe(disp, use_container_width=True, hide_index=True)
