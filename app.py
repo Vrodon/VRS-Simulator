@@ -996,6 +996,7 @@ with st.sidebar:
         "🔮 Scenario Simulator",
         "⚔️ Team Comparison",
         "📖 How VRS Works",
+        "🔍 Team Breakdown",
     ], label_visibility="collapsed")
     st.markdown("---")
 
@@ -1661,7 +1662,7 @@ elif page == "📖 How VRS Works":
     )
     st.markdown("---")
 
-    tab_arch, tab_age, tab_curve, tab_bo, tab_bc, tab_on, tab_lan, tab_h2h, tab_seed, tab_worked = st.tabs([
+    tab_arch, tab_age, tab_curve, tab_bo2, tab_bc2, tab_on2, tab_lan2, tab_h2h, tab_seed = st.tabs([
         "🏗️ Architecture",
         "⏳ Age Weight",
         "📐 Curve f(x)",
@@ -1671,7 +1672,6 @@ elif page == "📖 How VRS Works":
         "🖥️ LAN Wins",
         "⚔️ H2H (Glicko)",
         "🌱 VRS Score",
-        "🔍 Worked Example",
     ])
 
     # ══════════════════════════════════════════════════════════════
@@ -2306,220 +2306,678 @@ This proportional gap then influences the H2H expected scores in Phase 2.
 """)
 
     # ══════════════════════════════════════════════════════════════
-    with tab_worked:
-        st.subheader("🔍 Full Worked Example")
-        st.markdown("Trace any team's complete score calculation step-by-step.")
 
-        if base_standings.empty:
-            st.warning("No standings data for the selected cutoff.")
-            st.stop()
+# ══════════════════════════════════════════════════════════════════
+# PAGE 5  ·  TEAM BREAKDOWN
+# ══════════════════════════════════════════════════════════════════
 
-        ex_team = st.selectbox("Select team:", base_standings["team"].tolist(), key="wex_team")
-        ex = base_standings[base_standings["team"] == ex_team].iloc[0]
-        meta = TEAM_META.get(ex_team, {})
+elif page == "🔍 Team Breakdown":
 
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("🏆 Rank",       f"#{int(ex['rank'])}")
-        c2.metric("🎯 Final Score", f"{ex['total_points']:,.1f}")
-        c3.metric("🌱 VRS Score",        f"{ex['seed']:,.1f}")
-        c4.metric("⚔️ H2H Δ",      f"{ex['h2h_delta']:+.1f}")
-        c5.metric("📝 Record",      f"{int(ex['wins'])}W / {int(ex['losses'])}L")
+    st.title("🔍 Team Breakdown")
+    st.markdown(
+        "Full factor-by-factor explanation of why a team has its current VRS score, "
+        "plus historical rank and score trends."
+    )
 
-        st.markdown("---")
-        st.markdown("### 🌱 Phase 1: Factor Scores → VRS Score")
+    if base_standings.empty:
+        st.warning("No data loaded. Check sidebar.")
+        st.stop()
 
-        col_l, col_r = st.columns([2, 3])
+    # ── Team selector ─────────────────────────────────────────────
+    team_list = base_standings["team"].tolist()
+    sel_team  = st.selectbox("Select team:", team_list, key="bd_team")
+    ex        = base_standings[base_standings["team"] == sel_team].iloc[0]
+    raw_ms    = team_match_history.get(sel_team, [])
+    bo_prizes = bo_prizes_map.get(sel_team, [])
+
+    # ── Global context bar ─────────────────────────────────────────
+    all_avgs  = base_standings["seed_combined"].tolist()
+    max_avg   = max(all_avgs) if all_avgs else 1.0
+    min_avg   = min(all_avgs) if all_avgs else 0.0
+    # 5th highest BO sum
+    bo_sums_sorted = sorted(base_standings["bo_sum"].tolist(), reverse=True)
+    ref5_bo = bo_sums_sorted[4] if len(bo_sums_sorted) >= 5 else bo_sums_sorted[-1] if bo_sums_sorted else 1.0
+
+    with st.expander("🌐 Global context — used in this team's calculation", expanded=False):
+        cg1, cg2, cg3, cg4 = st.columns(4)
+        cg1.metric("Teams in pool",    f"{len(base_standings):,}")
+        cg2.metric("Max avg factor",   f"{max_avg:.4f}",  help="Highest average of 4 factors across all teams")
+        cg3.metric("Min avg factor",   f"{min_avg:.4f}",  help="Lowest average — always 0.000 (weakest team)")
+        cg4.metric("5th BO ref ($)",   f"${ref5_bo:,.0f}", help="5th-highest BO sum — BO normalisation reference")
+        st.markdown(
+            f"**This team's average:** `{ex['seed_combined']:.4f}` · "
+            f"**Percentile:** `{(ex['seed_combined']-min_avg)/(max_avg-min_avg)*100:.1f}th` · "
+            f"**VRS Score:** `{ex['seed']:,.1f}` out of max 2000"
+        )
+
+    st.markdown("---")
+
+    # Helper: mini progress bar
+    def _bar(val, color, w=65):
+        pct = max(0.0, min(1.0, float(val))) * 100
+        return (
+            f'<div style="display:inline-flex;align-items:center;gap:5px;">'
+            f'<div style="width:{w}px;height:8px;background:#21262d;border-radius:4px;overflow:hidden;">'
+            f'<div style="width:{pct:.0f}%;height:100%;background:{color};border-radius:4px;"></div></div>'
+            f'<span style="font-size:11px;color:#8b949e">{float(val):.3f}</span></div>'
+        )
+
+    def _factor_header(emoji, name, value, color, weight="25%"):
+        pct = max(0.0, min(1.0, float(value))) * 100
+        return f"""
+        <div style="background:#161b22;border:1px solid #30363d;border-left:4px solid {color};
+                    border-radius:8px;padding:14px 18px;margin:8px 0;">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <div>
+              <span style="font-size:16px;font-weight:700;color:{color}">{emoji} {name}</span>
+              <span style="font-size:11px;color:#484f58;margin-left:10px">weight: {weight}</span>
+            </div>
+            <div style="text-align:right;">
+              <div style="font-size:28px;font-weight:700;color:{color}">{float(value):.4f}</div>
+              <div style="width:120px;height:8px;background:#21262d;border-radius:4px;overflow:hidden;margin-top:4px;">
+                <div style="width:{pct:.0f}%;height:100%;background:{color};border-radius:4px;"></div></div>
+            </div>
+          </div>
+        </div>"""
+
+    # ═══════════════════════════════════════════════════════════════
+    # PHASE 1 TABS
+    # ═══════════════════════════════════════════════════════════════
+    st.subheader("🌱 Phase 1 — Four Factors")
+    st.markdown(
+        "Each factor is scored 0–1, averaged equally (25% each), then mapped to the "
+        "VRS Score range [400–2000] using min-max normalisation across all teams."
+    )
+
+    tab_bo, tab_bc, tab_on, tab_lan, tab_seed_ph1 = st.tabs([
+        "🏆 Bounty Offered",
+        "💰 Bounty Collected",
+        "🕸️ Opponent Network",
+        "🖥️ LAN Wins",
+        "🌱 VRS Score (Phase 1)",
+    ])
+
+    # ────────────────────────────────────────────────────────────────
+    with tab_bo:
+        st.markdown(_factor_header("🏆", "Bounty Offered", ex["bo_factor"], "#f0b429"), unsafe_allow_html=True)
+        col_l, col_r = st.columns([3, 2])
         with col_l:
-            factor_rows = [
-                ("🏆 Bounty Offered", "BO",
-                 f"BO_sum=${ex['bo_sum']:,.2f}", f"{ex['bo_factor']:.4f}", "#f0b429"),
-                ("💰 Bounty Collected", "BC",
-                 f"Σ_top10/10={ex['bc_pre_curve']:.4f}", f"{ex['bc_factor']:.4f}", "#3fb950"),
-                ("🕸️ Opp. Network", "ON",
-                 f"Σ_top10/10={ex['on_factor']:.4f}", f"{ex['on_factor']:.4f}", "#79c0ff"),
-                ("🖥️ LAN Wins", "LAN",
-                 f"{int(ex['lan_wins'])} LAN wins", f"{ex['lan_factor']:.4f}", "#f85149"),
-            ]
-            for fname, fcode, raw_info, factor_val, color in factor_rows:
-                note = " (curve applied)" if fcode in ("BO", "BC") else " (no curve)"
-                st.markdown(f"""
-                <div style="background:#161b22;border:1px solid #30363d;border-radius:8px;
-                            padding:12px 14px;margin:5px 0;">
-                  <div style="color:{color};font-weight:700;margin-bottom:5px">{fname}</div>
-                  <div style="font-size:12px;color:#8b949e">{raw_info}{note}</div>
-                  <div style="display:flex;justify-content:space-between;margin-top:6px;">
-                    <span style="font-size:12px;color:#8b949e">Factor value (×0.25)</span>
-                    <span style="font-weight:700;color:{color}">{factor_val}
-                      → <span style="color:#c9d1d9">{float(factor_val)*0.25:.4f}</span>
-                    </span>
-                  </div>
-                </div>""", unsafe_allow_html=True)
+            st.markdown(r"""
+**What it measures:** How much prize money this team has won recently.
 
-            combined_val = ex["seed_combined"]
-            seed_val     = ex["seed"]
+**Formula:**
+1. For each win: `scaled = prize_won × age_weight`
+2. Sum the **top 10** scaled winnings → `BO_sum`
+3. Divide by the **5th-highest** BO_sum across all teams → `ratio`
+4. Apply curve and clamp: `BO = curve( min(1.0, ratio) )`
+
+Teams 1–5 by prize money all get BO = **1.000** (ratio ≥ 1).
+Below rank 5: `BO = curve(ratio)` where ratio < 1, giving BO < 1.
+""")
             st.markdown(f"""
-            <div style="background:#1c2128;border:2px solid #58a6ff;border-radius:10px;
-                        padding:16px;margin-top:10px;">
-              <div style="font-size:13px;color:#8b949e">Average = (BO+BC+ON+LAN)/4</div>
-              <div style="font-size:26px;font-weight:700;color:#c9d1d9">{combined_val:.4f}</div>
-              <div style="font-size:12px;color:#8b949e;margin-top:6px">
-                → VRS Score = 400 + ({combined_val:.4f} − min) / (max − min) × 1600</div>
-              <div style="font-size:30px;font-weight:700;color:#58a6ff;margin-top:4px">
-                VRS Score = {seed_val:,.1f}</div>
+            <div style="background:#1c1c1c;border:1px solid #30363d;border-radius:8px;padding:12px 16px;font-size:13px;">
+              <div style="color:#8b949e;font-size:11px;margin-bottom:6px">CALCULATION</div>
+              <div>BO Sum (top-10) = <strong style="color:#f0b429">${ex['bo_sum']:,.2f}</strong></div>
+              <div>÷ 5th ref = <strong>${ref5_bo:,.0f}</strong></div>
+              <div>ratio = <strong>{ex['bo_sum']/max(ref5_bo,1):.4f}</strong>
+                → min(1.0, ratio) = <strong>{min(1.0, ex['bo_sum']/max(ref5_bo,1)):.4f}</strong></div>
+              <div>curve(x) = 1/(1+|log₁₀(x)|) = <strong style="color:#f0b429;font-size:16px">{ex['bo_factor']:.4f}</strong></div>
             </div>""", unsafe_allow_html=True)
 
         with col_r:
-            st.markdown("#### All matches in the 6-month window")
-
-            def _mini_bar(val, color, width=55):
-                pct = max(0.0, min(1.0, float(val))) * 100
-                return (
-                    f'<div style="display:inline-flex;align-items:center;gap:4px;">' +
-                    f'<div style="width:{width}px;height:6px;background:#21262d;border-radius:3px;overflow:hidden;">' +
-                    f'<div style="width:{pct:.0f}%;height:100%;background:{color};border-radius:3px;"></div></div>' +
-                    f'<span style="font-size:11px;color:#8b949e">{float(val):.3f}</span>' +
-                    '</div>'
+            st.markdown("**Top prize winnings (BO table):**")
+            if bo_prizes:
+                bp_rows = []
+                for i, bp in enumerate(bo_prizes, 1):
+                    age_pct = max(0.0, min(1.0, bp["age_weight"])) * 100
+                    age_c   = "#3fb950" if bp["age_weight"] > 0.8 else "#f0b429" if bp["age_weight"] > 0.4 else "#f85149"
+                    age_bar = (
+                        f'<div style="display:inline-flex;align-items:center;gap:3px;">'
+                        f'<div style="width:45px;height:6px;background:#21262d;border-radius:3px;overflow:hidden;">'
+                        f'<div style="width:{age_pct:.0f}%;height:100%;background:{age_c};border-radius:3px;"></div></div>'
+                        f'<span style="font-size:10px;color:#8b949e">{bp["age_weight"]:.3f}</span></div>'
+                    )
+                    bp_rows.append(
+                        f'<tr style="border-bottom:1px solid #21262d;">'
+                        f'<td style="padding:5px 6px;color:#8b949e;font-size:11px">{bp["event_date"]}</td>'
+                        f'<td style="padding:5px 6px;text-align:right;color:#c9d1d9;font-size:12px">${bp["prize_won"]:,.0f}</td>'
+                        f'<td style="padding:5px 6px">{age_bar}</td>'
+                        f'<td style="padding:5px 6px;text-align:right;color:#f0b429;font-weight:600;font-size:12px">${bp["scaled_prize"]:,.0f}</td>'
+                        f'</tr>'
+                    )
+                total_scaled = sum(b["scaled_prize"] for b in bo_prizes)
+                st.markdown(
+                    '<div style="overflow-y:auto;max-height:280px;border:1px solid #30363d;border-radius:6px;">'
+                    '<table style="width:100%;border-collapse:collapse;font-size:12px;">'
+                    '<thead><tr style="background:#161b22;color:#8b949e;font-size:10px;text-transform:uppercase;">'
+                    '<th style="padding:7px 6px">Date</th>'
+                    '<th style="padding:7px 6px;text-align:right">Prize</th>'
+                    '<th style="padding:7px 6px">Age Wt</th>'
+                    '<th style="padding:7px 6px;text-align:right">Scaled</th>'
+                    '</tr></thead><tbody>' + "".join(bp_rows) + '</tbody>'
+                    f'<tfoot><tr style="background:#161b22;border-top:2px solid #30363d;">'
+                    f'<td colspan="3" style="padding:7px 6px;color:#8b949e;font-size:11px">BO Sum</td>'
+                    f'<td style="padding:7px 6px;text-align:right;color:#f0b429;font-weight:700">${total_scaled:,.0f}</td>'
+                    '</tr></tfoot></table></div>',
+                    unsafe_allow_html=True
                 )
-
-            raw_matches = team_match_history.get(ex_team, [])
-            if raw_matches:
-                m_rows_html = []
-                for m in sorted(raw_matches, key=lambda x: x["date"], reverse=True):
-                    is_win = (m["result"] == "W")
-                    res_badge = (
-                        '<span style="background:#1f4a1f;color:#3fb950;border-radius:4px;padding:2px 7px;font-size:11px;font-weight:700">W</span>'
-                        if is_win else
-                        '<span style="background:#4a1f1f;color:#f85149;border-radius:4px;padding:2px 7px;font-size:11px;font-weight:700">L</span>'
-                    )
-                    h2h = m.get("h2h_adj", 0.0)
-                    h2h_cell = (
-                        f'<span style="color:#3fb950;font-weight:700">+{h2h:.1f}</span>'
-                        if h2h > 0 else
-                        f'<span style="color:#f85149;font-weight:700">{h2h:.1f}</span>'
-                        if h2h < 0 else
-                        '<span style="color:#8b949e">0.0</span>'
-                    )
-                    lan_icon = '🖥️' if m.get("is_lan") else '🌐'
-                    age_bar  = _mini_bar(m["age_w"],  "#f0b429")
-                    ev_bar   = _mini_bar(m["ev_w"],   "#79c0ff") if m["ev_w"] > 0 else '<span style="color:#484f58;font-size:11px">—</span>'
-                    m_rows_html.append(f"""<tr style="border-bottom:1px solid #21262d;">
-                      <td style="padding:5px 6px;color:#8b949e;font-size:11px">{m["date"].strftime("%Y-%m-%d")}</td>
-                      <td style="padding:5px 6px">{res_badge}</td>
-                      <td style="padding:5px 6px;color:#c9d1d9">{m["opponent"]}</td>
-                      <td style="padding:5px 6px;text-align:center">{lan_icon}</td>
-                      <td style="padding:5px 6px">{age_bar}</td>
-                      <td style="padding:5px 6px">{ev_bar}</td>
-                      <td style="padding:5px 6px;text-align:right">{h2h_cell}</td>
-                    </tr>""")
-
-                n_wins   = sum(1 for m in raw_matches if m["result"] == "W")
-                n_losses = len(raw_matches) - n_wins
-                total_h2h = sum(m.get("h2h_adj", 0.0) for m in raw_matches)
-                h2h_color = "#3fb950" if total_h2h >= 0 else "#f85149"
-
-                st.markdown(f"""
-                <div style="overflow-y:auto;max-height:320px;border:1px solid #30363d;border-radius:8px;">
-                <table style="width:100%;border-collapse:collapse;font-size:12px;">
-                  <thead style="position:sticky;top:0;background:#161b22;">
-                    <tr style="color:#8b949e;font-size:10px;text-transform:uppercase;">
-                      <th style="padding:7px 6px;text-align:left">Date</th>
-                      <th style="padding:7px 6px">W/L</th>
-                      <th style="padding:7px 6px;text-align:left">Opponent</th>
-                      <th style="padding:7px 6px;text-align:center" title="LAN or Online">Type</th>
-                      <th style="padding:7px 6px;text-align:left" title="Age Weight — recency of match">
-                        <span style="color:#f0b429">●</span> Age Wt</th>
-                      <th style="padding:7px 6px;text-align:left" title="Event Stakes — prize pool weight for BC/ON">
-                        <span style="color:#79c0ff">●</span> Ev.Stk</th>
-                      <th style="padding:7px 6px;text-align:right" title="H2H rating adjustment (Glicko)">H2H Δ pts</th>
-                    </tr>
-                  </thead>
-                  <tbody>{"".join(m_rows_html)}</tbody>
-                </table>
-                </div>
-                <div style="display:flex;justify-content:space-between;margin-top:8px;font-size:12px;color:#8b949e;padding:0 4px;">
-                  <span>{len(raw_matches)} matches  ·  {n_wins}W {n_losses}L</span>
-                  <span>Total H2H Δ: <strong style="color:{h2h_color}">{total_h2h:+.1f} pts</strong></span>
-                </div>
-                <div style="font-size:11px;color:#484f58;margin-top:4px;padding:0 4px;">
-                  <span style="color:#f0b429">● Age Wt</span>: 1.0 for ≤30d, linear decay to 0 at 180d &nbsp;·&nbsp;
-                  <span style="color:#79c0ff">● Ev.Stk</span>: curve(pool/$1M), used by BC+ON &nbsp;·&nbsp;
-                  H2H Δ: Glicko rating shift for this match
-                </div>
-                """, unsafe_allow_html=True)
             else:
-                st.info("No match data available for this team in the selected snapshot.")
+                st.info("Prize data not available for this snapshot.")
 
+    # ────────────────────────────────────────────────────────────────
+    with tab_bc:
+        st.markdown(_factor_header("💰", "Bounty Collected", ex["bc_factor"], "#3fb950"), unsafe_allow_html=True)
+        col_l, col_r = st.columns([3, 2])
+        with col_l:
+            st.markdown(r"""
+**What it measures:** The quality of opponents you beat — using their BO factor as a proxy for strength.
 
-        # ── BO Prize Table ───────────────────────────────────────────
-        st.markdown("---")
-        st.markdown("### 🏆 Bounty Offered — Prize History")
-        st.markdown(
-            "Top-10 prize winnings used to calculate the **Bounty Offered** factor. "
-            "Each prize is scaled by Age Weight; the sum is compared against the 5th-highest team."
-        )
-        _bo_prizes = bo_prizes_map.get(ex_team, [])
-        if _bo_prizes:
-            _bp_rows = []
-            for i, bp in enumerate(_bo_prizes, 1):
-                age_pct = max(0.0, min(1.0, bp["age_weight"])) * 100
-                age_col = ("#3fb950" if bp["age_weight"] > 0.8
-                           else "#f0b429" if bp["age_weight"] > 0.4 else "#f85149")
-                age_bar = (
-                    f'<div style="display:inline-flex;align-items:center;gap:4px;">' +
-                    f'<div style="width:60px;height:7px;background:#21262d;border-radius:3px;overflow:hidden;">' +
-                    f'<div style="width:{age_pct:.0f}%;height:100%;background:{age_col};border-radius:3px;"></div></div>' +
-                    f'<span style="font-size:11px;color:#8b949e">{bp["age_weight"]:.3f}</span></div>'
+**Formula:**
+1. For each win **at a prize-pool event**: `entry = opp_BO × age_weight × event_stakes`
+2. Take **top 10** entries, sum them → `Σ`
+3. `BC_pre = Σ / 10`
+4. Apply curve: `BC = curve(BC_pre)`
+
+**Event stakes** = `curve(pool / $1M)`. Online qualifiers (no prize pool) don't contribute.
+Beating a rich, high-BO opponent recently at a big event → maximum entry.
+""")
+            st.markdown(f"""
+            <div style="background:#1c1c1c;border:1px solid #30363d;border-radius:8px;padding:12px 16px;font-size:13px;">
+              <div style="color:#8b949e;font-size:11px;margin-bottom:6px">CALCULATION</div>
+              <div>Σ top-10 adjusted = <strong style="color:#3fb950">{ex['bc_pre_curve']:.4f} × 10 = {ex['bc_pre_curve']*10:.4f}</strong></div>
+              <div>÷ 10 → BC_pre = <strong>{ex['bc_pre_curve']:.4f}</strong></div>
+              <div>curve({ex['bc_pre_curve']:.4f}) = <strong style="color:#3fb950;font-size:16px">{ex['bc_factor']:.4f}</strong></div>
+            </div>""", unsafe_allow_html=True)
+        with col_r:
+            st.markdown("**Contributing wins (event wins only, sorted by entry value):**")
+            bc_matches = [m for m in raw_ms if m["result"] == "W" and m.get("ev_w", 0) > 0]
+            # get opp BO for each
+            opp_bo_map = base_standings.set_index("team")["bo_factor"].to_dict()
+            bc_entries = []
+            for m in bc_matches:
+                opp_bo = opp_bo_map.get(m["opponent"], 0.0)
+                entry  = opp_bo * m["age_w"] * m["ev_w"]
+                bc_entries.append((entry, m, opp_bo))
+            bc_entries.sort(reverse=True)
+            top10_bc = bc_entries[:10]
+
+            if bc_entries:
+                bc_rows = []
+                for rank_i, (entry, m, opp_bo) in enumerate(bc_entries, 1):
+                    in_top10 = rank_i <= 10
+                    row_style = "border-bottom:1px solid #21262d;" + ("" if in_top10 else "opacity:0.4;")
+                    ev_bar = _bar(m["ev_w"], "#79c0ff", 40)
+                    bc_rows.append(
+                        f'<tr style="{row_style}">'
+                        f'<td style="padding:4px 5px;color:#c9d1d9;font-size:11px">{m["date"].strftime("%m-%d")}</td>'
+                        f'<td style="padding:4px 5px;color:#c9d1d9;font-size:11px">{m["opponent"][:15]}</td>'
+                        f'<td style="padding:4px 5px;color:#8b949e;font-size:11px">{opp_bo:.3f}</td>'
+                        f'<td style="padding:4px 5px;font-size:11px">{_bar(m["age_w"],"#f0b429",35)}</td>'
+                        f'<td style="padding:4px 5px">{ev_bar}</td>'
+                        f'<td style="padding:4px 5px;text-align:right;color:#3fb950;font-weight:600;font-size:11px">{entry:.3f}</td>'
+                        f'</tr>'
+                    )
+                sum10 = sum(e for e,_,_ in top10_bc)
+                st.markdown(
+                    '<div style="overflow-y:auto;max-height:280px;border:1px solid #30363d;border-radius:6px;">'
+                    '<table style="width:100%;border-collapse:collapse;">'
+                    '<thead><tr style="background:#161b22;color:#8b949e;font-size:9px;text-transform:uppercase;">'
+                    '<th style="padding:6px 5px">Date</th><th style="padding:6px 5px">Opponent</th>'
+                    '<th style="padding:6px 5px">Opp BO</th><th style="padding:6px 5px">Age</th>'
+                    '<th style="padding:6px 5px">Ev.Stk</th><th style="padding:6px 5px;text-align:right">Entry</th>'
+                    '</tr></thead><tbody>' + "".join(bc_rows) + '</tbody>'
+                    f'<tfoot><tr style="background:#161b22;border-top:2px solid #30363d;">'
+                    f'<td colspan="5" style="padding:6px 5px;color:#8b949e;font-size:10px">Top-10 sum / 10 → BC_pre</td>'
+                    f'<td style="padding:6px 5px;text-align:right;color:#3fb950;font-weight:700">{sum10/10:.4f}</td>'
+                    '</tr></tfoot></table></div>'
+                    '<div style="font-size:10px;color:#484f58;margin-top:3px">Faded rows outside top-10</div>',
+                    unsafe_allow_html=True
                 )
-                _bp_rows.append(
-                    f'<tr style="border-bottom:1px solid #21262d;">' +
-                    f'<td style="padding:6px 8px;color:#8b949e;text-align:center">{i}</td>' +
-                    f'<td style="padding:6px 8px;color:#c9d1d9">{bp["event_date"]}</td>' +
-                    f'<td style="padding:6px 8px;text-align:right;color:#f0b429;font-weight:600">${bp["prize_won"]:,.0f}</td>' +
-                    f'<td style="padding:6px 8px">{age_bar}</td>' +
-                    f'<td style="padding:6px 8px;text-align:right;color:#3fb950;font-weight:700">${bp["scaled_prize"]:,.2f}</td>' +
-                    '</tr>'
+            else:
+                st.info("No event wins found.")
+
+    # ────────────────────────────────────────────────────────────────
+    with tab_on:
+        st.markdown(_factor_header("🕸️", "Opponent Network", ex["on_factor"], "#79c0ff"), unsafe_allow_html=True)
+        col_l, col_r = st.columns([3, 2])
+        with col_l:
+            st.markdown(r"""
+**What it measures:** The depth and quality of your opponent *network* — not just their prize money, but how connected they are.
+
+**Key difference from BC:** Instead of using the opponent's **BO** score, ON uses the opponent's **own ON** score. This creates a recursive dependency.
+
+**Formula:**
+1. For each win at a prize-pool event: `entry = opp_ON × age_weight × event_stakes`
+2. Take **top 10** entries, sum them → `Σ`
+3. `ON = Σ / 10`   *(no curve applied — unlike BC)*
+
+**Why iterative?** Team A's ON depends on Team B's ON, which depends on Team C's ON, and so on. This is circular. Solution: start with BO as an initial estimate for everyone's ON value, then repeat the calculation 6 times (like Google's PageRank). Values converge quickly.
+
+**Intuition:** A team that beats opponents who themselves beat many strong teams scores highly here — even if those opponents didn't earn huge prize money. It rewards beating well-connected, active teams.
+""")
+            st.markdown(f"""
+            <div style="background:#1c1c1c;border:1px solid #30363d;border-radius:8px;padding:12px 16px;font-size:13px;">
+              <div style="color:#8b949e;font-size:11px;margin-bottom:6px">CALCULATION</div>
+              <div>Σ top-10 adjusted entries = <strong style="color:#79c0ff">{ex['on_factor']*10:.4f}</strong></div>
+              <div>÷ 10 → ON = <strong style="color:#79c0ff;font-size:16px">{ex['on_factor']:.4f}</strong></div>
+              <div style="color:#484f58;font-size:11px;margin-top:4px">No curve applied (unlike BC)</div>
+            </div>""", unsafe_allow_html=True)
+        with col_r:
+            st.markdown("**Contributing wins (event wins, sorted by estimated ON entry):**")
+            on_matches = [m for m in raw_ms if m["result"] == "W" and m.get("ev_w", 0) > 0]
+            opp_on_map = base_standings.set_index("team")["on_factor"].to_dict()
+            on_entries = []
+            for m in on_matches:
+                opp_on = opp_on_map.get(m["opponent"], 0.0)
+                entry  = opp_on * m["age_w"] * m["ev_w"]
+                on_entries.append((entry, m, opp_on))
+            on_entries.sort(reverse=True)
+
+            if on_entries:
+                on_rows = []
+                for rank_i, (entry, m, opp_on) in enumerate(on_entries, 1):
+                    in_top10 = rank_i <= 10
+                    row_style = "border-bottom:1px solid #21262d;" + ("" if in_top10 else "opacity:0.4;")
+                    on_rows.append(
+                        f'<tr style="{row_style}">'
+                        f'<td style="padding:4px 5px;color:#c9d1d9;font-size:11px">{m["date"].strftime("%m-%d")}</td>'
+                        f'<td style="padding:4px 5px;color:#c9d1d9;font-size:11px">{m["opponent"][:15]}</td>'
+                        f'<td style="padding:4px 5px;color:#8b949e;font-size:11px">{opp_on:.3f}</td>'
+                        f'<td style="padding:4px 5px">{_bar(m["age_w"],"#f0b429",35)}</td>'
+                        f'<td style="padding:4px 5px">{_bar(m["ev_w"],"#79c0ff",35)}</td>'
+                        f'<td style="padding:4px 5px;text-align:right;color:#79c0ff;font-weight:600;font-size:11px">{entry:.3f}</td>'
+                        f'</tr>'
+                    )
+                sum10_on = sum(e for e,_,_ in on_entries[:10])
+                st.markdown(
+                    '<div style="overflow-y:auto;max-height:280px;border:1px solid #30363d;border-radius:6px;">'
+                    '<table style="width:100%;border-collapse:collapse;">'
+                    '<thead><tr style="background:#161b22;color:#8b949e;font-size:9px;text-transform:uppercase;">'
+                    '<th style="padding:6px 5px">Date</th><th style="padding:6px 5px">Opponent</th>'
+                    '<th style="padding:6px 5px">Opp ON</th><th style="padding:6px 5px">Age</th>'
+                    '<th style="padding:6px 5px">Ev.Stk</th><th style="padding:6px 5px;text-align:right">Entry</th>'
+                    '</tr></thead><tbody>' + "".join(on_rows) + '</tbody>'
+                    f'<tfoot><tr style="background:#161b22;border-top:2px solid #30363d;">'
+                    f'<td colspan="5" style="padding:6px 5px;color:#8b949e;font-size:10px">Top-10 sum / 10 → ON</td>'
+                    f'<td style="padding:6px 5px;text-align:right;color:#79c0ff;font-weight:700">{sum10_on/10:.4f}</td>'
+                    '</tr></tfoot></table></div>'
+                    '<div style="font-size:10px;color:#484f58;margin-top:3px">Faded rows outside top-10 · opp ON from current snapshot</div>',
+                    unsafe_allow_html=True
                 )
-            _bo_total = sum(b["scaled_prize"] for b in _bo_prizes)
-            st.markdown(
-                '<table style="width:100%;border-collapse:collapse;font-size:13px;">' +
-                '<thead><tr style="background:#161b22;color:#8b949e;font-size:10px;text-transform:uppercase;">' +
-                '<th style="padding:8px;text-align:center">#</th>' +
-                '<th style="padding:8px;text-align:left">Event Date</th>' +
-                '<th style="padding:8px;text-align:right">Prize Won</th>' +
-                '<th style="padding:8px;text-align:left">Age Weight</th>' +
-                '<th style="padding:8px;text-align:right">Scaled (Prize × Age)</th>' +
-                '</tr></thead><tbody>' + "".join(_bp_rows) + '</tbody>' +
-                f'<tfoot><tr style="background:#161b22;border-top:2px solid #30363d;">' +
-                f'<td colspan="4" style="padding:8px;color:#8b949e;font-size:12px">BO Sum (top-10 total)</td>' +
-                f'<td style="padding:8px;text-align:right;color:#f0b429;font-weight:700;font-size:14px">${_bo_total:,.2f}</td>' +
-                '</tr></tfoot></table>' +
-                '<div style="font-size:11px;color:#484f58;margin-top:4px">' +
-                f'BO Sum = ${_bo_total:,.2f} · BO factor = curve(min(1.0, BO Sum / ref₅)) = ' +
-                f'<strong style="color:#f0b429">{ex["bo_factor"]:.4f}</strong></div>',
-                unsafe_allow_html=True,
+            else:
+                st.info("No event wins found.")
+
+    # ────────────────────────────────────────────────────────────────
+    with tab_lan:
+        st.markdown(_factor_header("🖥️", "LAN Wins", ex["lan_factor"], "#f85149"), unsafe_allow_html=True)
+        col_l, col_r = st.columns([3, 2])
+        with col_l:
+            st.markdown(r"""
+**What it measures:** A time-weighted count of wins at LAN (offline, in-person) events.
+
+**Formula:**
+1. For each LAN win: `entry = 1.0 × age_weight`
+2. Take **top 10** entries, sum → `Σ`
+3. `LAN = Σ / 10`  *(no curve, no event stakes)*
+
+A team with 10 recent LAN wins scores **1.000** (maximum).
+Online wins don't contribute at all to this factor.
+
+LAN only affects **this factor** — there is no LAN bonus in the H2H phase.
+""")
+            lan_wins_list = [m for m in raw_ms if m["result"] == "W" and m.get("is_lan")]
+            lan_entries   = sorted(
+                [(m["age_w"], m) for m in lan_wins_list], reverse=True
             )
-        else:
-            st.info("Bounty Offered prize data not available for this snapshot.")
+            sum10_lan = sum(aw for aw, _ in lan_entries[:10])
+            st.markdown(f"""
+            <div style="background:#1c1c1c;border:1px solid #30363d;border-radius:8px;padding:12px 16px;font-size:13px;">
+              <div style="color:#8b949e;font-size:11px;margin-bottom:6px">CALCULATION</div>
+              <div>Total LAN wins in window: <strong style="color:#f85149">{len(lan_wins_list)}</strong></div>
+              <div>Top-10 age weights sum: <strong>{sum10_lan:.4f}</strong></div>
+              <div>÷ 10 → LAN = <strong style="color:#f85149;font-size:16px">{ex['lan_factor']:.4f}</strong></div>
+            </div>""", unsafe_allow_html=True)
+        with col_r:
+            st.markdown("**LAN wins in window (sorted by age weight):**")
+            if lan_entries:
+                lan_rows = []
+                for rank_i, (aw, m) in enumerate(lan_entries, 1):
+                    in_top10  = rank_i <= 10
+                    row_style = "border-bottom:1px solid #21262d;" + ("" if in_top10 else "opacity:0.4;")
+                    lan_rows.append(
+                        f'<tr style="{row_style}">'
+                        f'<td style="padding:5px 6px;color:#8b949e;font-size:11px">{rank_i}</td>'
+                        f'<td style="padding:5px 6px;color:#c9d1d9;font-size:11px">{m["date"].strftime("%Y-%m-%d")}</td>'
+                        f'<td style="padding:5px 6px;color:#c9d1d9;font-size:11px">{m["opponent"][:16]}</td>'
+                        f'<td style="padding:5px 6px">{_bar(aw,"#f85149",55)}</td>'
+                        f'</tr>'
+                    )
+                st.markdown(
+                    '<div style="overflow-y:auto;max-height:280px;border:1px solid #30363d;border-radius:6px;">'
+                    '<table style="width:100%;border-collapse:collapse;">'
+                    '<thead><tr style="background:#161b22;color:#8b949e;font-size:10px;text-transform:uppercase;">'
+                    '<th style="padding:7px 6px">#</th><th style="padding:7px 6px">Date</th>'
+                    '<th style="padding:7px 6px">Opponent</th><th style="padding:7px 6px">Age Weight</th>'
+                    '</tr></thead><tbody>' + "".join(lan_rows) + '</tbody>'
+                    f'<tfoot><tr style="background:#161b22;border-top:2px solid #30363d;">'
+                    f'<td colspan="3" style="padding:7px 6px;color:#8b949e;font-size:10px">Top-10 sum / 10</td>'
+                    f'<td style="padding:7px 6px;color:#f85149;font-weight:700">{sum10_lan/10:.4f}</td>'
+                    '</tr></tfoot></table></div>'
+                    '<div style="font-size:10px;color:#484f58;margin-top:3px">Faded rows outside top-10</div>',
+                    unsafe_allow_html=True
+                )
+            else:
+                st.info("No LAN wins found in the 6-month window.")
 
-        st.markdown("---")
-        st.markdown("### ⚔️ Phase 2 Summary")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("VRS Score",        f"{ex['seed']:,.1f}")
-        c2.metric("H2H Δ",       f"{ex['h2h_delta']:+.1f}")
-        c3.metric("Final Score", f"{ex['total_points']:,.1f}")
+    # ────────────────────────────────────────────────────────────────
+    with tab_seed_ph1:
+        st.subheader("🌱 Phase 1 Result — Intermediate VRS Score")
+        col_l, col_r = st.columns([3, 2])
+        with col_l:
+            st.markdown(r"""
+The four factor scores are averaged equally (25% each), then mapped to [400, 2000]:
 
-        fig_fin = go.Figure()
-        fig_fin.add_trace(go.Bar(name="VRS Score", x=[ex_team], y=[ex["seed"]],
-            marker_color="#79c0ff", text=[f"{ex['seed']:.0f}"], textposition="auto"))
-        h2h_v = ex["h2h_delta"]
-        fig_fin.add_trace(go.Bar(name="H2H Δ", x=[ex_team], y=[h2h_v],
-            marker_color="#3fb950" if h2h_v >= 0 else "#f85149",
-            text=[f"{h2h_v:+.1f}"], textposition="auto"))
-        fig_fin.update_layout(
-            barmode="relative",
-            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-            font=dict(color="#c9d1d9"),
-            yaxis=dict(gridcolor="#21262d"),
-            legend=dict(orientation="h", y=1.15),
-            margin=dict(l=10,r=10,t=30,b=10), height=200)
-        st.plotly_chart(fig_fin, use_container_width=True)
+$$\text{average} = \frac{BO + BC + ON + LAN}{4}$$
+
+$$\text{VRS Score} = 400 + \frac{\text{average} - \text{avg}_{\min}}{\text{avg}_{\max} - \text{avg}_{\min}} \times 1600$$
+
+The **best team** always gets 2000. The **worst eligible team** always gets 400.
+All other teams are spaced proportionally in between.
+""")
+            combined = ex["seed_combined"]
+            st.markdown(f"""
+            <div style="background:#1c2128;border:2px solid #58a6ff;border-radius:10px;padding:18px 20px;">
+              <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px;">
+                <div style="text-align:center;">
+                  <div style="font-size:11px;color:#8b949e">🏆 BO × 0.25</div>
+                  <div style="font-size:18px;font-weight:700;color:#f0b429">{ex['bo_factor']*0.25:.4f}</div>
+                </div>
+                <div style="text-align:center;">
+                  <div style="font-size:11px;color:#8b949e">💰 BC × 0.25</div>
+                  <div style="font-size:18px;font-weight:700;color:#3fb950">{ex['bc_factor']*0.25:.4f}</div>
+                </div>
+                <div style="text-align:center;">
+                  <div style="font-size:11px;color:#8b949e">🕸️ ON × 0.25</div>
+                  <div style="font-size:18px;font-weight:700;color:#79c0ff">{ex['on_factor']*0.25:.4f}</div>
+                </div>
+                <div style="text-align:center;">
+                  <div style="font-size:11px;color:#8b949e">🖥️ LAN × 0.25</div>
+                  <div style="font-size:18px;font-weight:700;color:#f85149">{ex['lan_factor']*0.25:.4f}</div>
+                </div>
+              </div>
+              <div style="border-top:1px solid #30363d;padding-top:12px;">
+                <div style="font-size:12px;color:#8b949e">Average = {combined:.4f}</div>
+                <div style="font-size:12px;color:#8b949e;margin-top:4px">
+                  400 + ({combined:.4f} − {min_avg:.4f}) / ({max_avg:.4f} − {min_avg:.4f}) × 1600</div>
+                <div style="font-size:32px;font-weight:700;color:#58a6ff;margin-top:6px">
+                  VRS Score = {ex['seed']:,.1f}</div>
+              </div>
+            </div>""", unsafe_allow_html=True)
+        with col_r:
+            # Radar chart of 4 factors
+            import plotly.graph_objects as _go
+            factors = ["BO", "BC", "ON", "LAN", "BO"]
+            values  = [ex["bo_factor"], ex["bc_factor"], ex["on_factor"], ex["lan_factor"], ex["bo_factor"]]
+            colors  = ["#f0b429", "#3fb950", "#79c0ff", "#f85149"]
+            fig_r   = _go.Figure()
+            fig_r.add_trace(_go.Scatterpolar(
+                r=values, theta=factors, fill="toself",
+                fillcolor="rgba(88,166,255,0.1)", line=dict(color="#58a6ff", width=2),
+                name=sel_team,
+            ))
+            fig_r.update_layout(
+                polar=dict(
+                    radialaxis=dict(visible=True, range=[0,1], gridcolor="#30363d", color="#8b949e"),
+                    angularaxis=dict(gridcolor="#30363d", color="#8b949e"),
+                    bgcolor="#161b22",
+                ),
+                paper_bgcolor="rgba(0,0,0,0)", font=dict(color="#c9d1d9"),
+                showlegend=False, margin=dict(l=20,r=20,t=30,b=20), height=300
+            )
+            st.plotly_chart(fig_r, use_container_width=True)
+
+    # ═══════════════════════════════════════════════════════════════
+    # PHASE 2
+    # ═══════════════════════════════════════════════════════════════
+    st.markdown("---")
+    st.subheader("⚔️ Phase 2 — Head-to-Head (Glicko)")
+    st.markdown(
+        "Starting from the VRS Score, each match in the 6-month window is processed "
+        "chronologically using a Glicko/Elo formula. The cumulative rating shift is the H2H adjustment."
+    )
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("🌱 VRS Score (Phase 1)", f"{ex['seed']:,.1f}")
+    c2.metric("⚔️ H2H Adjustment",      f"{ex['h2h_delta']:+.1f}")
+    c3.metric("🎯 Final Score",          f"{ex['total_points']:,.1f}")
+
+    # Bar chart: VRS Score + H2H offset
+    import plotly.graph_objects as _go2
+    fig_ph2 = _go2.Figure()
+    fig_ph2.add_trace(_go2.Bar(
+        name="VRS Score (Phase 1)", x=[sel_team], y=[ex["seed"]],
+        marker_color="#79c0ff", text=[f"{ex['seed']:.0f}"], textposition="auto",
+    ))
+    h2h_v = ex["h2h_delta"]
+    fig_ph2.add_trace(_go2.Bar(
+        name="H2H Adjustment", x=[sel_team], y=[h2h_v],
+        marker_color="#3fb950" if h2h_v >= 0 else "#f85149",
+        text=[f"{h2h_v:+.1f}"], textposition="auto",
+    ))
+    fig_ph2.update_layout(
+        barmode="relative",
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#c9d1d9"), yaxis=dict(gridcolor="#21262d"),
+        legend=dict(orientation="h", y=1.15),
+        margin=dict(l=10,r=10,t=40,b=10), height=220
+    )
+    st.plotly_chart(fig_ph2, use_container_width=True)
+
+    # Full match list for H2H
+    st.markdown("**All matches (H2H adjustments — oldest first):**")
+    if raw_ms:
+        m_rows = []
+        total_h2h = 0.0
+        for m in sorted(raw_ms, key=lambda x: x["date"]):
+            is_win   = m["result"] == "W"
+            h2h      = m.get("h2h_adj", 0.0)
+            total_h2h += h2h
+            res_badge = (
+                '<span style="background:#1f4a1f;color:#3fb950;border-radius:4px;padding:2px 7px;font-size:11px;font-weight:700">W</span>'
+                if is_win else
+                '<span style="background:#4a1f1f;color:#f85149;border-radius:4px;padding:2px 7px;font-size:11px;font-weight:700">L</span>'
+            )
+            h2h_cell = (
+                f'<span style="color:#3fb950;font-weight:700">+{h2h:.1f}</span>' if h2h > 0 else
+                f'<span style="color:#f85149;font-weight:700">{h2h:.1f}</span>'  if h2h < 0 else
+                '<span style="color:#8b949e">0.0</span>'
+            )
+            lan_icon = '🖥️' if m.get("is_lan") else '🌐'
+            age_bar  = _bar(m["age_w"], "#f0b429", 50)
+            m_rows.append(
+                f'<tr style="border-bottom:1px solid #21262d;">'
+                f'<td style="padding:5px 7px;color:#8b949e;font-size:11px">{m["date"].strftime("%Y-%m-%d")}</td>'
+                f'<td style="padding:5px 7px">{res_badge}</td>'
+                f'<td style="padding:5px 7px;color:#c9d1d9;font-size:12px">{m["opponent"]}</td>'
+                f'<td style="padding:5px 7px;text-align:center">{lan_icon}</td>'
+                f'<td style="padding:5px 7px">{age_bar}</td>'
+                f'<td style="padding:5px 7px;text-align:right">{h2h_cell}</td>'
+                f'</tr>'
+            )
+        n_wins   = sum(1 for m in raw_ms if m["result"] == "W")
+        n_losses = len(raw_ms) - n_wins
+        h2h_color = "#3fb950" if total_h2h >= 0 else "#f85149"
+        st.markdown(
+            '<div style="overflow-y:auto;max-height:380px;border:1px solid #30363d;border-radius:8px;">'
+            '<table style="width:100%;border-collapse:collapse;font-size:12px;">'
+            '<thead style="position:sticky;top:0;background:#161b22;">'
+            '<tr style="color:#8b949e;font-size:10px;text-transform:uppercase;">'
+            '<th style="padding:8px 7px;text-align:left">Date</th>'
+            '<th style="padding:8px 7px">W/L</th>'
+            '<th style="padding:8px 7px;text-align:left">Opponent</th>'
+            '<th style="padding:8px 7px;text-align:center">Type</th>'
+            '<th style="padding:8px 7px;text-align:left">Age Wt</th>'
+            '<th style="padding:8px 7px;text-align:right">H2H Δ pts</th>'
+            '</tr></thead><tbody>' + "".join(m_rows) + '</tbody></table></div>'
+            f'<div style="display:flex;justify-content:space-between;margin-top:6px;font-size:12px;color:#8b949e;padding:0 4px;">'
+            f'<span>{len(raw_ms)} matches · {n_wins}W {n_losses}L</span>'
+            f'<span>Total H2H: <strong style="color:{h2h_color}">{total_h2h:+.1f} pts</strong></span></div>',
+            unsafe_allow_html=True
+        )
+    else:
+        st.info("No match history available for this team.")
+
+    # ═══════════════════════════════════════════════════════════════
+    # TAB 2: HISTORY
+    # ═══════════════════════════════════════════════════════════════
+    st.markdown("---")
+    st.subheader("📈 Historical Performance")
+
+    @st.cache_data(ttl=3600, show_spinner=False)
+    def _load_team_history(team_name: str, all_dates: list) -> pd.DataFrame:
+        """Load rank + score for a team across all available snapshots."""
+        rows = []
+        for ds, yr in all_dates:
+            gd = load_valve_github_data(ds, yr)
+            s  = gd.get("standings", pd.DataFrame())
+            if not s.empty and team_name in s["team"].values:
+                row = s[s["team"] == team_name].iloc[0]
+                try:
+                    dt = datetime.strptime(ds, "%Y_%m_%d")
+                except Exception:
+                    continue
+                rows.append({
+                    "date":         dt,
+                    "date_label":   dt.strftime("%b %d, %Y"),
+                    "rank":         int(row["rank"]),
+                    "total_points": float(row["total_points"]),
+                    "seed":         float(row["seed"]),
+                    "h2h_delta":    float(row["h2h_delta"]),
+                    "bo_factor":    float(row.get("bo_factor", 0)),
+                    "bc_factor":    float(row.get("bc_factor", 0)),
+                    "on_factor":    float(row.get("on_factor", 0)),
+                    "lan_factor":   float(row.get("lan_factor", 0)),
+                    "wins":         int(row.get("wins", 0)),
+                    "losses":       int(row.get("losses", 0)),
+                })
+        return pd.DataFrame(sorted(rows, key=lambda r: r["date"])) if rows else pd.DataFrame()
+
+    with st.spinner(f"Loading history for {sel_team}…"):
+        hist_df = _load_team_history(sel_team, _all_dates)
+
+    if hist_df.empty:
+        st.info(f"No historical snapshots found for {sel_team}.")
+    else:
+        import plotly.graph_objects as _go3
+        from plotly.subplots import make_subplots as _msp
+
+        h_tabs = st.tabs(["📊 Rank & Score", "🔬 Factor Trends", "📋 Summary Table"])
+
+        with h_tabs[0]:
+            fig_h = _msp(rows=2, cols=1, shared_xaxes=True,
+                         subplot_titles=("Global Rank (lower = better)", "Final VRS Score"),
+                         vertical_spacing=0.12)
+            fig_h.add_trace(_go3.Scatter(
+                x=hist_df["date_label"], y=hist_df["rank"], mode="lines+markers",
+                name="Rank", line=dict(color="#f0b429", width=2.5),
+                marker=dict(size=8, color="#f0b429"),
+            ), row=1, col=1)
+            fig_h.add_trace(_go3.Scatter(
+                x=hist_df["date_label"], y=hist_df["total_points"], mode="lines+markers",
+                name="Final Score", line=dict(color="#58a6ff", width=2.5),
+                marker=dict(size=8, color="#58a6ff"),
+                fill="tozeroy", fillcolor="rgba(88,166,255,0.06)",
+            ), row=2, col=1)
+            fig_h.update_yaxes(autorange="reversed", row=1, col=1, gridcolor="#21262d")
+            fig_h.update_yaxes(gridcolor="#21262d", row=2, col=1)
+            fig_h.update_xaxes(gridcolor="#21262d")
+            fig_h.update_layout(
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                font=dict(color="#c9d1d9"), showlegend=False,
+                margin=dict(l=10,r=10,t=40,b=10), height=400,
+            )
+            st.plotly_chart(fig_h, use_container_width=True)
+
+            # Delta metrics vs previous snapshot
+            if len(hist_df) >= 2:
+                latest = hist_df.iloc[-1]
+                prev   = hist_df.iloc[-2]
+                d1,d2,d3,d4 = st.columns(4)
+                rank_delta = int(latest["rank"]) - int(prev["rank"])
+                score_delta = latest["total_points"] - prev["total_points"]
+                d1.metric("Current Rank",  f"#{latest['rank']}",
+                          f"{'-' if rank_delta<0 else '+'}{abs(rank_delta)} ranks",
+                          delta_color="inverse")
+                d2.metric("Final Score",   f"{latest['total_points']:,.0f}",
+                          f"{score_delta:+.0f} pts")
+                d3.metric("Win Rate",
+                          f"{latest['wins']/(latest['wins']+latest['losses'])*100:.0f}%" if (latest['wins']+latest['losses'])>0 else "—")
+                d4.metric("Snapshots tracked", str(len(hist_df)))
+
+        with h_tabs[1]:
+            fig_f = _go3.Figure()
+            factor_series = [
+                ("BO", "bo_factor",  "#f0b429"),
+                ("BC", "bc_factor",  "#3fb950"),
+                ("ON", "on_factor",  "#79c0ff"),
+                ("LAN","lan_factor", "#f85149"),
+            ]
+            for label, col, color in factor_series:
+                if col in hist_df.columns:
+                    fig_f.add_trace(_go3.Scatter(
+                        x=hist_df["date_label"], y=hist_df[col],
+                        name=label, mode="lines+markers",
+                        line=dict(color=color, width=2),
+                        marker=dict(size=6, color=color),
+                    ))
+            fig_f.update_layout(
+                yaxis=dict(title="Factor value (0–1)", gridcolor="#21262d", range=[0,1.05]),
+                xaxis=dict(gridcolor="#21262d"),
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                font=dict(color="#c9d1d9"),
+                legend=dict(orientation="h", y=1.12),
+                margin=dict(l=10,r=10,t=40,b=10), height=340,
+            )
+            st.plotly_chart(fig_f, use_container_width=True)
+            st.caption("Each factor ranges 0–1. Trends reveal whether strength comes from prize money (BO), opponent quality (BC), network depth (ON), or LAN results (LAN).")
+
+            # VRS Score vs H2H breakdown over time
+            fig_ph = _go3.Figure()
+            fig_ph.add_trace(_go3.Bar(
+                x=hist_df["date_label"], y=hist_df["seed"],
+                name="VRS Score (Phase 1)", marker_color="#79c0ff",
+            ))
+            fig_ph.add_trace(_go3.Bar(
+                x=hist_df["date_label"], y=hist_df["h2h_delta"],
+                name="H2H Δ",
+                marker_color=["#3fb950" if v >= 0 else "#f85149" for v in hist_df["h2h_delta"]],
+            ))
+            fig_ph.update_layout(
+                barmode="relative",
+                yaxis=dict(gridcolor="#21262d", title="VRS Score"),
+                xaxis=dict(gridcolor="#21262d"),
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                font=dict(color="#c9d1d9"),
+                legend=dict(orientation="h", y=1.12),
+                margin=dict(l=10,r=10,t=40,b=10), height=280,
+            )
+            st.plotly_chart(fig_ph, use_container_width=True)
+
+        with h_tabs[2]:
+            disp_hist = hist_df[[
+                "date_label","rank","total_points","seed","h2h_delta",
+                "bo_factor","bc_factor","on_factor","lan_factor","wins","losses"
+            ]].rename(columns={
+                "date_label":   "Date",
+                "rank":         "Rank",
+                "total_points": "Final Score",
+                "seed":         "VRS Score",
+                "h2h_delta":    "H2H Δ",
+                "bo_factor":    "BO",
+                "bc_factor":    "BC",
+                "on_factor":    "ON",
+                "lan_factor":   "LAN",
+                "wins":         "W",
+                "losses":       "L",
+            }).sort_values("Date", ascending=False)
+            st.dataframe(disp_hist, use_container_width=True, hide_index=True)
