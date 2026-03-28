@@ -1881,7 +1881,7 @@ The curve distributes "importance" evenly across orders of magnitude.
             st.plotly_chart(fig_c, use_container_width=True)
 
     # ══════════════════════════════════════════════════════════════
-    with tab_bo:
+    with tab_bo2:
         st.subheader("🏆 Factor 1 — Bounty Offered")
         st.markdown('<span class="tag-v">✓ VERIFIED — sum / 5th-ref / curve(min(1,x)) confirmed</span>', unsafe_allow_html=True)
         col_l, col_r = st.columns([3, 2])
@@ -1937,7 +1937,7 @@ Teams below get `BO = curve(ratio)` where ratio < 1 → BO < 1.000.
             st.caption(f"BO_sum (top 5 shown) = ${total_ex:,.0f}. If ref₅ = $334,320 → ratio = {total_ex/334320:.2f} → clamped to 1.0 → BO = 1.000")
 
     # ══════════════════════════════════════════════════════════════
-    with tab_bc:
+    with tab_bc2:
         st.subheader("💰 Factor 2 — Bounty Collected")
         st.markdown('<span class="tag-v">✓ VERIFIED — BC = curve(Σ_top10_adjusted / 10) confirmed numerically</span>', unsafe_allow_html=True)
         col_l, col_r = st.columns([3, 2])
@@ -2002,7 +2002,7 @@ Sum of top 10 = **8.256**, /10 = **0.8256**, curve(0.8256) = **0.923** ✓
             st.caption("Beating one strong opponent can be worth more than beating 10 weak ones.")
 
     # ══════════════════════════════════════════════════════════════
-    with tab_on:
+    with tab_on2:
         st.subheader("🕸️ Factor 3 — Opponent Network")
         st.markdown('<span class="tag-v">✓ VERIFIED — ON = Σ_top10_adjusted / 10, NO curve, confirmed numerically</span>', unsafe_allow_html=True)
         col_l, col_r = st.columns([3, 2])
@@ -2095,7 +2095,7 @@ who have themselves beaten many opponents scores highly, regardless of prize mon
             st.caption("Values converge within 5–6 iterations. We use 6 in the engine.")
 
     # ══════════════════════════════════════════════════════════════
-    with tab_lan:
+    with tab_lan2:
         st.subheader("🖥️ Factor 4 — LAN Wins")
         st.markdown('<span class="tag-v">✓ VERIFIED — 1.0 × age_weight, top-10, /10, no curve, no event stakes</span>', unsafe_allow_html=True)
         col_l, col_r = st.columns([3, 2])
@@ -2498,7 +2498,7 @@ Beating a rich, high-BO opponent recently at a big event → maximum entry.
                 opp_bo = opp_bo_map.get(m["opponent"], 0.0)
                 entry  = opp_bo * m["age_w"] * m["ev_w"]
                 bc_entries.append((entry, m, opp_bo))
-            bc_entries.sort(reverse=True)
+            bc_entries.sort(key=lambda x: x[0], reverse=True)
             top10_bc = bc_entries[:10]
 
             if bc_entries:
@@ -2571,7 +2571,7 @@ Beating a rich, high-BO opponent recently at a big event → maximum entry.
                 opp_on = opp_on_map.get(m["opponent"], 0.0)
                 entry  = opp_on * m["age_w"] * m["ev_w"]
                 on_entries.append((entry, m, opp_on))
-            on_entries.sort(reverse=True)
+            on_entries.sort(key=lambda x: x[0], reverse=True)
 
             if on_entries:
                 on_rows = []
@@ -2627,7 +2627,7 @@ LAN only affects **this factor** — there is no LAN bonus in the H2H phase.
 """)
             lan_wins_list = [m for m in raw_ms if m["result"] == "W" and m.get("is_lan")]
             lan_entries   = sorted(
-                [(m["age_w"], m) for m in lan_wins_list], reverse=True
+                [(m["age_w"], m) for m in lan_wins_list], key=lambda x: x[0], reverse=True
             )
             sum10_lan = sum(aw for aw, _ in lan_entries[:10])
             st.markdown(f"""
