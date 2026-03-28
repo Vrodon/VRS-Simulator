@@ -1071,14 +1071,6 @@ if _gd["error"]:
 cutoff_dt   = _gd["cutoff_datetime"]
 cutoff_date = cutoff_dt   # alias used in page display
 
-with st.sidebar:
-    if sim_active:
-        st.info(f"🔮 Simulation  ·  {sim_cutoff_dt.strftime('%Y_%m_%d')}")
-    elif _gd["source"] == "github":
-        st.success(f"✅ {_gd['total_teams']} teams  ·  {_gd['cutoff_date']}")
-    else:
-        st.error("❌ GitHub offline — limited data")
-
 # ══════════════════════════════════════════════════════════════════
 # BASE COMPUTATION
 # ══════════════════════════════════════════════════════════════════
@@ -1394,6 +1386,15 @@ if sim_active:
         Matches near the old window edge may drop out entirely (age&nbsp;→&nbsp;0).
       </div>
     </div>""", unsafe_allow_html=True)
+
+# ── Sidebar status (after simulation state is resolved) ───────────
+with st.sidebar:
+    if sim_active:
+        st.info(f"🔮 Simulation  ·  {sim_cutoff_dt.strftime('%Y_%m_%d')}")
+    elif _gd["source"] == "github":
+        st.success(f"✅ {_gd['total_teams']} teams  ·  {_gd['cutoff_date']}")
+    else:
+        st.error("❌ GitHub offline — limited data")
 
 
 # ══════════════════════════════════════════════════════════════════
