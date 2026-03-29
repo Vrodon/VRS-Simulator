@@ -703,7 +703,7 @@ if page == "📊 Ranking Dashboard":
             margin=dict(l=10, r=80, t=40, b=10),
             height=max(300, len(movers) * 26),
         )
-        st.plotly_chart(fig_decay, use_container_width=True)
+        st.plotly_chart(fig_decay, use_container_width=True, config={"staticPlot": True})
 
     st.markdown("---")
 
@@ -863,7 +863,7 @@ if page == "📊 Ranking Dashboard":
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
             margin=dict(l=10, r=10, t=40, b=80), height=400,
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, config={"staticPlot": True})
 
     with col2:
         st.subheader("🕸️ Top 10 — Factor Radar")
@@ -889,7 +889,7 @@ if page == "📊 Ranking Dashboard":
             legend=dict(orientation="v", x=1.05, y=0.5, font=dict(size=10)),
             margin=dict(l=10, r=120, t=10, b=10), height=400,
         )
-        st.plotly_chart(fig2, use_container_width=True)
+        st.plotly_chart(fig2, use_container_width=True, config={"staticPlot": True})
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1030,7 +1030,7 @@ elif page == "🔮 Scenario Simulator":
                     margin=dict(l=10, r=80, t=40, b=10),
                     height=max(300, len(plot_df) * 28),
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True, config={"staticPlot": True})
     else:
         st.info("👆 Add at least one match, then click **Simulate & Compare**.")
 
@@ -1128,7 +1128,7 @@ elif page == "⚔️ Team Comparison":
             legend=dict(orientation="h", yanchor="bottom", y=-0.15, xanchor="center", x=0.5),
             height=400, margin=dict(l=10, r=10, t=10, b=40),
         )
-        st.plotly_chart(fig_r, use_container_width=True)
+        st.plotly_chart(fig_r, use_container_width=True, config={"staticPlot": True})
 
     with col2:
         st.subheader("📊 Raw Factor Scores")
@@ -1159,7 +1159,7 @@ elif page == "⚔️ Team Comparison":
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
             height=400, margin=dict(l=10, r=10, t=40, b=10),
         )
-        st.plotly_chart(fig_b, use_container_width=True)
+        st.plotly_chart(fig_b, use_container_width=True, config={"staticPlot": True})
 
     # ── H2H record ────────────────────────────────────────────────
     st.markdown("---")
@@ -1484,25 +1484,42 @@ and therefore do **not contribute** to BC or ON at all.
             fig_ew = go.Figure()
             fig_ew.add_trace(go.Scatter(
                 x=[x/1e6 for x in _ew_xs], y=_ew_ys, mode="lines",
-                line=dict(color="#3fb950", width=2.5),
-                fill="tozeroy", fillcolor="rgba(63,185,80,0.07)"))
+                line=dict(color="#58a6ff", width=2.5),
+                fill="tozeroy", fillcolor="rgba(88,166,255,0.07)"))
             fig_ew.add_trace(go.Scatter(
                 x=[_ew_pool/1e6], y=[_ew_val], mode="markers",
-                marker=dict(color="#3fb950", size=12, symbol="diamond"), showlegend=False))
-            for pp, lbl in [(1e6, "$1M → 100%"), (1e5, "$100k → 50%")]:
+                marker=dict(color="#f0b429", size=12, symbol="diamond",
+                            line=dict(color="#c9d1d9", width=1.5)),
+                showlegend=False))
+            fig_ew.add_vrect(x0=1.0, x1=1.2, fillcolor="#3fb950", opacity=0.06,
+                line_width=0, annotation_text="Capped at $1M",
+                annotation_position="top right",
+                annotation=dict(font_color="#3fb950", font_size=10))
+            fig_ew.add_vline(x=1.0, line_dash="dot", line_color="#3fb950",
+                annotation_text="$1M cap", annotation_position="top left",
+                annotation=dict(font_color="#3fb950", font_size=10))
+            for pp, lbl, ax_off, ay_off in [
+                (1e6,  "$1M → 1.000",  -55, -25),
+                (5e5,  "$500k → 0.769", 50, -30),
+                (1e5,  "$100k → 0.500", 50, -20),
+                (2.5e4,"$25k → 0.286",  50,  20),
+            ]:
                 ev = event_stakes(max(pp, 1))
                 fig_ew.add_annotation(x=pp/1e6, y=ev, text=lbl,
-                    showarrow=True, arrowhead=0, ax=40, ay=-20,
-                    font=dict(size=9, color="#8b949e"))
+                    showarrow=True, arrowhead=2, arrowwidth=1,
+                    arrowcolor="#484f58", ax=ax_off, ay=ay_off,
+                    font=dict(size=9, color="#8b949e"),
+                    bgcolor="rgba(22,27,34,0.85)", bordercolor="#30363d", borderwidth=1)
             fig_ew.update_layout(
                 xaxis=dict(title="Prize Pool ($M)", gridcolor="#21262d",
                            tickvals=[0, 0.1, 0.25, 0.5, 0.75, 1.0, 1.2],
                            ticktext=["$0","$100k","$250k","$500k","$750k","$1M","$1.2M"]),
-                yaxis=dict(title="Event Weight", gridcolor="#21262d", range=[0, 1.1]),
+                yaxis=dict(title="Event Weight", gridcolor="#21262d",
+                           tickformat=".0%", range=[-0.05, 1.15]),
                 paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                 font=dict(color="#c9d1d9"), showlegend=False,
-                margin=dict(l=10,r=10,t=10,b=10), height=280)
-            st.plotly_chart(fig_ew, use_container_width=True)
+                margin=dict(l=10,r=10,t=20,b=10), height=300)
+            st.plotly_chart(fig_ew, use_container_width=True, config={"staticPlot": True})
             st.caption(
                 "Source: [Reddit — How Valve's CSGO Team Ranking System Works]"
                 "(https://www.reddit.com/r/GlobalOffensive/comments/15j0t5e/) · "
@@ -1585,7 +1602,7 @@ This is NOT a simple 0→1 remap over 180 days. The flat period is critical.
                 paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                 font=dict(color="#c9d1d9"), showlegend=False,
                 margin=dict(l=10,r=10,t=10,b=10), height=280)
-            st.plotly_chart(fig_aw, use_container_width=True)
+            st.plotly_chart(fig_aw, use_container_width=True, config={"staticPlot": True})
 
     # ══════════════════════════════════════════════════════════════
     with tab_curve:
@@ -1644,23 +1661,32 @@ scores to teams that are orders of magnitude below the top.
             ys_c = [curve(x) for x in xs_c]
             fig_c = go.Figure()
             fig_c.add_trace(go.Scatter(x=xs_c, y=ys_c,
-                mode="lines", line=dict(color="#3fb950", width=2.5),
-                fill="tozeroy", fillcolor="rgba(63,185,80,0.07)"))
+                mode="lines", line=dict(color="#bc8cff", width=2.5),
+                fill="tozeroy", fillcolor="rgba(188,140,255,0.07)"))
             fig_c.add_trace(go.Scatter(x=[_cv_input], y=[_cv_output], mode="markers",
-                marker=dict(color="#3fb950", size=12, symbol="diamond"), showlegend=False))
-            # Reference annotations
-            for xr, lbl in [(1.0, "f(1.0) = 1.000"), (0.5, "f(0.5) = 0.769"),
-                            (0.1, "f(0.1) = 0.500"), (0.01, "f(0.01) = 0.333")]:
+                marker=dict(color="#f0b429", size=12, symbol="diamond",
+                            line=dict(color="#c9d1d9", width=1.5)),
+                showlegend=False))
+            for xr, lbl, ax_off, ay_off in [
+                (1.00, "f(1.0) = 1.000", -65, -25),
+                (0.50, "f(0.5) = 0.769", -65, -25),
+                (0.10, "f(0.1) = 0.500",  50, -25),
+                (0.01, "f(0.01) = 0.333", 50,  20),
+            ]:
                 fig_c.add_annotation(x=xr, y=curve(xr), text=lbl,
-                    showarrow=True, arrowhead=0, ax=50, ay=-15,
-                    font=dict(size=9, color="#8b949e"))
+                    showarrow=True, arrowhead=2, arrowwidth=1,
+                    arrowcolor="#484f58", ax=ax_off, ay=ay_off,
+                    font=dict(size=9, color="#8b949e"),
+                    bgcolor="rgba(22,27,34,0.85)", bordercolor="#30363d", borderwidth=1)
             fig_c.update_layout(
-                xaxis=dict(title="Pre-curve value (x)", gridcolor="#21262d"),
-                yaxis=dict(title="f(x) — after curve", gridcolor="#21262d", range=[0, 1.1]),
+                xaxis=dict(title="Pre-curve value (x)", gridcolor="#21262d",
+                           tickvals=[0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]),
+                yaxis=dict(title="f(x) — after curve", gridcolor="#21262d",
+                           tickformat=".0%", range=[-0.05, 1.15]),
                 paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                 font=dict(color="#c9d1d9"), showlegend=False,
                 margin=dict(l=10,r=10,t=10,b=10), height=280)
-            st.plotly_chart(fig_c, use_container_width=True)
+            st.plotly_chart(fig_c, use_container_width=True, config={"staticPlot": True})
             st.caption(
                 "The curve is also used for Event Weight (see Event Weight tab), "
                 "but with prize_pool/$1M as input instead of factor values."
@@ -1784,7 +1810,7 @@ Sum of top 10 = **8.256**, /10 = **0.8256**, curve(0.8256) = **0.923** ✓
                 paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                 font=dict(color="#c9d1d9"), xaxis=dict(gridcolor="#21262d"),
                 margin=dict(l=10,r=10,t=10,b=10), height=320)
-            st.plotly_chart(fig_bc, use_container_width=True)
+            st.plotly_chart(fig_bc, use_container_width=True, config={"staticPlot": True})
             st.caption("Beating one strong opponent can be worth more than beating 10 weak ones.")
 
     # ══════════════════════════════════════════════════════════════
@@ -1877,7 +1903,7 @@ who have themselves beaten many opponents scores highly, regardless of prize mon
                 font=dict(color="#c9d1d9"),
                 legend=dict(orientation="h", y=1.15),
                 margin=dict(l=10,r=10,t=30,b=10), height=280)
-            st.plotly_chart(fig_pg, use_container_width=True)
+            st.plotly_chart(fig_pg, use_container_width=True, config={"staticPlot": True})
             st.caption("Values converge within 5–6 iterations. We use 6 in the engine.")
 
     # ══════════════════════════════════════════════════════════════
@@ -1936,7 +1962,7 @@ The maximum LAN factor is 1.000 (10 or more recent LAN wins all at age=1.000).
                 paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                 font=dict(color="#c9d1d9"), xaxis=dict(gridcolor="#21262d"),
                 margin=dict(l=10,r=10,t=10,b=80), height=340)
-            st.plotly_chart(fig_lan, use_container_width=True)
+            st.plotly_chart(fig_lan, use_container_width=True, config={"staticPlot": True})
             st.caption("Recent LAN wins are worth much more than old ones. 10 wins 3 months ago scores the same as 5 wins last month.")
 
     # ══════════════════════════════════════════════════════════════
@@ -2037,7 +2063,7 @@ produce different, incorrect results.
                 paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                 font=dict(color="#c9d1d9"),
                 margin=dict(l=10,r=10,t=10,b=10), height=240)
-            st.plotly_chart(fig_sh, use_container_width=True)
+            st.plotly_chart(fig_sh, use_container_width=True, config={"staticPlot": True})
 
     # ══════════════════════════════════════════════════════════════
     with tab_seed:
@@ -2081,7 +2107,7 @@ $$\text{Factor Score} = 400 + \frac{0.846 - 0.000}{0.846 - 0.000} \times 1600 = 
             fig_weights.update_layout(
                 paper_bgcolor="rgba(0,0,0,0)", font=dict(color="#c9d1d9"),
                 showlegend=False, height=300, margin=dict(l=10,r=10,t=10,b=10))
-            st.plotly_chart(fig_weights, use_container_width=True)
+            st.plotly_chart(fig_weights, use_container_width=True, config={"staticPlot": True})
             st.markdown("""
 **Why lerp (not just sort)?**
 
@@ -2316,7 +2342,7 @@ elif page == "🔍 Team Breakdown":
                 height=320,
                 showlegend=False,
             )
-            st.plotly_chart(fig_wf, use_container_width=True)
+            st.plotly_chart(fig_wf, use_container_width=True, config={"staticPlot": True})
 
             # ── Insight text (directly under waterfall) ───────
             _drivers = [
@@ -2650,7 +2676,7 @@ When the eligible pool changes (teams drop out due to inactivity or window expir
             legend=dict(orientation="h", y=1.18),
             margin=dict(l=10,r=10,t=40,b=10), height=200,
         )
-        st.plotly_chart(fig_p2, use_container_width=True)
+        st.plotly_chart(fig_p2, use_container_width=True, config={"staticPlot": True})
 
         # All matches for H2H (newest first)
         if raw_ms:
@@ -2811,7 +2837,7 @@ When the eligible pool changes (teams drop out due to inactivity or window expir
                 margin=dict(l=10,r=10,t=40,b=10), height=350,
                 barmode="group",
             )
-            st.plotly_chart(fig_dual, use_container_width=True)
+            st.plotly_chart(fig_dual, use_container_width=True, config={"staticPlot": True})
 
             # Delta vs previous snapshot
             if len(hist_df) >= 2:
@@ -2851,7 +2877,7 @@ When the eligible pool changes (teams drop out due to inactivity or window expir
                 legend=dict(orientation="h", y=1.12),
                 margin=dict(l=10,r=10,t=40,b=10), height=280,
             )
-            st.plotly_chart(fig_f, use_container_width=True)
+            st.plotly_chart(fig_f, use_container_width=True, config={"staticPlot": True})
 
             st.markdown("---")
 
