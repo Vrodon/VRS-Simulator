@@ -2237,7 +2237,6 @@ Click any factor to jump to its detailed tab.
         st.markdown("""
 <div style="background:#0d1117;border:1px solid #30363d;border-radius:12px;padding:24px;margin:12px 0;">
 
-  <!-- Match History (top) -->
   <div style="text-align:center;margin-bottom:20px;">
     <div style="display:inline-block;background:#161b22;border:2px solid #8b949e;border-radius:8px;
                 padding:10px 28px;font-size:14px;font-weight:700;color:#8b949e;">
@@ -2246,15 +2245,12 @@ Click any factor to jump to its detailed tab.
     <div style="color:#30363d;font-size:20px;margin:6px 0;">▼</div>
   </div>
 
-  <!-- Two phases side by side -->
   <div style="display:flex;gap:20px;margin-bottom:20px;">
 
-    <!-- Phase 1 -->
     <div style="flex:1;background:#0d1a2e;border:2px solid #58a6ff;border-radius:10px;padding:16px;">
       <div style="font-size:14px;font-weight:700;color:#58a6ff;text-align:center;margin-bottom:14px;">
         Phase 1 — Factor Score</div>
 
-      <!-- Background modifiers -->
       <div style="display:flex;gap:6px;margin-bottom:12px;justify-content:center;">
         <span style="background:#21262d;border:1px solid #484f58;border-radius:6px;padding:4px 10px;
                      font-size:11px;color:#8b949e;">⏳ Age Weight</span>
@@ -2264,7 +2260,6 @@ Click any factor to jump to its detailed tab.
                      font-size:11px;color:#8b949e;">📐 Curve</span>
       </div>
 
-      <!-- Four factors -->
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:14px;">
         <div style="background:#161b22;border-left:3px solid #f0b429;border-radius:6px;padding:10px;text-align:center;">
           <div style="font-size:12px;font-weight:700;color:#f0b429;">🏆 Bounty Offered</div>
@@ -2284,7 +2279,6 @@ Click any factor to jump to its detailed tab.
         </div>
       </div>
 
-      <!-- Average + Lerp -->
       <div style="text-align:center;color:#30363d;font-size:16px;margin-bottom:8px;">▼ avg (25% each) ▼</div>
       <div style="background:#161b22;border:2px solid #58a6ff;border-radius:8px;padding:10px;text-align:center;">
         <div style="font-size:13px;font-weight:700;color:#58a6ff;">🌱 Factor Score</div>
@@ -2292,7 +2286,6 @@ Click any factor to jump to its detailed tab.
       </div>
     </div>
 
-    <!-- Phase 2 -->
     <div style="flex:1;background:#0d1a0d;border:2px solid #3fb950;border-radius:10px;padding:16px;
                 display:flex;flex-direction:column;justify-content:space-between;">
       <div>
@@ -2313,7 +2306,6 @@ Click any factor to jump to its detailed tab.
     </div>
   </div>
 
-  <!-- Final result -->
   <div style="text-align:center;">
     <div style="color:#30363d;font-size:20px;margin-bottom:6px;">▼ + ▼</div>
     <div style="display:inline-block;background:#2d1f00;border:2px solid #f0b429;border-radius:10px;
@@ -2377,29 +2369,51 @@ and therefore do **not contribute** to BC or ON at all.
 """)
         with col_r:
             st.markdown("#### 🎛️ Event Weight Calculator")
-            _ew_pool = st.number_input("Prize pool (USD)", 1000, 2_000_000, 250_000, 10_000, key="ew_pool")
-            _ew_val = event_stakes(_ew_pool)
+            _ew_pool = st.slider("Prize pool (USD)", 0, 2_000_000, 250_000, 10_000, key="ew_pool")
+            _ew_val = event_stakes(max(_ew_pool, 1))
+            _ew_color = "#3fb950" if _ew_val > 0.7 else ("#f0b429" if _ew_val > 0.4 else "#f85149")
             st.markdown(f"""
             <div style="background:#161b22;border:1px solid #30363d;border-radius:10px;
-                        padding:16px;text-align:center;">
-              <div style="font-size:12px;color:#8b949e">pool / $1,000,000 = {min(_ew_pool, PRIZE_CAP)/PRIZE_CAP:.4f}</div>
-              <div style="font-size:38px;font-weight:700;color:#f0b429;margin:8px 0">{_ew_val:.4f}</div>
+                        padding:16px;text-align:center;margin-bottom:12px;">
+              <div style="font-size:12px;color:#8b949e">${_ew_pool:,.0f} / $1,000,000</div>
+              <div style="font-size:48px;font-weight:700;color:{_ew_color};margin:4px 0">{_ew_val:.4f}</div>
               <div style="font-size:12px;color:#8b949e">Event Weight</div>
+              <div style="font-size:11px;color:#484f58;margin-top:4px">
+                  {'✅ Full weight' if _ew_pool >= 1_000_000 else
+                   f'→ {_ew_val*100:.0f}% of a $1M Major' if _ew_pool > 0 else
+                   '→ 14.3% (minimum floor)'}</div>
             </div>""", unsafe_allow_html=True)
 
-            st.markdown("#### Reference table")
-            ref_ew = [
-                (1_000_000, "$1M (Major)"), (500_000, "$500k"), (250_000, "$250k"),
-                (100_000, "$100k"), (50_000, "$50k"), (10_000, "$10k"),
-            ]
-            st.dataframe(pd.DataFrame([{
-                "Event": lbl, "Prize Pool": f"${p:,.0f}",
-                "Event Weight": f"{event_stakes(p):.4f}",
-            } for p, lbl in ref_ew]), use_container_width=True, hide_index=True)
-
+            # Event Weight curve chart
+            _ew_xs = list(range(0, 1_100_000, 10_000))
+            _ew_ys = [event_stakes(max(x, 1)) for x in _ew_xs]
+            fig_ew = go.Figure()
+            fig_ew.add_trace(go.Scatter(
+                x=[x/1e6 for x in _ew_xs], y=_ew_ys, mode="lines",
+                line=dict(color="#f0b429", width=2.5),
+                fill="tozeroy", fillcolor="rgba(240,180,41,0.07)"))
+            fig_ew.add_trace(go.Scatter(
+                x=[_ew_pool/1e6], y=[_ew_val], mode="markers",
+                marker=dict(color=_ew_color, size=12, symbol="diamond"), showlegend=False))
+            # Key reference points
+            for pp, lbl in [(1e6, "$1M → 100%"), (1e5, "$100k → 50%"), (0, "$0 → 14.3%")]:
+                ev = event_stakes(max(pp, 1))
+                fig_ew.add_annotation(x=pp/1e6, y=ev, text=lbl,
+                    showarrow=True, arrowhead=0, ax=40, ay=-20,
+                    font=dict(size=9, color="#8b949e"))
+            fig_ew.update_layout(
+                xaxis=dict(title="Prize Pool ($M)", gridcolor="#21262d",
+                           tickvals=[0, 0.1, 0.25, 0.5, 0.75, 1.0],
+                           ticktext=["$0","$100k","$250k","$500k","$750k","$1M"]),
+                yaxis=dict(title="Event Weight", gridcolor="#21262d", range=[0, 1.1]),
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                font=dict(color="#c9d1d9"), showlegend=False,
+                margin=dict(l=10,r=10,t=10,b=10), height=280)
+            st.plotly_chart(fig_ew, use_container_width=True)
             st.caption(
-                "Events with higher prize pools have disproportionately more weight. "
-                "This incentivizes teams to compete at the biggest tournaments."
+                "Source: [Reddit — How Valve's CSGO Team Ranking System Works]"
+                "(https://www.reddit.com/r/GlobalOffensive/comments/15j0t5e/) · "
+                '"$1M tournaments are scaled 100%, $100k tournaments 50%, $0 tournaments 14.3%"'
             )
 
     # ══════════════════════════════════════════════════════════════
@@ -2491,63 +2505,74 @@ The curve function compresses any positive value into $(0,\,1]$ using a log scal
 
 $$f(x) = \frac{1}{1 + |\log_{10}(x)|}$$
 
-It is used in **three places:**
+**Where is it applied?** The curve is used as a **normalisation step** on two factors:
 
-| Usage | Input x | Applied to |
+| Factor | Input x | Why |
 |---|---|---|
-| **Event stakes** | `pool / $1,000,000` | BC, ON (not BO or LAN) |
-| **BO normalisation** | `min(1.0, bo_sum / 5th_ref)` | Final BO factor |
-| **BC normalisation** | `Σ_top10_adjusted / 10` | Final BC factor |
+| **Bounty Offered** | `min(1.0, bo_sum / 5th_ref)` | Compress prize money ratio into [0, 1] |
+| **Bounty Collected** | `Σ_top10_adjusted / 10` | Compress opponent-strength sum into [0, 1] |
+
+It is **not** applied to Opponent Network or LAN Wins.
+
+**What does it do for BC?** Without the curve, a team that beats 10 opponents with
+avg BO=0.05 would get BC_pre = 0.05. The curve maps this to `f(0.05) = 0.435` — a
+significant boost. This prevents small teams from having near-zero BC scores when
+they beat opponents with modest BO values.
+
+**What does it do for BO?** Teams with less prize money than the top 5 get a ratio < 1.
+The curve compresses this: a team at 10% of the ref gets `f(0.1) = 0.500` instead of 0.1.
+This keeps smaller teams competitive in the ranking.
 
 **Key properties:**
-- `f(1.0) = 1.000` — at the reference, full value
-- `f(0.5) ≈ 0.768` — half the reference
-- `f(0.1) = 0.500` — one-tenth of reference
-- `f(0.01) = 0.333` — one-hundredth
-- Peaks at x = 1; symmetric in log-space (f(0.1) = f(10))
+- `f(1.0) = 1.000` — at the reference point, full value
+- `f(0.5) ≈ 0.769` — half of the reference
+- `f(0.1) = 0.500` — one-tenth still gets 50%
+- `f(0.01) = 0.333` — one-hundredth still gets 33%
+- Peaks at x = 1; symmetric in log-space
 
-**Why log-scale?** A $100k event is roughly as different from $10k as $1M is from $100k.
-The curve distributes "importance" evenly across orders of magnitude.
+**In short:** The curve prevents the rich-get-richer effect by giving meaningful
+scores to teams that are orders of magnitude below the top.
 """)
-            st.markdown("**Event stakes reference table:**")
-            ref = [(1_000_000,"$1M (Major)",),(500_000,"$500k"),(250_000,"$250k"),
-                   (100_000,"$100k"),(50_000,"$50k"),(10_000,"$10k")]
-            st.dataframe(pd.DataFrame([{
-                "Prize Pool": lbl, "x = pool/$1M": f"{p/1e6:.3f}",
-                "Event Stakes f(x)": f"{event_stakes(p):.4f}",
-            } for p,lbl in ref]), use_container_width=True, hide_index=True)
-
         with col_r:
             st.markdown("#### 🎛️ Curve Calculator")
-            pool_calc = st.number_input("Prize pool (USD)", 1000, 2_000_000, 250_000, 10_000, key="cv_pool")
-            x_c = min(float(pool_calc), PRIZE_CAP) / PRIZE_CAP
-            fx_c = curve(x_c)
+            st.caption("Input: a factor value between 0 and 1 (typical BC/BO pre-curve range)")
+            _cv_input = st.slider("Pre-curve value (x)", 0.01, 1.50, 0.25, 0.01, key="cv_x")
+            _cv_output = curve(_cv_input)
+            _cv_color = "#3fb950" if _cv_output > 0.7 else ("#79c0ff" if _cv_output > 0.4 else "#f85149")
             st.markdown(f"""
             <div style="background:#161b22;border:1px solid #30363d;border-radius:10px;
-                        padding:16px;text-align:center;">
-              <div style="font-size:12px;color:#8b949e">x = ${min(pool_calc,PRIZE_CAP):,.0f} / $1,000,000</div>
-              <div style="font-size:28px;font-weight:700;color:#79c0ff;margin:4px 0">x = {x_c:.4f}</div>
-              <div style="font-size:12px;color:#8b949e">f(x) = 1 / (1 + |log₁₀({x_c:.4f})|)</div>
-              <div style="font-size:38px;font-weight:700;color:#f0b429;margin-top:6px">{fx_c:.4f}</div>
-              <div style="font-size:12px;color:#8b949e">Event Stakes</div>
+                        padding:16px;text-align:center;margin-bottom:12px;">
+              <div style="font-size:13px;color:#8b949e">f({_cv_input:.2f}) = 1 / (1 + |log₁₀({_cv_input:.2f})|)</div>
+              <div style="font-size:48px;font-weight:700;color:{_cv_color};margin:4px 0">{_cv_output:.4f}</div>
+              <div style="font-size:12px;color:#8b949e">After curve normalization</div>
             </div>""", unsafe_allow_html=True)
 
-            xs_c = [i/200 for i in range(1, 201)]
+            # Curve chart with x from 0 to 1.5
+            xs_c = [i/100 for i in range(1, 151)]
             ys_c = [curve(x) for x in xs_c]
             fig_c = go.Figure()
-            fig_c.add_trace(go.Scatter(x=[xi*1e6 for xi in xs_c], y=ys_c,
-                mode="lines", line=dict(color="#f0b429", width=2.5)))
-            fig_c.add_trace(go.Scatter(x=[pool_calc], y=[fx_c], mode="markers",
-                marker=dict(color="#58a6ff", size=12, symbol="diamond"), showlegend=False))
+            fig_c.add_trace(go.Scatter(x=xs_c, y=ys_c,
+                mode="lines", line=dict(color="#79c0ff", width=2.5),
+                fill="tozeroy", fillcolor="rgba(121,192,255,0.07)"))
+            fig_c.add_trace(go.Scatter(x=[_cv_input], y=[_cv_output], mode="markers",
+                marker=dict(color=_cv_color, size=12, symbol="diamond"), showlegend=False))
+            # Reference annotations
+            for xr, lbl in [(1.0, "f(1.0) = 1.000"), (0.5, "f(0.5) = 0.769"),
+                            (0.1, "f(0.1) = 0.500"), (0.01, "f(0.01) = 0.333")]:
+                fig_c.add_annotation(x=xr, y=curve(xr), text=lbl,
+                    showarrow=True, arrowhead=0, ax=50, ay=-15,
+                    font=dict(size=9, color="#8b949e"))
             fig_c.update_layout(
-                xaxis=dict(title="Prize Pool (USD)", gridcolor="#21262d",
-                    tickvals=[0,100_000,250_000,500_000,750_000,1_000_000],
-                    ticktext=["$0","$100k","$250k","$500k","$750k","$1M"]),
-                yaxis=dict(title="f(x)", gridcolor="#21262d", range=[0,1.1]),
+                xaxis=dict(title="Pre-curve value (x)", gridcolor="#21262d"),
+                yaxis=dict(title="f(x) — after curve", gridcolor="#21262d", range=[0, 1.1]),
                 paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                 font=dict(color="#c9d1d9"), showlegend=False,
                 margin=dict(l=10,r=10,t=10,b=10), height=280)
             st.plotly_chart(fig_c, use_container_width=True)
+            st.caption(
+                "The curve is also used for Event Weight (see Event Weight tab), "
+                "but with prize_pool/$1M as input instead of factor values."
+            )
 
     # ══════════════════════════════════════════════════════════════
     with tab_bo2:
