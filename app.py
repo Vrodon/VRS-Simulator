@@ -2104,88 +2104,303 @@ elif page == "📖 How VRS Works":
     </style>
     """, unsafe_allow_html=True)
 
-    st.title("📖 How the VRS is Calculated")
-    st.markdown(
-        "Complete technical breakdown — every formula verified against "
-        "Valve's published Vitality detail sheet (March 2026 cutoff)."
-    )
-    st.markdown(
-        '<span class="tag-v">✓ VERIFIED</span>&nbsp; Formula confirmed from official data &nbsp;&nbsp;'
-        '<span class="tag-a">~ ASSUMED</span>&nbsp; Not explicitly stated in public spec',
-        unsafe_allow_html=True,
-    )
-    st.markdown("---")
+    st.title("📖 How the VRS Works")
 
-    tab_arch, tab_age, tab_curve, tab_bo2, tab_bc2, tab_on2, tab_lan2, tab_h2h, tab_seed = st.tabs([
+    # ── Tab categories ────────────────────────────────────────────
+    # Welcome | Architecture | Background (Age, Event, Curve) | Factors (BO, BC, ON, LAN → Seed) | Final (H2H)
+    (tab_welcome, tab_arch,
+     tab_age, tab_evw, tab_curve,
+     tab_bo2, tab_bc2, tab_on2, tab_lan2, tab_seed,
+     tab_h2h) = st.tabs([
+        "👋 Welcome",
         "🏗️ Architecture",
+        #  — Background —
         "⏳ Age Weight",
+        "🎪 Event Weight",
         "📐 Curve f(x)",
+        #  — Four Factors —
         "🏆 Bounty Offered",
         "💰 Bounty Collected",
         "🕸️ Opp. Network",
         "🖥️ LAN Wins",
-        "⚔️ H2H (Glicko)",
-        "🌱 Factor Score",
+        "🌱 → Factor Score",
+        #  — Final —
+        "⚔️ H2H → Final",
     ])
 
     # ══════════════════════════════════════════════════════════════
+    with tab_welcome:
+    # ══════════════════════════════════════════════════════════════
+
+        st.markdown("""
+### What is the VRS?
+
+The **Valve Regional Standings** (VRS) is Valve's official ranking system for professional
+Counter-Strike 2 teams. Introduced in October 2023, it replaced the previous RMR
+(Regional Major Rankings) system and is now the **sole factor** for determining invitations
+to Major Championships and seedings at Valve-sanctioned events.
+
+> *"Teams play meaningful matches in third-party events throughout the year.
+> To reduce the burden on Major participants and streamline the Major qualification process,
+> we're going to leverage those match results to identify teams that should be invited
+> to later qualification stages."*
+> — **Valve** (2023 announcement)
+
+### Why does it matter?
+
+Unlike community-driven rankings (e.g. HLTV), the VRS directly determines which teams
+get to play at Majors — the most prestigious tournaments in CS2. Tournament organizers
+are also increasingly using VRS for their own invitations, making it the backbone of the
+entire competitive CS2 ecosystem.
+
+### What does this tool offer?
+
+This site fetches live data from [Valve's GitHub repository](https://github.com/ValveSoftware/counter-strike_regional_standings)
+and provides three things:
+""")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.markdown("""
+<div style="background:#161b22;border:1px solid #30363d;border-top:3px solid #58a6ff;
+            border-radius:8px;padding:16px;height:200px;">
+  <div style="font-size:22px;margin-bottom:8px">📊</div>
+  <div style="font-size:15px;font-weight:700;color:#58a6ff;margin-bottom:6px">Live Rankings</div>
+  <div style="font-size:12px;color:#8b949e;line-height:1.6">
+    Current and historical VRS standings with full factor breakdowns per team.
+    Explore global, European, Americas, and Asia rankings.
+  </div>
+</div>""", unsafe_allow_html=True)
+        with c2:
+            st.markdown("""
+<div style="background:#161b22;border:1px solid #30363d;border-top:3px solid #3fb950;
+            border-radius:8px;padding:16px;height:200px;">
+  <div style="font-size:22px;margin-bottom:8px">🔍</div>
+  <div style="font-size:15px;font-weight:700;color:#3fb950;margin-bottom:6px">Deep Team Analysis</div>
+  <div style="font-size:12px;color:#8b949e;line-height:1.6">
+    Detailed breakdowns per team: how each of the four factors and every single match
+    contributed to their final score.
+  </div>
+</div>""", unsafe_allow_html=True)
+        with c3:
+            st.markdown("""
+<div style="background:#161b22;border:1px solid #30363d;border-top:3px solid #7c3aed;
+            border-radius:8px;padding:16px;height:200px;">
+  <div style="font-size:22px;margin-bottom:8px">🔮</div>
+  <div style="font-size:15px;font-weight:700;color:#7c3aed;margin-bottom:6px">Simulation</div>
+  <div style="font-size:12px;color:#8b949e;line-height:1.6">
+    Simulate time decay: see how rankings will shift next month as matches age out
+    of the 180-day window — before Valve publishes the update.
+  </div>
+</div>""", unsafe_allow_html=True)
+
+        st.markdown("---")
+        st.markdown("""
+### How is the VRS calculated?
+
+The remaining tabs on this page walk through the complete calculation, verified formula-by-formula
+against Valve's published data. Here's the short version:
+""")
+        st.latex(
+            r"\text{Final Score} = "
+            r"\underbrace{\text{Factor Score}_{[400,\;2000]}}_{\text{Phase 1}} "
+            r"+ \;\underbrace{\Delta_{\text{H2H}}}_{\text{Phase 2}}"
+        )
+        st.markdown("""
+**Phase 1** averages four factors (Bounty Offered, Bounty Collected, Opponent Network, LAN Wins)
+and maps the result to a score between 400 and 2000.
+
+**Phase 2** replays every match chronologically using a Glicko/Elo system, adjusting the seed up or down.
+
+Only the last **180 days** of matches count, with recent matches weighted more heavily.
+
+Use the tabs above to explore each component in detail. →
+""")
+        st.markdown(
+            '<span class="tag-v">✓ VERIFIED</span>&nbsp; Formula confirmed from official data &nbsp;&nbsp;'
+            '<span class="tag-a">~ ASSUMED</span>&nbsp; Not explicitly stated in public spec',
+            unsafe_allow_html=True,
+        )
+
+
+    # ══════════════════════════════════════════════════════════════
     with tab_arch:
+    # ══════════════════════════════════════════════════════════════
         st.subheader("Two-Phase Architecture")
+
+        st.markdown("""
+The VRS is computed in **two sequential phases** that are simply added together.
+The flowchart below shows how match data flows through the system.
+Click any factor to jump to its detailed tab.
+""")
+
+        # ── Interactive HTML/SVG flowchart ─────────────────────────
+        st.markdown("""
+<div style="background:#0d1117;border:1px solid #30363d;border-radius:12px;padding:24px;margin:12px 0;">
+
+  <!-- Match History (top) -->
+  <div style="text-align:center;margin-bottom:20px;">
+    <div style="display:inline-block;background:#161b22;border:2px solid #8b949e;border-radius:8px;
+                padding:10px 28px;font-size:14px;font-weight:700;color:#8b949e;">
+      📅 180-Day Match History
+    </div>
+    <div style="color:#30363d;font-size:20px;margin:6px 0;">▼</div>
+  </div>
+
+  <!-- Two phases side by side -->
+  <div style="display:flex;gap:20px;margin-bottom:20px;">
+
+    <!-- Phase 1 -->
+    <div style="flex:1;background:#0d1a2e;border:2px solid #58a6ff;border-radius:10px;padding:16px;">
+      <div style="font-size:14px;font-weight:700;color:#58a6ff;text-align:center;margin-bottom:14px;">
+        Phase 1 — Factor Score</div>
+
+      <!-- Background modifiers -->
+      <div style="display:flex;gap:6px;margin-bottom:12px;justify-content:center;">
+        <span style="background:#21262d;border:1px solid #484f58;border-radius:6px;padding:4px 10px;
+                     font-size:11px;color:#8b949e;">⏳ Age Weight</span>
+        <span style="background:#21262d;border:1px solid #484f58;border-radius:6px;padding:4px 10px;
+                     font-size:11px;color:#8b949e;">🎪 Event Weight</span>
+        <span style="background:#21262d;border:1px solid #484f58;border-radius:6px;padding:4px 10px;
+                     font-size:11px;color:#8b949e;">📐 Curve</span>
+      </div>
+
+      <!-- Four factors -->
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:14px;">
+        <div style="background:#161b22;border-left:3px solid #f0b429;border-radius:6px;padding:10px;text-align:center;">
+          <div style="font-size:12px;font-weight:700;color:#f0b429;">🏆 Bounty Offered</div>
+          <div style="font-size:10px;color:#8b949e;margin-top:2px;">Prize money earned</div>
+        </div>
+        <div style="background:#161b22;border-left:3px solid #3fb950;border-radius:6px;padding:10px;text-align:center;">
+          <div style="font-size:12px;font-weight:700;color:#3fb950;">💰 Bounty Collected</div>
+          <div style="font-size:10px;color:#8b949e;margin-top:2px;">Quality of opponents beaten</div>
+        </div>
+        <div style="background:#161b22;border-left:3px solid #79c0ff;border-radius:6px;padding:10px;text-align:center;">
+          <div style="font-size:12px;font-weight:700;color:#79c0ff;">🕸️ Opp. Network</div>
+          <div style="font-size:10px;color:#8b949e;margin-top:2px;">Network depth (PageRank)</div>
+        </div>
+        <div style="background:#161b22;border-left:3px solid #f85149;border-radius:6px;padding:10px;text-align:center;">
+          <div style="font-size:12px;font-weight:700;color:#f85149;">🖥️ LAN Wins</div>
+          <div style="font-size:10px;color:#8b949e;margin-top:2px;">Offline wins count</div>
+        </div>
+      </div>
+
+      <!-- Average + Lerp -->
+      <div style="text-align:center;color:#30363d;font-size:16px;margin-bottom:8px;">▼ avg (25% each) ▼</div>
+      <div style="background:#161b22;border:2px solid #58a6ff;border-radius:8px;padding:10px;text-align:center;">
+        <div style="font-size:13px;font-weight:700;color:#58a6ff;">🌱 Factor Score</div>
+        <div style="font-size:10px;color:#8b949e;">lerp → [400, 2000]</div>
+      </div>
+    </div>
+
+    <!-- Phase 2 -->
+    <div style="flex:1;background:#0d1a0d;border:2px solid #3fb950;border-radius:10px;padding:16px;
+                display:flex;flex-direction:column;justify-content:space-between;">
+      <div>
+        <div style="font-size:14px;font-weight:700;color:#3fb950;text-align:center;margin-bottom:14px;">
+          Phase 2 — Head-to-Head</div>
+        <div style="font-size:12px;color:#c9d1d9;line-height:1.6;text-align:center;padding:0 10px;">
+          Starting from the Factor Score, every match is replayed <b>chronologically</b>
+          using a Glicko/Elo system.<br><br>
+          Upsets (beating higher-rated teams) gain more points;
+          expected wins gain fewer.<br><br>
+          Each match's K-factor is scaled by <b>Age Weight only</b> — recent matches have more impact.
+        </div>
+      </div>
+      <div style="background:#161b22;border:2px solid #3fb950;border-radius:8px;padding:10px;text-align:center;margin-top:14px;">
+        <div style="font-size:13px;font-weight:700;color:#3fb950;">⚔️ H2H Adjustment (Δ)</div>
+        <div style="font-size:10px;color:#8b949e;">Can be positive or negative</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Final result -->
+  <div style="text-align:center;">
+    <div style="color:#30363d;font-size:20px;margin-bottom:6px;">▼ + ▼</div>
+    <div style="display:inline-block;background:#2d1f00;border:2px solid #f0b429;border-radius:10px;
+                padding:12px 36px;">
+      <div style="font-size:16px;font-weight:700;color:#f0b429;">🎯 Final Score</div>
+      <div style="font-size:11px;color:#c9d1d9;margin-top:2px;">Factor Score + H2H Δ</div>
+    </div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+        st.markdown('<span class="tag-v">✓ VERIFIED</span> — from official team detail sheets', unsafe_allow_html=True)
+
+        st.markdown("---")
+        st.markdown("""
+**Data window:** Only matches within the last **180 days** contribute.
+Within the window, **Age Weight** scales every contribution continuously —
+the most recent 30 days count at full strength, then decay linearly to zero at 180 days.
+
+**Eligibility:** A team must have ≥1 win and ≥5 total matches in the window to be ranked.
+
+**Explore each component** using the tabs above. The tabs are ordered left-to-right
+following the calculation flow:
+
+| Category | Tabs | Purpose |
+|---|---|---|
+| **Background** | Age Weight, Event Weight, Curve | Modifiers applied within the factors |
+| **Four Factors** | BO, BC, ON, LAN → Factor Score | Phase 1 computation |
+| **Final Score** | H2H → Final | Phase 2 Glicko adjustment |
+""")
+
+    # ══════════════════════════════════════════════════════════════
+    with tab_evw:
+    # ══════════════════════════════════════════════════════════════
+        st.subheader("🎪 Event Weight (Event Stakes)")
+        st.markdown('<span class="tag-v">✓ VERIFIED — derived from curve function applied to prize pool</span>', unsafe_allow_html=True)
         col_l, col_r = st.columns([3, 2])
         with col_l:
-            st.markdown("""
-The VRS is computed in **two sequential phases** that are simply added together:
+            st.markdown(r"""
+Event Weight measures the **prestige of a tournament** based on its total prize pool.
+It is used as a multiplier in the **Bounty Collected** and **Opponent Network** calculations
+(but NOT in Bounty Offered or LAN Wins).
+
+$$\text{Event Weight} = f\!\left(\frac{\text{prize\_pool}}{\$1{,}000{,}000}\right)$$
+
+where $f(x) = \frac{1}{1 + |\log_{10}(x)|}$ is the Curve function.
+
+**Key idea:** A $1M Major gets weight 1.000. Smaller events get proportionally less weight,
+but the log-scale means a $100k event still gets 0.500 — not 0.100. This prevents small
+events from being completely worthless while ensuring Majors carry the most importance.
+
+**Where Event Weight is used:**
+- ✅ **Bounty Collected:** `entry = opp_BO × age × event_weight`
+- ✅ **Opponent Network:** `entry = opp_ON × age × event_weight`
+- ❌ **Bounty Offered:** uses age weight only (no event weight)
+- ❌ **LAN Wins:** uses age weight only (no event weight)
+- ❌ **H2H (Glicko):** K-factor uses age weight only
+
+**Matches without a prize pool** (e.g., online qualifiers) have Event Weight = 0
+and therefore do **not contribute** to BC or ON at all.
 """)
-            st.latex(
-                r"\text{Final Score} = "
-                r"\underbrace{\text{Factor Score}_{[400,\;2000]}}_{\text{Phase 1 — Seeding}} "
-                r"+ \;\underbrace{\Delta_{\text{H2H}}}_{\text{Phase 2 — Head-to-Head}}"
-            )
-            st.markdown("""
-**Phase 1 — Factor Score** asks: *"What is this team's overall quality over the last 6 months?"*
-
-Four factors are computed, averaged (25% each), and mapped to [400, 2000]. This is the
-team's **starting rank value** for Phase 2.
-
-**Phase 2 — Head-to-Head** asks: *"How did this team perform against specific opponents?"*
-
-Starting from their seed, every match in the window is replayed chronologically using a
-Glicko/Elo system. The cumulative rating change is the H2H adjustment.
-
-**Data window:** Only matches within the last **180 days** contribute. Older matches are
-excluded entirely. Within the window, **age weight** scales contributions continuously.
-""")
-            st.markdown('<span class="tag-v">✓ VERIFIED</span> — from official team detail sheets', unsafe_allow_html=True)
-
         with col_r:
-            # Simple flow diagram
-            fig = go.Figure()
-            nodes = [
-                (0.5, 0.88, "180-day match history", "#21262d", "#8b949e", 13),
-                (0.25, 0.65, "Phase 1\nFactor Score\n(4 factors)", "#0d1a2e", "#58a6ff", 14),
-                (0.75, 0.65, "Phase 2\nHead-to-Head\n(Glicko, chronological)", "#0d1a0d", "#3fb950", 13),
-                (0.5,  0.40, "Factor Score + H2H Δ", "#1c1c1c", "#c9d1d9", 13),
-                (0.5,  0.17, "Final Factor Score", "#2d1f00", "#f0b429", 15),
+            st.markdown("#### 🎛️ Event Weight Calculator")
+            _ew_pool = st.number_input("Prize pool (USD)", 1000, 2_000_000, 250_000, 10_000, key="ew_pool")
+            _ew_val = event_stakes(_ew_pool)
+            st.markdown(f"""
+            <div style="background:#161b22;border:1px solid #30363d;border-radius:10px;
+                        padding:16px;text-align:center;">
+              <div style="font-size:12px;color:#8b949e">pool / $1,000,000 = {min(_ew_pool, PRIZE_CAP)/PRIZE_CAP:.4f}</div>
+              <div style="font-size:38px;font-weight:700;color:#f0b429;margin:8px 0">{_ew_val:.4f}</div>
+              <div style="font-size:12px;color:#8b949e">Event Weight</div>
+            </div>""", unsafe_allow_html=True)
+
+            st.markdown("#### Reference table")
+            ref_ew = [
+                (1_000_000, "$1M (Major)"), (500_000, "$500k"), (250_000, "$250k"),
+                (100_000, "$100k"), (50_000, "$50k"), (10_000, "$10k"),
             ]
-            for x, y, text, bg, fc, fs in nodes:
-                fig.add_annotation(x=x, y=y, text=text, showarrow=False,
-                    bgcolor=bg, bordercolor=fc, borderwidth=1.5, borderpad=9,
-                    font=dict(color=fc, size=fs), xref="paper", yref="paper", align="center")
-            # Arrows: head at (x1,y1); ax/ay are pixel offsets to tail
-            # axref="pixel" is required in newer Plotly (axref="paper" removed)
-            for x1, y1, ax_px, ay_px in [
-                (0.3,0.76,  68, -29), (0.7,0.76, -68, -29),
-                (0.44,0.47,-48, -29), (0.56,0.47, 48, -29),
-                (0.5,0.24,   0, -32),
-            ]:
-                fig.add_annotation(ax=ax_px, ay=ay_px, x=x1, y=y1,
-                    axref="pixel", ayref="pixel", xref="paper", yref="paper",
-                    arrowhead=2, arrowwidth=1.5, arrowcolor="#8b949e", showarrow=True, text="")
-            fig.update_layout(
-                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                xaxis=dict(visible=False, range=[0,1]), yaxis=dict(visible=False, range=[0,1]),
-                height=360, margin=dict(l=5,r=5,t=5,b=5))
-            st.plotly_chart(fig, use_container_width=True)
+            st.dataframe(pd.DataFrame([{
+                "Event": lbl, "Prize Pool": f"${p:,.0f}",
+                "Event Weight": f"{event_stakes(p):.4f}",
+            } for p, lbl in ref_ew]), use_container_width=True, hide_index=True)
+
+            st.caption(
+                "Events with higher prize pools have disproportionately more weight. "
+                "This incentivizes teams to compete at the biggest tournaments."
+            )
 
     # ══════════════════════════════════════════════════════════════
     with tab_age:
