@@ -110,6 +110,8 @@ div[data-testid="metric-container"] {
     background:#161b22; border:1px solid #30363d; border-radius:10px; padding:10px;
 }
 </style>
+""", unsafe_allow_html=True)
+
 
 # ══════════════════════════════════════════════════════════════════
 # IMPORTS FROM VRS MODULES
