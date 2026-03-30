@@ -1696,97 +1696,343 @@ scores to teams that are orders of magnitude below the top.
     with tab_bo2:
         st.subheader("🏆 Factor 1 — Bounty Offered")
         st.markdown('<span class="tag-v">✓ VERIFIED — sum / 5th-ref / curve(min(1,x)) confirmed</span>', unsafe_allow_html=True)
+
+        if "bo_sim_entries" not in st.session_state:
+            st.session_state.bo_sim_entries = [
+                {"event": "IEM Krakow 2026",   "prize": 350_000, "days_ago":  14},
+                {"event": "PGL Cluj 2026",      "prize": 460_000, "days_ago":   7},
+                {"event": "BLAST Fall 2025",    "prize": 500_000, "days_ago":  77},
+                {"event": "ESL Pro League S21", "prize":  90_000, "days_ago":  49},
+                {"event": "Small LAN Oct 2025", "prize":  65_000, "days_ago": 168},
+            ]
+        if "bo_sim_result" not in st.session_state:
+            st.session_state.bo_sim_result = None
+
         col_l, col_r = st.columns([3, 2])
         with col_l:
-            st.markdown(r"""
-Bounty Offered (BO) measures how much **prize money a team has earned**, scaled for recency.
+            _bo_fc = (
+                '<div style="background:#0d1117;border:1px solid #30363d;border-radius:12px;padding:20px 24px;margin:8px 0;">'
+                '<div style="text-align:center;margin-bottom:16px;">'
+                '<span style="font-size:13px;font-weight:700;color:#f0b429;">🏆 Bounty Offered — Calculation Flow</span>'
+                '</div>'
+                '<div style="text-align:center;">'
+                '<div style="display:inline-block;background:#161b22;border:2px solid #8b949e;border-radius:8px;padding:8px 22px;">'
+                '<div style="font-size:12px;font-weight:700;color:#8b949e;">📅 All wins · 180-day window</div>'
+                '</div></div>'
+                '<div style="text-align:center;color:#484f58;font-size:20px;margin:3px 0;">▼</div>'
+                '<div style="background:#0d1a2e;border:1px solid #58a6ff;border-radius:8px;padding:10px 14px;margin:0 24px 4px;">'
+                '<div style="font-size:11px;font-weight:700;color:#58a6ff;margin-bottom:4px;">Step 1 — Contribution per win</div>'
+                '<div style="font-family:monospace;font-size:11px;color:#c9d1d9;background:#0a0e1a;border-radius:4px;padding:6px 8px;">'
+                'contribution = prize_won × age_weight'
+                '</div>'
+                '<div style="font-size:10px;color:#8b949e;margin-top:4px;">⚠️ No event stakes — only time decay applied</div>'
+                '</div>'
+                '<div style="text-align:center;color:#484f58;font-size:20px;margin:3px 0;">▼</div>'
+                '<div style="background:#0d1a2e;border:1px solid #58a6ff;border-radius:8px;padding:10px 14px;margin:0 24px 4px;">'
+                '<div style="font-size:11px;font-weight:700;color:#58a6ff;margin-bottom:4px;">Step 2 — Keep top 10 · sum</div>'
+                '<div style="font-family:monospace;font-size:11px;color:#c9d1d9;background:#0a0e1a;border-radius:4px;padding:6px 8px;">'
+                'BO_sum = Σ top-10 (contributions)'
+                '</div>'
+                '<div style="font-size:10px;color:#8b949e;margin-top:4px;">Wins beyond the top-10 are discarded</div>'
+                '</div>'
+                '<div style="text-align:center;color:#484f58;font-size:20px;margin:3px 0;">▼</div>'
+                '<div style="background:#2d1f00;border:1px solid #f0b429;border-radius:8px;padding:10px 14px;margin:0 24px 4px;">'
+                '<div style="font-size:11px;font-weight:700;color:#f0b429;margin-bottom:4px;">Step 3 — Normalise against the field</div>'
+                '<div style="font-family:monospace;font-size:11px;color:#c9d1d9;background:#1a1000;border-radius:4px;padding:6px 8px;">'
+                'ref&#8325; = 5th-highest BO_sum across all teams<br>'
+                'ratio&#160;&#160; = min(1.0,  BO_sum / ref&#8325;)'
+                '</div>'
+                '<div style="font-size:10px;color:#8b949e;margin-top:4px;">Top-5 teams by prize money all clamp to ratio = 1.0</div>'
+                '</div>'
+                '<div style="text-align:center;color:#484f58;font-size:20px;margin:3px 0;">▼</div>'
+                '<div style="background:#2d1f00;border:1px solid #f0b429;border-radius:8px;padding:10px 14px;margin:0 24px 4px;">'
+                '<div style="font-size:11px;font-weight:700;color:#f0b429;margin-bottom:4px;">Step 4 — Apply curve function</div>'
+                '<div style="font-family:monospace;font-size:11px;color:#c9d1d9;background:#1a1000;border-radius:4px;padding:6px 8px;">'
+                'BO = f(ratio) = 1 / (1 + |log&#8321;&#8320;(ratio)|)'
+                '</div>'
+                '<div style="font-size:10px;color:#8b949e;margin-top:4px;">f(1.0)=1.000 · f(0.5)≈0.770 · f(0.1)=0.500 · f(0.01)=0.333</div>'
+                '</div>'
+                '<div style="text-align:center;color:#484f58;font-size:20px;margin:3px 0;">▼</div>'
+                '<div style="text-align:center;">'
+                '<div style="display:inline-block;background:#2d1f00;border:2px solid #f0b429;border-radius:8px;padding:10px 28px;">'
+                '<div style="font-size:14px;font-weight:700;color:#f0b429;">🏆 BO Factor &nbsp; [0 → 1]</div>'
+                '</div></div>'
+                '</div>'
+            )
+            st.markdown(_bo_fc, unsafe_allow_html=True)
 
-**Step-by-step:**
-
-**Step 1.** For each win, compute the scaled prize:
-$$\text{contribution}_i = \text{prize\_won}_i \;\times\; \text{age\_weight}_i$$
-
-⚠️ **No event stakes.** BO uses only age weight — confirmed from the official data where
-"Scaled Winnings = Prize × Age Weight" with no event-stakes column.
-
-**Step 2.** Sum the **top 10** contributions across all wins:
-$$\text{BO\_sum} = \sum_{i \in \text{top-10}} \text{prize\_won}_i \times \text{age\_weight}_i$$
-
-**Step 3.** Find the **5th-highest BO\_sum** across all teams in the dataset. Call it `ref₅`.
-Teams ranked 1–5 by prize money all have `ratio ≥ 1.0`.
-
-**Step 4.** Clamp and apply the curve:
-$$\text{BO} = f\!\left(\min\!\left(1.0,\;\frac{\text{BO\_sum}}{\text{ref}_5}\right)\right)$$
-
-Since `curve(1.0) = 1.000`, all teams with `BO_sum ≥ ref₅` receive **BO = 1.000**.
-Teams below get `BO = curve(ratio)` where ratio < 1 → BO < 1.000.
-""")
-            st.markdown("""
-**Verification — Vitality:**
-- BO_sum = $1,472,719.98  ✓ (sum of 8 entries × age weights)
-- ref₅ = $334,320.24
-- ratio = 4.406 → min(1.0, 4.406) = 1.0 → curve(1.0) = **1.000** ✓
-""")
         with col_r:
-            st.markdown("#### Example contributions")
-            ex_bo = [
-                ("IEM Krakow (W, Feb)", datetime(2026,2,16), 350_000),
-                ("PGL Cluj (W, Feb)",   datetime(2026,2,22), 460_000),
-                ("BLAST Fall (W, Dec)", datetime(2025,12,14),500_000),
-                ("ESL PL (3rd, Jan)",   datetime(2026,1,10),  90_000),
-                ("Small LAN (W, Oct)", datetime(2025,10,12), 65_000),
-            ]
-            cutoff_ex = datetime(2026, 3, 2)
-            ex_rows = []
-            for ename, edate, prize in ex_bo:
-                aw = age_weight(edate, cutoff_ex)
-                contrib = prize * aw
-                ex_rows.append({"Event": ename, "Prize Won": f"${prize:,.0f}",
-                                 "Age Weight": f"{aw:.3f}",
-                                 "Scaled (contribution)": f"${contrib:,.0f}"})
-            st.dataframe(pd.DataFrame(ex_rows), use_container_width=True, hide_index=True)
-            total_ex = sum(p * age_weight(d, cutoff_ex) for _,d,p in ex_bo)
-            st.caption(f"BO_sum (top 5 shown) = ${total_ex:,.0f}. If ref₅ = $334,320 → ratio = {total_ex/334320:.2f} → clamped to 1.0 → BO = 1.000")
+            st.markdown("#### 🎮 Build a prize history")
+            st.caption("Add fictive wins, set a ref₅ value, then click **Calculate** for a step-by-step breakdown.")
+
+            with st.form("bo_add_form", clear_on_submit=True):
+                _c1, _c2, _c3 = st.columns([3, 2, 1])
+                _ne = _c1.text_input("Event name", placeholder="IEM Major 2026")
+                _np = _c2.number_input("Prize ($)", min_value=0, max_value=2_000_000,
+                                       value=250_000, step=10_000)
+                _nd = _c3.number_input("Days ago", min_value=0, max_value=179, value=20)
+                if st.form_submit_button("➕ Add win", use_container_width=True) and _ne:
+                    st.session_state.bo_sim_entries.append(
+                        {"event": _ne, "prize": int(_np), "days_ago": int(_nd)})
+                    st.session_state.bo_sim_result = None
+
+            if st.session_state.bo_sim_entries:
+                for _i, _e in enumerate(st.session_state.bo_sim_entries):
+                    _ec1, _ec2, _ec3 = st.columns([4, 3, 0.7])
+                    _ec1.markdown(f"<span style='font-size:12px'>{_e['event']}</span>",
+                                  unsafe_allow_html=True)
+                    _ec2.markdown(
+                        f"<span style='font-size:12px;color:#8b949e'>${_e['prize']:,} · {_e['days_ago']}d</span>",
+                        unsafe_allow_html=True)
+                    if _ec3.button("✕", key=f"bo_rm_{_i}"):
+                        st.session_state.bo_sim_entries.pop(_i)
+                        st.session_state.bo_sim_result = None
+                        st.rerun()
+
+                st.markdown("---")
+                _ref5 = st.number_input(
+                    "ref₅ — 5th-highest BO_sum in the field ($)",
+                    min_value=1_000, max_value=5_000_000, value=334_320, step=10_000,
+                    help="Real Valve value ≈ $334,320 at cutoff 2026-03-02")
+
+                if st.button("🧮 Calculate Bounty Offered", use_container_width=True,
+                             type="primary"):
+                    _now = datetime.now()
+                    _calcs = []
+                    for _e in st.session_state.bo_sim_entries:
+                        _md = _now - timedelta(days=_e["days_ago"])
+                        _aw = age_weight(_md, _now)
+                        _calcs.append({"event": _e["event"], "prize": _e["prize"],
+                                       "aw": _aw, "contrib": _e["prize"] * _aw})
+                    _calcs.sort(key=lambda x: x["contrib"], reverse=True)
+                    _top10 = _calcs[:10]
+                    _bo_sum = sum(x["contrib"] for x in _top10)
+                    _ratio  = min(1.0, _bo_sum / _ref5)
+                    _bo_val = curve(_ratio)
+                    st.session_state.bo_sim_result = {
+                        "calcs": _calcs, "top10": _top10,
+                        "bo_sum": _bo_sum, "ref5": _ref5,
+                        "ratio": _ratio, "bo_val": _bo_val,
+                    }
+
+            if st.session_state.bo_sim_result:
+                _r = st.session_state.bo_sim_result
+                st.markdown("##### 📋 Step-by-step result")
+                _rows = ""
+                for _idx, _x in enumerate(_r["calcs"]):
+                    _top = _idx < 10
+                    _bg  = "background:#0d2818" if _top else "background:#161b22;opacity:0.55"
+                    _badge = ('<span style="background:#3fb950;color:#000;border-radius:3px;'
+                              'padding:0 4px;font-size:9px;font-weight:700;margin-left:4px;">TOP10</span>'
+                              if _top else '')
+                    _rows += (
+                        f'<tr style="{_bg}">'
+                        f'<td style="padding:5px 6px;font-size:11px;color:#c9d1d9">{_x["event"]}{_badge}</td>'
+                        f'<td style="padding:5px 6px;font-size:11px;color:#c9d1d9;text-align:right">${_x["prize"]:,}</td>'
+                        f'<td style="padding:5px 6px;font-size:11px;color:#79c0ff;text-align:right">{_x["aw"]:.3f}</td>'
+                        f'<td style="padding:5px 6px;font-size:11px;color:#f0b429;font-weight:700;text-align:right">${_x["contrib"]:,.0f}</td>'
+                        f'</tr>'
+                    )
+                st.markdown(
+                    f'<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px;margin-bottom:10px;">'
+                    f'<table style="width:100%;border-collapse:collapse">'
+                    f'<thead><tr style="border-bottom:1px solid #30363d">'
+                    f'<th style="padding:5px 6px;font-size:11px;color:#8b949e;text-align:left">Event</th>'
+                    f'<th style="padding:5px 6px;font-size:11px;color:#8b949e;text-align:right">Prize</th>'
+                    f'<th style="padding:5px 6px;font-size:11px;color:#8b949e;text-align:right">AgeW</th>'
+                    f'<th style="padding:5px 6px;font-size:11px;color:#8b949e;text-align:right">Contribution</th>'
+                    f'</tr></thead><tbody>{_rows}</tbody></table></div>',
+                    unsafe_allow_html=True)
+                _clamp_note = ("✅ Clamped to 1.0 — top-5 level"
+                               if _r["ratio"] >= 1.0
+                               else f"→ {_r['bo_val']*100:.1f}% of a top-5 team")
+                st.markdown(
+                    f'<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:14px;">'
+                    f'<div style="display:flex;flex-direction:column;gap:8px;">'
+                    f'<div style="display:flex;justify-content:space-between;">'
+                    f'<span style="font-size:12px;color:#8b949e;">① BO_sum (top {min(10, len(_r["calcs"]))})</span>'
+                    f'<span style="font-size:13px;font-weight:700;color:#f0b429;">${_r["bo_sum"]:,.0f}</span></div>'
+                    f'<div style="display:flex;justify-content:space-between;">'
+                    f'<span style="font-size:12px;color:#8b949e;">② ref₅</span>'
+                    f'<span style="font-size:13px;font-weight:700;color:#c9d1d9;">${_r["ref5"]:,.0f}</span></div>'
+                    f'<div style="display:flex;justify-content:space-between;border-top:1px solid #30363d;padding-top:8px;">'
+                    f'<span style="font-size:12px;color:#8b949e;">③ ratio = min(1.0, {_r["bo_sum"]/1000:.1f}K / {_r["ref5"]/1000:.1f}K)</span>'
+                    f'<span style="font-size:13px;font-weight:700;color:#c9d1d9;">{_r["ratio"]:.4f}</span></div>'
+                    f'<div style="display:flex;justify-content:space-between;align-items:center;border-top:1px solid #30363d;padding-top:8px;">'
+                    f'<span style="font-size:12px;color:#8b949e;">④ BO = curve({_r["ratio"]:.4f})</span>'
+                    f'<span style="font-size:30px;font-weight:700;color:#f0b429;">{_r["bo_val"]:.4f}</span></div>'
+                    f'<div style="font-size:10px;color:#8b949e;text-align:center;">{_clamp_note}</div>'
+                    f'</div></div>',
+                    unsafe_allow_html=True)
+            elif st.session_state.bo_sim_entries:
+                st.info("Click **Calculate Bounty Offered** to see results.", icon="💡")
+            else:
+                st.info("Add at least one win to start.", icon="💡")
 
     # ══════════════════════════════════════════════════════════════
     with tab_bc2:
         st.subheader("💰 Factor 2 — Bounty Collected")
         st.markdown('<span class="tag-v">✓ VERIFIED — BC = curve(Σ_top10_adjusted / 10) confirmed numerically</span>', unsafe_allow_html=True)
+
+        if "bc_sim_entries" not in st.session_state:
+            st.session_state.bc_sim_entries = [
+                {"opponent": "NAVI",      "opp_bo": 1.000, "pool": 1_000_000, "days_ago":  5},
+                {"opponent": "G2 Esports","opp_bo": 0.843, "pool":   500_000, "days_ago": 20},
+                {"opponent": "MOUZ",      "opp_bo": 0.672, "pool":   500_000, "days_ago": 45},
+                {"opponent": "Liquid",    "opp_bo": 0.446, "pool":   250_000, "days_ago": 80},
+                {"opponent": "Cloud9",    "opp_bo": 0.250, "pool":   100_000, "days_ago": 10},
+            ]
+        if "bc_sim_result" not in st.session_state:
+            st.session_state.bc_sim_result = None
+
         col_l, col_r = st.columns([3, 2])
         with col_l:
-            st.markdown(r"""
-Bounty Collected (BC) measures the **quality of opponents defeated**, using each
-opponent's own Bounty Offered score as the proxy for their strength.
+            _bc_fc = (
+                '<div style="background:#0d1117;border:1px solid #30363d;border-radius:12px;padding:20px 24px;margin:8px 0;">'
+                '<div style="text-align:center;margin-bottom:16px;">'
+                '<span style="font-size:13px;font-weight:700;color:#3fb950;">💰 Bounty Collected — Calculation Flow</span>'
+                '</div>'
+                '<div style="text-align:center;">'
+                '<div style="display:inline-block;background:#161b22;border:2px solid #8b949e;border-radius:8px;padding:8px 22px;">'
+                '<div style="font-size:12px;font-weight:700;color:#8b949e;">📅 All wins · 180-day window</div>'
+                '</div></div>'
+                '<div style="text-align:center;color:#484f58;font-size:20px;margin:3px 0;">▼</div>'
+                '<div style="background:#1a0d0d;border:1px solid #f85149;border-radius:8px;padding:8px 14px;margin:0 24px 4px;">'
+                '<div style="font-size:11px;font-weight:700;color:#f85149;margin-bottom:2px;">⚠️ Prize pool required</div>'
+                '<div style="font-size:10px;color:#c9d1d9;">Wins at events with no prize pool are excluded (event_weight = 0)</div>'
+                '</div>'
+                '<div style="text-align:center;color:#484f58;font-size:20px;margin:3px 0;">▼</div>'
+                '<div style="background:#0d1a1a;border:1px solid #3fb950;border-radius:8px;padding:10px 14px;margin:0 24px 4px;">'
+                '<div style="font-size:11px;font-weight:700;color:#3fb950;margin-bottom:4px;">Step 1 — Entry per win</div>'
+                '<div style="font-family:monospace;font-size:11px;color:#c9d1d9;background:#061010;border-radius:4px;padding:6px 8px;">'
+                'entry = opp_BO × age_weight × event_weight'
+                '</div>'
+                '<div style="font-size:10px;color:#8b949e;margin-top:4px;">opp_BO = opponent\'s Bounty Offered · event_weight = curve(pool / $1M)</div>'
+                '</div>'
+                '<div style="text-align:center;color:#484f58;font-size:20px;margin:3px 0;">▼</div>'
+                '<div style="background:#0d1a1a;border:1px solid #3fb950;border-radius:8px;padding:10px 14px;margin:0 24px 4px;">'
+                '<div style="font-size:11px;font-weight:700;color:#3fb950;margin-bottom:4px;">Step 2 — Top 10 · average</div>'
+                '<div style="font-family:monospace;font-size:11px;color:#c9d1d9;background:#061010;border-radius:4px;padding:6px 8px;">'
+                'BC_pre = &#x3A3; top-10 (entries) / 10'
+                '</div>'
+                '</div>'
+                '<div style="text-align:center;color:#484f58;font-size:20px;margin:3px 0;">▼</div>'
+                '<div style="background:#0d1a1a;border:1px solid #3fb950;border-radius:8px;padding:10px 14px;margin:0 24px 4px;">'
+                '<div style="font-size:11px;font-weight:700;color:#3fb950;margin-bottom:4px;">Step 3 — Apply curve</div>'
+                '<div style="font-family:monospace;font-size:11px;color:#c9d1d9;background:#061010;border-radius:4px;padding:6px 8px;">'
+                'BC = f(BC_pre) = 1 / (1 + |log&#8321;&#8320;(BC_pre)|)'
+                '</div>'
+                '<div style="font-size:10px;color:#8b949e;margin-top:4px;">Unlike ON, BC does apply the curve function</div>'
+                '</div>'
+                '<div style="text-align:center;color:#484f58;font-size:20px;margin:3px 0;">▼</div>'
+                '<div style="text-align:center;">'
+                '<div style="display:inline-block;background:#0d1a1a;border:2px solid #3fb950;border-radius:8px;padding:10px 28px;">'
+                '<div style="font-size:14px;font-weight:700;color:#3fb950;">💰 BC Factor &nbsp; [0 → 1]</div>'
+                '</div></div>'
+                '</div>'
+            )
+            st.markdown(_bc_fc, unsafe_allow_html=True)
 
-**Step-by-step:**
-
-**Step 1.** For each win **at an event with a prize pool**, compute the adjusted entry:
-$$\text{entry}_i = \text{BO\_factor}[\text{opponent}] \;\times\; \text{age\_weight}_i \;\times\; \text{event\_stakes}(\text{pool})$$
-
-Note: matches at events **without** a prize pool (e.g. online qualifiers) do NOT
-contribute to BC (event stakes = 0 for prize_pool = 0).
-
-**Step 2.** Take the **top 10** entries, sum them, divide by 10:
-$$\text{BC\_pre\_curve} = \frac{\sum_{i \in \text{top-10}} \text{entry}_i}{10}$$
-
-**Step 3.** Apply the curve function:
-$$\text{BC} = f(\text{BC\_pre\_curve})$$
-
-**Verification — Vitality (cutoff 2026-03-02):**
-
-| Opponent | opp BO | Age | Event | Entry |
-|---|---|---|---|---|
-| PARIVISION | 1.000 | 1.000 | 1.000 | 1.000 |
-| FURIA | 1.000 | 1.000 | 1.000 | 1.000 |
-| Aurora (×2) | 1.000 | 1.000 | 1.000 | 1.000 |
-| MOUZ (×2) | 0.949 | 1.000 | 1.000 | 0.949 |
-| MongolZ (×2) | 0.672 | 1.000 | 1.000 | 0.672 |
-| Spirit | 0.843 | 0.674 | 1.000 | 0.568 |
-| G2 | 0.446 | 1.000 | 1.000 | 0.446 |
-
-Sum of top 10 = **8.256**, /10 = **0.8256**, curve(0.8256) = **0.923** ✓
-""")
         with col_r:
+            st.markdown("#### 🎮 Build a win record")
+            st.caption("Set opponent BO and event prize pool — both scale the entry value.")
+
+            with st.form("bc_add_form", clear_on_submit=True):
+                _bc1, _bc2 = st.columns(2)
+                _bopp    = _bc1.text_input("Opponent", placeholder="NAVI")
+                _boppbo  = _bc2.slider("Opp. BO factor", 0.0, 1.0, 0.70, 0.01)
+                _bc3, _bc4 = st.columns(2)
+                _bpool   = _bc3.number_input("Prize pool ($)", min_value=0,
+                                             max_value=2_000_000, value=500_000, step=50_000)
+                _bdays   = _bc4.number_input("Days ago", min_value=0, max_value=179, value=20)
+                if st.form_submit_button("➕ Add win", use_container_width=True) and _bopp:
+                    st.session_state.bc_sim_entries.append(
+                        {"opponent": _bopp, "opp_bo": float(_boppbo),
+                         "pool": int(_bpool), "days_ago": int(_bdays)})
+                    st.session_state.bc_sim_result = None
+
+            if st.session_state.bc_sim_entries:
+                for _i, _e in enumerate(st.session_state.bc_sim_entries):
+                    _ec1, _ec2, _ec3 = st.columns([3, 4, 0.7])
+                    _ec1.markdown(f"<span style='font-size:12px'>vs {_e['opponent']}</span>",
+                                  unsafe_allow_html=True)
+                    _ec2.markdown(
+                        f"<span style='font-size:11px;color:#8b949e'>BO={_e['opp_bo']:.2f} · ${_e['pool']:,} · {_e['days_ago']}d</span>",
+                        unsafe_allow_html=True)
+                    if _ec3.button("✕", key=f"bc_rm_{_i}"):
+                        st.session_state.bc_sim_entries.pop(_i)
+                        st.session_state.bc_sim_result = None
+                        st.rerun()
+
+                st.markdown("---")
+                if st.button("🧮 Calculate Bounty Collected", use_container_width=True,
+                             type="primary"):
+                    _now = datetime.now()
+                    _calcs = []
+                    for _e in st.session_state.bc_sim_entries:
+                        _md   = _now - timedelta(days=_e["days_ago"])
+                        _aw   = age_weight(_md, _now)
+                        _ew   = event_stakes(max(_e["pool"], 1)) if _e["pool"] > 0 else 0.0
+                        _entry = _e["opp_bo"] * _aw * _ew
+                        _calcs.append({"opponent": _e["opponent"], "opp_bo": _e["opp_bo"],
+                                       "aw": _aw, "ew": _ew, "entry": _entry})
+                    _calcs.sort(key=lambda x: x["entry"], reverse=True)
+                    _top10   = _calcs[:10]
+                    _bc_pre  = sum(x["entry"] for x in _top10) / 10
+                    _bc_val  = curve(_bc_pre) if _bc_pre > 0 else 0.0
+                    st.session_state.bc_sim_result = {
+                        "calcs": _calcs, "top10": _top10,
+                        "bc_pre": _bc_pre, "bc_val": _bc_val,
+                    }
+
+            if st.session_state.bc_sim_result:
+                _r = st.session_state.bc_sim_result
+                st.markdown("##### 📋 Step-by-step result")
+                _rows = ""
+                for _idx, _x in enumerate(_r["calcs"]):
+                    _top   = _idx < 10
+                    _bg    = "background:#0d2818" if _top else "background:#161b22;opacity:0.55"
+                    _badge = ('<span style="background:#3fb950;color:#000;border-radius:3px;'
+                              'padding:0 4px;font-size:9px;font-weight:700;margin-left:4px;">TOP10</span>'
+                              if _top else '')
+                    _rows += (
+                        f'<tr style="{_bg}">'
+                        f'<td style="padding:5px 6px;font-size:11px;color:#c9d1d9">vs {_x["opponent"]}{_badge}</td>'
+                        f'<td style="padding:5px 6px;font-size:11px;color:#f0b429;text-align:right">{_x["opp_bo"]:.3f}</td>'
+                        f'<td style="padding:5px 6px;font-size:11px;color:#79c0ff;text-align:right">{_x["aw"]:.3f}</td>'
+                        f'<td style="padding:5px 6px;font-size:11px;color:#8b949e;text-align:right">{_x["ew"]:.3f}</td>'
+                        f'<td style="padding:5px 6px;font-size:11px;color:#3fb950;font-weight:700;text-align:right">{_x["entry"]:.4f}</td>'
+                        f'</tr>'
+                    )
+                st.markdown(
+                    f'<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px;margin-bottom:10px;">'
+                    f'<table style="width:100%;border-collapse:collapse">'
+                    f'<thead><tr style="border-bottom:1px solid #30363d">'
+                    f'<th style="padding:5px 6px;font-size:11px;color:#8b949e;text-align:left">vs Opponent</th>'
+                    f'<th style="padding:5px 6px;font-size:11px;color:#8b949e;text-align:right">opp_BO</th>'
+                    f'<th style="padding:5px 6px;font-size:11px;color:#8b949e;text-align:right">AgeW</th>'
+                    f'<th style="padding:5px 6px;font-size:11px;color:#8b949e;text-align:right">EvW</th>'
+                    f'<th style="padding:5px 6px;font-size:11px;color:#8b949e;text-align:right">Entry</th>'
+                    f'</tr></thead><tbody>{_rows}</tbody></table></div>',
+                    unsafe_allow_html=True)
+                st.markdown(
+                    f'<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:14px;">'
+                    f'<div style="display:flex;flex-direction:column;gap:8px;">'
+                    f'<div style="display:flex;justify-content:space-between;">'
+                    f'<span style="font-size:12px;color:#8b949e;">① Sum top {min(10, len(_r["calcs"]))}</span>'
+                    f'<span style="font-size:13px;font-weight:700;color:#c9d1d9;">{sum(x["entry"] for x in _r["top10"]):.4f}</span></div>'
+                    f'<div style="display:flex;justify-content:space-between;">'
+                    f'<span style="font-size:12px;color:#8b949e;">② BC_pre = &#x3A3; / 10</span>'
+                    f'<span style="font-size:13px;font-weight:700;color:#c9d1d9;">{_r["bc_pre"]:.4f}</span></div>'
+                    f'<div style="display:flex;justify-content:space-between;align-items:center;border-top:1px solid #30363d;padding-top:8px;">'
+                    f'<span style="font-size:12px;color:#8b949e;">③ BC = curve({_r["bc_pre"]:.4f})</span>'
+                    f'<span style="font-size:30px;font-weight:700;color:#3fb950;">{_r["bc_val"]:.4f}</span></div>'
+                    f'</div></div>',
+                    unsafe_allow_html=True)
+            elif st.session_state.bc_sim_entries:
+                st.info("Click **Calculate Bounty Collected** to see results.", icon="💡")
+            else:
+                st.info("Add at least one win to start.", icon="💡")
             st.markdown("#### Why BC rewards beating strong teams")
             scenarios = [
                 ("1 win vs #1 (BO=1.0)", [1.0]),
@@ -1817,49 +2063,168 @@ Sum of top 10 = **8.256**, /10 = **0.8256**, curve(0.8256) = **0.923** ✓
     with tab_on2:
         st.subheader("🕸️ Factor 3 — Opponent Network")
         st.markdown('<span class="tag-v">✓ VERIFIED — ON = Σ_top10_adjusted / 10, NO curve, confirmed numerically</span>', unsafe_allow_html=True)
+
+        if "on_sim_entries" not in st.session_state:
+            st.session_state.on_sim_entries = [
+                {"opponent": "NAVI",       "opp_on": 0.622, "pool": 1_000_000, "days_ago":  5},
+                {"opponent": "MOUZ",       "opp_on": 0.460, "pool":   500_000, "days_ago": 20},
+                {"opponent": "G2 Esports", "opp_on": 0.380, "pool":   500_000, "days_ago": 45},
+                {"opponent": "Liquid",     "opp_on": 0.280, "pool":   250_000, "days_ago": 80},
+                {"opponent": "BIG",        "opp_on": 0.195, "pool":   100_000, "days_ago": 30},
+            ]
+        if "on_sim_result" not in st.session_state:
+            st.session_state.on_sim_result = None
+
         col_l, col_r = st.columns([3, 2])
         with col_l:
-            st.markdown(r"""
-Opponent Network (ON) measures the **depth of the network** of opponents beaten.
-The key difference from BC: ON uses the opponent's **own ON factor** (not their BO),
-creating a recursive PageRank-like structure.
+            _on_fc = (
+                '<div style="background:#0d1117;border:1px solid #30363d;border-radius:12px;padding:20px 24px;margin:8px 0;">'
+                '<div style="text-align:center;margin-bottom:16px;">'
+                '<span style="font-size:13px;font-weight:700;color:#79c0ff;">🕸️ Opponent Network — Calculation Flow</span>'
+                '</div>'
+                '<div style="text-align:center;">'
+                '<div style="display:inline-block;background:#161b22;border:2px solid #8b949e;border-radius:8px;padding:8px 22px;">'
+                '<div style="font-size:12px;font-weight:700;color:#8b949e;">📅 All wins · 180-day window</div>'
+                '</div></div>'
+                '<div style="text-align:center;color:#484f58;font-size:20px;margin:3px 0;">▼</div>'
+                '<div style="background:#0d0d1a;border:1px solid #79c0ff;border-radius:8px;padding:10px 14px;margin:0 24px 4px;">'
+                '<div style="font-size:11px;font-weight:700;color:#79c0ff;margin-bottom:4px;">Initialise — seed with BO</div>'
+                '<div style="font-family:monospace;font-size:11px;color:#c9d1d9;background:#060610;border-radius:4px;padding:6px 8px;">'
+                'ON&#8320;[team] = BO_factor[team]  &#x2200; teams'
+                '</div>'
+                '<div style="font-size:10px;color:#8b949e;margin-top:4px;">Bootstraps the circular dependency with a known prior</div>'
+                '</div>'
+                '<div style="text-align:center;color:#484f58;font-size:20px;margin:3px 0;">▼</div>'
+                '<div style="background:#1a0d0d;border:1px solid #f85149;border-radius:8px;padding:8px 14px;margin:0 24px 4px;">'
+                '<div style="font-size:11px;font-weight:700;color:#f85149;margin-bottom:2px;">⚠️ Prize pool required</div>'
+                '<div style="font-size:10px;color:#c9d1d9;">Only wins at events with a prize pool count</div>'
+                '</div>'
+                '<div style="text-align:center;color:#484f58;font-size:20px;margin:3px 0;">▼</div>'
+                '<div style="background:#0d0d1a;border:1px solid #79c0ff;border-radius:8px;padding:10px 14px;margin:0 24px 4px;">'
+                '<div style="font-size:11px;font-weight:700;color:#79c0ff;margin-bottom:4px;">Step 1 — Entry per win (uses opp ON, not BO)</div>'
+                '<div style="font-family:monospace;font-size:11px;color:#c9d1d9;background:#060610;border-radius:4px;padding:6px 8px;">'
+                'entry = opp_ON × age_weight × event_weight'
+                '</div>'
+                '<div style="font-size:10px;color:#8b949e;margin-top:4px;">Key difference from BC: uses opponent\'s ON value, not their BO</div>'
+                '</div>'
+                '<div style="text-align:center;color:#484f58;font-size:20px;margin:3px 0;">▼</div>'
+                '<div style="background:#0d0d1a;border:1px solid #79c0ff;border-radius:8px;padding:10px 14px;margin:0 24px 4px;">'
+                '<div style="font-size:11px;font-weight:700;color:#79c0ff;margin-bottom:4px;">Step 2 — Top 10 · average &nbsp;(no curve!)</div>'
+                '<div style="font-family:monospace;font-size:11px;color:#c9d1d9;background:#060610;border-radius:4px;padding:6px 8px;">'
+                'ON_new = &#x3A3; top-10 (entries) / 10'
+                '</div>'
+                '<div style="font-size:10px;color:#8b949e;margin-top:4px;">⚠️ No curve applied — output is a direct average (unlike BC)</div>'
+                '</div>'
+                '<div style="text-align:center;color:#484f58;font-size:20px;margin:3px 0;">▼</div>'
+                '<div style="background:#1a1a0a;border:2px dashed #f0b429;border-radius:8px;padding:8px 14px;margin:0 24px 4px;">'
+                '<div style="font-size:11px;font-weight:700;color:#f0b429;margin-bottom:2px;">↺ Repeat 6 iterations (PageRank)</div>'
+                '<div style="font-size:10px;color:#c9d1d9;">Each pass refines ON for all teams simultaneously — converges in ~5 rounds</div>'
+                '</div>'
+                '<div style="text-align:center;color:#484f58;font-size:20px;margin:3px 0;">▼</div>'
+                '<div style="text-align:center;">'
+                '<div style="display:inline-block;background:#0d0d1a;border:2px solid #79c0ff;border-radius:8px;padding:10px 28px;">'
+                '<div style="font-size:14px;font-weight:700;color:#79c0ff;">🕸️ ON Factor &nbsp; [0 → 1]</div>'
+                '</div></div>'
+                '</div>'
+            )
+            st.markdown(_on_fc, unsafe_allow_html=True)
 
-**Step-by-step:**
-
-**Step 1.** For each win **at an event with a prize pool**, compute:
-$$\text{entry}_i = \text{ON\_factor}[\text{opponent}] \;\times\; \text{age\_weight}_i \;\times\; \text{event\_stakes}(\text{pool})$$
-
-**Step 2.** Take the **top 10** entries, sum, divide by 10:
-$$\text{ON} = \frac{\sum_{i \in \text{top-10}} \text{entry}_i}{10}$$
-
-**⚠️ No curve applied to ON** (unlike BC).
-
-**The circular dependency:**
-
-ON for team A uses ON of all opponents of A. But those opponents' ON values use ON
-of *their* opponents. This is circular — no closed-form solution exists.
-
-**Solution: iterative computation (like PageRank):**
-1. Initialise every team's ON with their BO factor (a reasonable prior)
-2. Compute new ON values for all teams simultaneously using current ON estimates
-3. Repeat 6 times — values converge quickly
-
-**Verification — Vitality:**
-
-| Opponent | opp ON | Age | Event | Entry |
-|---|---|---|---|---|
-| PARIVISION | 0.622 | 1.000 | 1.000 | 0.622 |
-| EYEBALLERS | 0.707 | 0.914 | 0.895 | **0.578** |
-| GamerLegion | 0.663 | 0.947 | 0.899 | **0.565** |
-| FURIA | 0.536 | 1.000 | 1.000 | 0.536 |
-| BC.Game | 0.521 | 1.000 | 1.000 | 0.521 |
-| MOUZ (×2) | 0.385 | 1.000 | 1.000 | 0.385 |
-| Aurora (×2) | 0.351 | 1.000 | 1.000 | 0.351 |
-| G2 | 0.305 | 1.000 | 1.000 | 0.305 |
-
-Sum of top 10 = **4.599**, /10 = **0.460** ✓
-""")
         with col_r:
+            st.markdown("#### 🎮 Build an opponent network")
+            st.caption("The opp. ON values you enter represent those opponents' converged ON scores.")
+
+            with st.form("on_add_form", clear_on_submit=True):
+                _oc1, _oc2 = st.columns(2)
+                _oopp   = _oc1.text_input("Opponent", placeholder="MOUZ")
+                _ooppon = _oc2.slider("Opp. ON factor", 0.0, 1.0, 0.45, 0.01)
+                _oc3, _oc4 = st.columns(2)
+                _opool  = _oc3.number_input("Prize pool ($)", min_value=0,
+                                            max_value=2_000_000, value=500_000, step=50_000)
+                _odays  = _oc4.number_input("Days ago", min_value=0, max_value=179, value=20)
+                if st.form_submit_button("➕ Add win", use_container_width=True) and _oopp:
+                    st.session_state.on_sim_entries.append(
+                        {"opponent": _oopp, "opp_on": float(_ooppon),
+                         "pool": int(_opool), "days_ago": int(_odays)})
+                    st.session_state.on_sim_result = None
+
+            if st.session_state.on_sim_entries:
+                for _i, _e in enumerate(st.session_state.on_sim_entries):
+                    _ec1, _ec2, _ec3 = st.columns([3, 4, 0.7])
+                    _ec1.markdown(f"<span style='font-size:12px'>vs {_e['opponent']}</span>",
+                                  unsafe_allow_html=True)
+                    _ec2.markdown(
+                        f"<span style='font-size:11px;color:#8b949e'>ON={_e['opp_on']:.2f} · ${_e['pool']:,} · {_e['days_ago']}d</span>",
+                        unsafe_allow_html=True)
+                    if _ec3.button("✕", key=f"on_rm_{_i}"):
+                        st.session_state.on_sim_entries.pop(_i)
+                        st.session_state.on_sim_result = None
+                        st.rerun()
+
+                st.markdown("---")
+                if st.button("🧮 Calculate Opponent Network", use_container_width=True,
+                             type="primary"):
+                    _now = datetime.now()
+                    _calcs = []
+                    for _e in st.session_state.on_sim_entries:
+                        _md    = _now - timedelta(days=_e["days_ago"])
+                        _aw    = age_weight(_md, _now)
+                        _ew    = event_stakes(max(_e["pool"], 1)) if _e["pool"] > 0 else 0.0
+                        _entry = _e["opp_on"] * _aw * _ew
+                        _calcs.append({"opponent": _e["opponent"], "opp_on": _e["opp_on"],
+                                       "aw": _aw, "ew": _ew, "entry": _entry})
+                    _calcs.sort(key=lambda x: x["entry"], reverse=True)
+                    _top10  = _calcs[:10]
+                    _on_val = sum(x["entry"] for x in _top10) / 10
+                    st.session_state.on_sim_result = {
+                        "calcs": _calcs, "top10": _top10, "on_val": _on_val,
+                    }
+
+            if st.session_state.on_sim_result:
+                _r = st.session_state.on_sim_result
+                st.markdown("##### 📋 Step-by-step result")
+                _rows = ""
+                for _idx, _x in enumerate(_r["calcs"]):
+                    _top   = _idx < 10
+                    _bg    = "background:#0d1626" if _top else "background:#161b22;opacity:0.55"
+                    _badge = ('<span style="background:#79c0ff;color:#000;border-radius:3px;'
+                              'padding:0 4px;font-size:9px;font-weight:700;margin-left:4px;">TOP10</span>'
+                              if _top else '')
+                    _rows += (
+                        f'<tr style="{_bg}">'
+                        f'<td style="padding:5px 6px;font-size:11px;color:#c9d1d9">vs {_x["opponent"]}{_badge}</td>'
+                        f'<td style="padding:5px 6px;font-size:11px;color:#79c0ff;text-align:right">{_x["opp_on"]:.3f}</td>'
+                        f'<td style="padding:5px 6px;font-size:11px;color:#79c0ff;text-align:right">{_x["aw"]:.3f}</td>'
+                        f'<td style="padding:5px 6px;font-size:11px;color:#8b949e;text-align:right">{_x["ew"]:.3f}</td>'
+                        f'<td style="padding:5px 6px;font-size:11px;color:#79c0ff;font-weight:700;text-align:right">{_x["entry"]:.4f}</td>'
+                        f'</tr>'
+                    )
+                st.markdown(
+                    f'<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px;margin-bottom:10px;">'
+                    f'<table style="width:100%;border-collapse:collapse">'
+                    f'<thead><tr style="border-bottom:1px solid #30363d">'
+                    f'<th style="padding:5px 6px;font-size:11px;color:#8b949e;text-align:left">vs Opponent</th>'
+                    f'<th style="padding:5px 6px;font-size:11px;color:#8b949e;text-align:right">opp_ON</th>'
+                    f'<th style="padding:5px 6px;font-size:11px;color:#8b949e;text-align:right">AgeW</th>'
+                    f'<th style="padding:5px 6px;font-size:11px;color:#8b949e;text-align:right">EvW</th>'
+                    f'<th style="padding:5px 6px;font-size:11px;color:#8b949e;text-align:right">Entry</th>'
+                    f'</tr></thead><tbody>{_rows}</tbody></table></div>',
+                    unsafe_allow_html=True)
+                st.markdown(
+                    f'<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:14px;">'
+                    f'<div style="display:flex;flex-direction:column;gap:8px;">'
+                    f'<div style="display:flex;justify-content:space-between;">'
+                    f'<span style="font-size:12px;color:#8b949e;">① Sum top {min(10, len(_r["calcs"]))}</span>'
+                    f'<span style="font-size:13px;font-weight:700;color:#c9d1d9;">{sum(x["entry"] for x in _r["top10"]):.4f}</span></div>'
+                    f'<div style="display:flex;justify-content:space-between;align-items:center;border-top:1px solid #30363d;padding-top:8px;">'
+                    f'<span style="font-size:12px;color:#8b949e;">② ON = &#x3A3; / 10 &nbsp;(no curve)</span>'
+                    f'<span style="font-size:30px;font-weight:700;color:#79c0ff;">{_r["on_val"]:.4f}</span></div>'
+                    f'<div style="font-size:10px;color:#8b949e;text-align:center;">In the real engine opp_ON values are themselves updated over 6 PageRank iterations</div>'
+                    f'</div></div>',
+                    unsafe_allow_html=True)
+            elif st.session_state.on_sim_entries:
+                st.info("Click **Calculate Opponent Network** to see results.", icon="💡")
+            else:
+                st.info("Add at least one win to start.", icon="💡")
             st.markdown("#### ON vs BC — what each rewards")
             st.markdown("""
 | Scenario | BO rewards | ON rewards |
@@ -1910,36 +2275,175 @@ who have themselves beaten many opponents scores highly, regardless of prize mon
     with tab_lan2:
         st.subheader("🖥️ Factor 4 — LAN Wins")
         st.markdown('<span class="tag-v">✓ VERIFIED — 1.0 × age_weight, top-10, /10, no curve, no event stakes</span>', unsafe_allow_html=True)
+
+        if "lan_sim_entries" not in st.session_state:
+            st.session_state.lan_sim_entries = [
+                {"event": "IEM Major 2026",        "days_ago":  10, "is_lan": True},
+                {"event": "PGL Antwerp 2026",       "days_ago":  40, "is_lan": True},
+                {"event": "BLAST Fall 2025",        "days_ago":  90, "is_lan": True},
+                {"event": "Online Qualifier (Q1)",  "days_ago":  15, "is_lan": False},
+                {"event": "IEM Katowice 2025",      "days_ago": 130, "is_lan": True},
+            ]
+        if "lan_sim_result" not in st.session_state:
+            st.session_state.lan_sim_result = None
+
         col_l, col_r = st.columns([3, 2])
         with col_l:
-            st.markdown(r"""
-LAN Wins is the simplest factor: a time-weighted count of wins at **LAN (offline) events**.
+            _lan_fc = (
+                '<div style="background:#0d1117;border:1px solid #30363d;border-radius:12px;padding:20px 24px;margin:8px 0;">'
+                '<div style="text-align:center;margin-bottom:16px;">'
+                '<span style="font-size:13px;font-weight:700;color:#f85149;">🖥️ LAN Wins — Calculation Flow</span>'
+                '</div>'
+                '<div style="text-align:center;">'
+                '<div style="display:inline-block;background:#161b22;border:2px solid #8b949e;border-radius:8px;padding:8px 22px;">'
+                '<div style="font-size:12px;font-weight:700;color:#8b949e;">📅 All wins · 180-day window</div>'
+                '</div></div>'
+                '<div style="text-align:center;color:#484f58;font-size:20px;margin:3px 0;">▼</div>'
+                '<div style="background:#1a0a0d;border:1px solid #f85149;border-radius:8px;padding:8px 14px;margin:0 24px 4px;">'
+                '<div style="font-size:11px;font-weight:700;color:#f85149;margin-bottom:2px;">⚠️ LAN event only</div>'
+                '<div style="font-size:10px;color:#c9d1d9;">Online wins are excluded. No prize pool requirement (unlike BC / ON).</div>'
+                '</div>'
+                '<div style="text-align:center;color:#484f58;font-size:20px;margin:3px 0;">▼</div>'
+                '<div style="background:#1a0a0d;border:1px solid #f85149;border-radius:8px;padding:10px 14px;margin:0 24px 4px;">'
+                '<div style="font-size:11px;font-weight:700;color:#f85149;margin-bottom:4px;">Step 1 — Fixed value per LAN win</div>'
+                '<div style="font-family:monospace;font-size:11px;color:#c9d1d9;background:#0e0508;border-radius:4px;padding:6px 8px;">'
+                'entry = 1.0 × age_weight'
+                '</div>'
+                '<div style="display:flex;gap:8px;margin-top:6px;flex-wrap:wrap;">'
+                '<span style="background:#21262d;border-radius:4px;padding:3px 8px;font-size:10px;color:#8b949e;">❌ No event stakes</span>'
+                '<span style="background:#21262d;border-radius:4px;padding:3px 8px;font-size:10px;color:#8b949e;">❌ No prize requirement</span>'
+                '<span style="background:#21262d;border-radius:4px;padding:3px 8px;font-size:10px;color:#8b949e;">❌ No curve</span>'
+                '</div>'
+                '</div>'
+                '<div style="text-align:center;color:#484f58;font-size:20px;margin:3px 0;">▼</div>'
+                '<div style="background:#1a0a0d;border:1px solid #f85149;border-radius:8px;padding:10px 14px;margin:0 24px 4px;">'
+                '<div style="font-size:11px;font-weight:700;color:#f85149;margin-bottom:4px;">Step 2 — Top 10 · average</div>'
+                '<div style="font-family:monospace;font-size:11px;color:#c9d1d9;background:#0e0508;border-radius:4px;padding:6px 8px;">'
+                'LAN = &#x3A3; top-10 (entries) / 10'
+                '</div>'
+                '<div style="font-size:10px;color:#8b949e;margin-top:4px;">Max = 1.000 — 10 LAN wins all within last 30 days</div>'
+                '</div>'
+                '<div style="text-align:center;color:#484f58;font-size:20px;margin:3px 0;">▼</div>'
+                '<div style="text-align:center;">'
+                '<div style="display:inline-block;background:#1a0a0d;border:2px solid #f85149;border-radius:8px;padding:10px 28px;">'
+                '<div style="font-size:14px;font-weight:700;color:#f85149;">🖥️ LAN Factor &nbsp; [0 → 1]</div>'
+                '</div></div>'
+                '</div>'
+            )
+            st.markdown(_lan_fc, unsafe_allow_html=True)
 
-**Step-by-step:**
-
-**Step 1.** For each win at a LAN event, compute:
-$$\text{entry}_i = 1.0 \;\times\; \text{age\_weight}_i$$
-
-**Step 2.** Take the **top 10** entries, sum, divide by 10:
-$$\text{LAN} = \frac{\sum_{i \in \text{top-10}} 1.0 \times \text{age\_weight}_i}{10}$$
-
-**Key confirmed behaviours:**
-- **No event stakes** — a LAN win at a small $30k event counts equally to a LAN win at a
-  $1M event for this factor (unlike BC/ON which do use event stakes)
-- **No curve** — the output is a direct time-weighted count, not curve-adjusted
-- Matches with **no prize pool** (Event Weight = "−") still count for LAN Wins if played on LAN
-
-**LAN vs Online: where the distinction matters:**
-
-LAN affects **only this factor**. There is **no LAN multiplier in Phase 2 (H2H)**.
-This was a v2 engine error that is now corrected.
-
-**Verification — Vitality (10 February LAN wins, all age=1.000):**
-$$\text{LAN} = \frac{10 \times 1.000}{10} = \mathbf{1.000} \checkmark$$
-
-The maximum LAN factor is 1.000 (10 or more recent LAN wins all at age=1.000).
-""")
         with col_r:
+            st.markdown("#### 🎮 Build a LAN win record")
+            st.caption("Toggle LAN/online for each entry — only LAN wins count toward this factor.")
+
+            with st.form("lan_add_form", clear_on_submit=True):
+                _lc1, _lc2, _lc3 = st.columns([4, 2, 1])
+                _levent = _lc1.text_input("Event name", placeholder="IEM Major 2026")
+                _ldays  = _lc2.number_input("Days ago", min_value=0, max_value=179, value=20)
+                _llan   = _lc3.checkbox("LAN", value=True)
+                if st.form_submit_button("➕ Add win", use_container_width=True) and _levent:
+                    st.session_state.lan_sim_entries.append(
+                        {"event": _levent, "days_ago": int(_ldays), "is_lan": bool(_llan)})
+                    st.session_state.lan_sim_result = None
+
+            if st.session_state.lan_sim_entries:
+                for _i, _e in enumerate(st.session_state.lan_sim_entries):
+                    _ec1, _ec2, _ec3 = st.columns([4, 3, 0.7])
+                    _lan_badge = (
+                        '<span style="background:#f85149;color:#fff;border-radius:3px;'
+                        'padding:1px 5px;font-size:9px;font-weight:700;">LAN</span>'
+                        if _e["is_lan"] else
+                        '<span style="background:#484f58;color:#c9d1d9;border-radius:3px;'
+                        'padding:1px 5px;font-size:9px;">online</span>'
+                    )
+                    _ec1.markdown(f"<span style='font-size:12px'>{_e['event']}</span>",
+                                  unsafe_allow_html=True)
+                    _ec2.markdown(
+                        f"<span style='font-size:11px;color:#8b949e'>{_lan_badge} · {_e['days_ago']}d ago</span>",
+                        unsafe_allow_html=True)
+                    if _ec3.button("✕", key=f"lan_rm_{_i}"):
+                        st.session_state.lan_sim_entries.pop(_i)
+                        st.session_state.lan_sim_result = None
+                        st.rerun()
+
+                st.markdown("---")
+                if st.button("🧮 Calculate LAN Wins", use_container_width=True, type="primary"):
+                    _now = datetime.now()
+                    _calcs_all = []
+                    for _e in st.session_state.lan_sim_entries:
+                        _md = _now - timedelta(days=_e["days_ago"])
+                        _aw = age_weight(_md, _now)
+                        _calcs_all.append({
+                            "event": _e["event"], "is_lan": _e["is_lan"],
+                            "aw": _aw, "entry": _aw if _e["is_lan"] else 0.0,
+                        })
+                    _lan_only = sorted(
+                        [x for x in _calcs_all if x["is_lan"]],
+                        key=lambda x: x["entry"], reverse=True)
+                    _excl     = [x for x in _calcs_all if not x["is_lan"]]
+                    _top10    = _lan_only[:10]
+                    _lan_val  = sum(x["entry"] for x in _top10) / 10
+                    st.session_state.lan_sim_result = {
+                        "lan_only": _lan_only, "excl": _excl,
+                        "top10": _top10, "lan_val": _lan_val,
+                    }
+
+            if st.session_state.lan_sim_result:
+                _r = st.session_state.lan_sim_result
+                st.markdown("##### 📋 Step-by-step result")
+                _rows = ""
+                for _idx, _x in enumerate(_r["lan_only"]):
+                    _top   = _idx < 10
+                    _bg    = "background:#1a0d0d" if _top else "background:#161b22;opacity:0.55"
+                    _badge = ('<span style="background:#f85149;color:#fff;border-radius:3px;'
+                              'padding:0 4px;font-size:9px;font-weight:700;margin-left:4px;">TOP10</span>'
+                              if _top else '')
+                    _rows += (
+                        f'<tr style="{_bg}">'
+                        f'<td style="padding:5px 6px;font-size:11px;color:#c9d1d9">{_x["event"]}{_badge}</td>'
+                        f'<td style="padding:5px 6px;font-size:11px;color:#f85149;text-align:center">🖥️</td>'
+                        f'<td style="padding:5px 6px;font-size:11px;color:#79c0ff;text-align:right">{_x["aw"]:.3f}</td>'
+                        f'<td style="padding:5px 6px;font-size:11px;color:#f85149;font-weight:700;text-align:right">{_x["entry"]:.4f}</td>'
+                        f'</tr>'
+                    )
+                for _x in _r["excl"]:
+                    _rows += (
+                        f'<tr style="background:#161b22;opacity:0.4">'
+                        f'<td style="padding:5px 6px;font-size:11px;color:#8b949e">{_x["event"]}'
+                        f'<span style="background:#484f58;color:#c9d1d9;border-radius:3px;padding:0 4px;font-size:9px;margin-left:4px;">online — excluded</span></td>'
+                        f'<td style="padding:5px 6px;font-size:11px;color:#484f58;text-align:center">🌐</td>'
+                        f'<td style="padding:5px 6px;font-size:11px;color:#484f58;text-align:right">{_x["aw"]:.3f}</td>'
+                        f'<td style="padding:5px 6px;font-size:11px;color:#484f58;text-align:right">—</td>'
+                        f'</tr>'
+                    )
+                st.markdown(
+                    f'<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px;margin-bottom:10px;">'
+                    f'<table style="width:100%;border-collapse:collapse">'
+                    f'<thead><tr style="border-bottom:1px solid #30363d">'
+                    f'<th style="padding:5px 6px;font-size:11px;color:#8b949e;text-align:left">Event</th>'
+                    f'<th style="padding:5px 6px;font-size:11px;color:#8b949e;text-align:center">Type</th>'
+                    f'<th style="padding:5px 6px;font-size:11px;color:#8b949e;text-align:right">AgeW</th>'
+                    f'<th style="padding:5px 6px;font-size:11px;color:#8b949e;text-align:right">Entry</th>'
+                    f'</tr></thead><tbody>{_rows}</tbody></table></div>',
+                    unsafe_allow_html=True)
+                st.markdown(
+                    f'<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:14px;">'
+                    f'<div style="display:flex;flex-direction:column;gap:8px;">'
+                    f'<div style="display:flex;justify-content:space-between;">'
+                    f'<span style="font-size:12px;color:#8b949e;">LAN wins</span>'
+                    f'<span style="font-size:13px;font-weight:700;color:#c9d1d9;">{len(_r["lan_only"])} total · top {min(10, len(_r["lan_only"]))} used</span></div>'
+                    f'<div style="display:flex;justify-content:space-between;">'
+                    f'<span style="font-size:12px;color:#8b949e;">① Sum top {min(10, len(_r["lan_only"]))}</span>'
+                    f'<span style="font-size:13px;font-weight:700;color:#c9d1d9;">{sum(x["entry"] for x in _r["top10"]):.4f}</span></div>'
+                    f'<div style="display:flex;justify-content:space-between;align-items:center;border-top:1px solid #30363d;padding-top:8px;">'
+                    f'<span style="font-size:12px;color:#8b949e;">② LAN = &#x3A3; / 10</span>'
+                    f'<span style="font-size:30px;font-weight:700;color:#f85149;">{_r["lan_val"]:.4f}</span></div>'
+                    f'</div></div>',
+                    unsafe_allow_html=True)
+            elif st.session_state.lan_sim_entries:
+                st.info("Click **Calculate LAN Wins** to see results.", icon="💡")
+            else:
+                st.info("Add at least one win to start.", icon="💡")
             st.markdown("#### Effect of age on LAN score")
             scenarios_lan = [
                 ("10 wins last month\n(age=1.0 each)",  [1.0]*10),
