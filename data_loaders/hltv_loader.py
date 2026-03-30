@@ -33,7 +33,20 @@ from typing import Callable
 
 import pandas as pd
 import requests
-from bs4 import BeautifulSoup
+
+# BeautifulSoup is imported lazily inside functions so the rest of the app
+# can start even if beautifulsoup4 is not yet installed.  A clear error is
+# raised at fetch-time rather than at import-time.
+def _bs4(html: str, parser: str = "html.parser"):
+    """Lazy BeautifulSoup constructor — imports bs4 on first call."""
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError as exc:
+        raise ImportError(
+            "beautifulsoup4 is required for the HLTV loader. "
+            "Install it with:  pip install beautifulsoup4"
+        ) from exc
+    return BeautifulSoup(html, parser)
 
 logger = logging.getLogger(__name__)
 
@@ -156,7 +169,7 @@ def _parse_matches_page(html: str) -> list[dict]:
         date_str, event_id, event_slug, event_name,
         map_stats_id
     """
-    soup = BeautifulSoup(html, "html.parser")
+    soup = _bs4(html, "html.parser")
     rows: list[dict] = []
 
     tbody = soup.find("tbody")
@@ -247,7 +260,7 @@ def _parse_row(tr) -> dict | None:
 
 def _total_results(html: str) -> int:
     """Try to read the total result count from the pagination element."""
-    soup = BeautifulSoup(html, "html.parser")
+    soup = _bs4(html, "html.parser")
     for txt in soup.find_all(string=re.compile(r"of\s+\d+")):
         m = re.search(r"of\s+(\d+)", txt)
         if m:
@@ -365,7 +378,7 @@ def _fetch_event_meta(
     if not html:
         return default
 
-    soup   = BeautifulSoup(html, "html.parser")
+    soup   = _bs4(html, "html.parser")
     result = dict(default)
 
     # ── Prize pool ─────────────────────────────────────────────────────
