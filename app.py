@@ -125,7 +125,29 @@ from vrs_engine import (
 )
 from data_loaders import load_valve_github_data
 from data_loaders.github_loader import _find_all_dates
+from data_loaders import (
+    fetch_hltv_matches, load_from_cache,
+    cache_exists, cache_mtime, clear_cache,
+)
 from utils import get_team_meta, KNOWN_META, COLOR_CYCLE
+TEAM_META = KNOWN_META   # alias used throughout app
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cached_find_all_dates() -> list[tuple[str, str]]:
+    """Cached wrapper — GitHub file list, refreshed at most once per hour."""
+    return _find_all_dates()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cached_load_github_data(date_str: str | None,
+                              year: str | None) -> dict:
+    """Cached wrapper — full snapshot fetch, keyed by (date_str, year).
+    Historical snapshots never change; the 1-hour TTL only matters for
+    the latest date where Valve occasionally pushes updates."""
+    return load_valve_github_data(date_str, year)
+
+
 from utils.ui_helpers import (
     region_pill, rank_badge, change_arrow, add_meta, add_regional_rank
 )
@@ -137,7 +159,7 @@ from utils.ui_helpers import (
 # ══════════════════════════════════════════════════════════════════
 
 # ── Discover all available dates first (lightweight, cached 1h) ────
-_all_dates = _find_all_dates()   # [(date_str, year), ...]
+_all_dates = _cached_find_all_dates()   # [(date_str, year), ...]
 
 # ── Query-param navigation: must run BEFORE sidebar widgets ────────
 # Team links in the dashboard use href="?team=TeamName".
@@ -213,7 +235,7 @@ with st.sidebar:
 _load_ph = st.empty()
 with _load_ph.container():
     with st.spinner("⏳ Loading VRS data from Valve GitHub…"):
-        _gd = load_valve_github_data(_sel_date, _sel_year)
+        _gd = _cached_load_github_data(_sel_date, _sel_year)
 
 _load_ph.empty()
 
@@ -907,6 +929,184 @@ elif page == "🔮 Scenario Simulator":
 
     if "hyp_matches" not in st.session_state:
         st.session_state.hyp_matches = []
+    if "hltv_df" not in st.session_state:
+        st.session_state.hltv_df = pd.DataFrame()
+
+    # ══════════════════════════════════════════════════════════════
+    # HLTV LIVE MATCH LOADER
+    # ══════════════════════════════════════════════════════════════
+    with st.expander("📡 Load Live HLTV Matches", expanded=True):
+        st.markdown(
+            "Fetch real CS2 series results from HLTV.org and inject them into "
+            "the simulator queue. Data is cached to disk so re-opening the app "
+            "does not re-fetch. Click **Fetch** only when you want fresh data."
+        )
+
+        _hc1, _hc2, _hc3 = st.columns([2, 2, 1])
+        _hltv_start = _hc1.date_input(
+            "From (inclusive)",
+            value=cutoff_dt.date(),
+            key="hltv_start",
+            help="Defaults to the Valve snapshot cutoff date.",
+        )
+        _hltv_end = _hc2.date_input(
+            "To (inclusive)",
+            value=datetime.today().date(),
+            key="hltv_end",
+        )
+        _hltv_lan_only = _hc3.toggle(
+            "LAN only", value=False, key="hltv_lan_only",
+            help="Filter the preview to LAN events only. "
+                 "Injection still uses the full filter setting below.",
+        )
+
+        _sd_str = _hltv_start.strftime("%Y-%m-%d")
+        _ed_str = _hltv_end.strftime("%Y-%m-%d")
+
+        # Cache status indicator
+        if cache_exists(_sd_str, _ed_str):
+            _mtime = cache_mtime(_sd_str, _ed_str)
+            st.caption(
+                f"💾 Disk cache found — last fetched "
+                f"**{_mtime.strftime('%d %b %Y, %H:%M')}**. "
+                f"Press **Fetch** to refresh, or **Load from Cache** to reuse."
+            )
+            _fb1, _fb2, _fb3 = st.columns(3)
+            _do_fetch = _fb1.button(
+                "🔄 Fetch Fresh Data", key="hltv_btn_fresh",
+                use_container_width=True,
+            )
+            _do_load_cache = _fb2.button(
+                "💾 Load from Cache", key="hltv_btn_cache",
+                use_container_width=True, type="primary",
+            )
+            _do_clear = _fb3.button(
+                "🗑️ Clear Cache", key="hltv_btn_clear",
+                use_container_width=True,
+            )
+
+            if _do_clear:
+                clear_cache(_sd_str, _ed_str)
+                st.session_state.hltv_df = pd.DataFrame()
+                st.success("Cache cleared.")
+                st.rerun()
+
+            if _do_load_cache:
+                _cached = load_from_cache(_sd_str, _ed_str)
+                if _cached is not None:
+                    st.session_state.hltv_df = _cached
+                    st.success(f"Loaded **{len(_cached)}** series from cache.")
+                    st.rerun()
+        else:
+            st.caption("No disk cache for this date range. Press **Fetch** to load data.")
+            _do_fetch        = st.button(
+                "🌐 Fetch HLTV Matches", key="hltv_btn_fetch",
+                type="primary", use_container_width=False,
+            )
+            _do_load_cache   = False
+
+        # ── Live fetch ─────────────────────────────────────────────
+        if _do_fetch:
+            from data_loaders.hltv_loader import _MAX_PAGES as _MAX_HLTV_PAGES
+            _prog_bar  = st.progress(0, text="Connecting to HLTV…")
+            _prog_text = st.empty()
+
+            def _progress(page: int, total: int, status: str):
+                _prog_bar.progress(min(page / (_MAX_HLTV_PAGES + 1), 0.95), text=status)
+                _prog_text.caption(f"{total} map rows collected so far…")
+            try:
+                _hltv_result = fetch_hltv_matches(
+                    _sd_str, _ed_str,
+                    force_refresh=True,
+                    progress_callback=_progress,
+                )
+                _prog_bar.progress(1.0, text="Done.")
+                _prog_text.empty()
+                st.session_state.hltv_df = _hltv_result
+                if _hltv_result.empty:
+                    st.warning(
+                        "Fetch returned 0 series. "
+                        "HLTV may have returned no results for this date range, "
+                        "or all rows could not be parsed."
+                    )
+                else:
+                    st.success(
+                        f"✅ Fetched **{len(_hltv_result)} series** "
+                        f"({_hltv_result['is_lan'].sum()} LAN · "
+                        f"{(~_hltv_result['is_lan']).sum()} Online)."
+                    )
+                    st.rerun()
+            except RuntimeError as _e:
+                _prog_bar.empty()
+                _prog_text.empty()
+                st.error(f"⚠️ HLTV fetch failed: {_e}")
+            except Exception as _e:
+                _prog_bar.empty()
+                _prog_text.empty()
+                st.error(f"Unexpected error during HLTV fetch: {_e}")
+
+        # ── Preview & inject ───────────────────────────────────────
+        _hdf = st.session_state.hltv_df
+        if not _hdf.empty:
+            _ranked_teams = set(base_standings["team"].tolist())
+            _hdf_view     = _hdf[_hdf["is_lan"]] if _hltv_lan_only else _hdf
+            _hdf_ranked   = _hdf[
+                _hdf["winner"].isin(_ranked_teams) & _hdf["loser"].isin(_ranked_teams)
+            ]
+            _hdf_view_ranked = _hdf_view[
+                _hdf_view["winner"].isin(_ranked_teams) & _hdf_view["loser"].isin(_ranked_teams)
+            ]
+
+            # Stats row
+            _si1, _si2, _si3, _si4 = st.columns(4)
+            _si1.metric("Total series",   len(_hdf))
+            _si2.metric("LAN series",     int(_hdf["is_lan"].sum()))
+            _si3.metric("Ranked-team series", len(_hdf_ranked),
+                        help="Both winner and loser appear in the current Valve standings.")
+            _si4.metric("Events", _hdf["event"].nunique())
+
+            # Preview table
+            _preview = _hdf_view[["date", "winner", "loser", "event", "prize_pool", "is_lan"]].copy()
+            _preview["date"]       = _preview["date"].dt.strftime("%Y-%m-%d")
+            _preview["prize_pool"] = _preview["prize_pool"].apply(
+                lambda x: f"${x:,.0f}" if x else "—"
+            )
+            _preview.columns = ["Date", "Winner", "Loser", "Event", "Prize Pool", "LAN"]
+            st.dataframe(_preview, use_container_width=True, hide_index=True, height=260)
+
+            st.markdown("**Inject into simulator queue:**")
+            _ij1, _ij2, _ij3 = st.columns(3)
+
+            if _ij1.button("➕ All series", use_container_width=True, key="hltv_inj_all"):
+                _records = _hdf.to_dict("records")
+                st.session_state.hyp_matches.extend(_records)
+                st.success(f"Injected {len(_records)} series into the queue.")
+                st.rerun()
+
+            if _ij2.button(
+                "➕ Ranked teams only", use_container_width=True, key="hltv_inj_ranked",
+                help="Only injects series where both teams appear in the current Valve standings.",
+            ):
+                _records = _hdf_ranked.to_dict("records")
+                st.session_state.hyp_matches.extend(_records)
+                st.success(f"Injected {len(_records)} series (ranked teams only).")
+                st.rerun()
+
+            if _ij3.button(
+                "➕ LAN + Ranked only", use_container_width=True, key="hltv_inj_lan_ranked",
+                help="Only LAN series between two ranked teams — the highest-signal matches for VRS.",
+            ):
+                _lan_ranked = _hdf[
+                    _hdf["is_lan"]
+                    & _hdf["winner"].isin(_ranked_teams)
+                    & _hdf["loser"].isin(_ranked_teams)
+                ]
+                _records = _lan_ranked.to_dict("records")
+                st.session_state.hyp_matches.extend(_records)
+                st.success(f"Injected {len(_records)} LAN series (ranked teams only).")
+                st.rerun()
+
+        st.markdown("---")
 
     # ── Input form ────────────────────────────────────────────────
     with st.form("add_match"):
@@ -2742,7 +2942,7 @@ When the eligible pool changes (teams drop out due to inactivity or window expir
         def _load_team_history(team_name: str, all_dates) -> pd.DataFrame:
             rows = []
             for ds, yr in all_dates:
-                gd = load_valve_github_data(ds, yr)
+                gd = _cached_load_github_data(ds, yr)
                 s  = gd.get("standings", pd.DataFrame())
                 if not s.empty and team_name in s["team"].values:
                     row = s[s["team"] == team_name].iloc[0]
