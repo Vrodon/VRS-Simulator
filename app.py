@@ -114,899 +114,22 @@ div[data-testid="metric-container"] {
 
 
 # ══════════════════════════════════════════════════════════════════
-# ████████████  VRS CALCULATION ENGINE  v3  ████████████████████████
+# IMPORTS FROM VRS MODULES
 # ══════════════════════════════════════════════════════════════════
-#
-# All formulas verified against the official Vitality March-2026
-# breakdown published in the Valve repository.
-#
-# KEY CORRECTIONS vs v2:
-#   1. Time decay: flat 1.0 for first 30 days, linear 1.0→0.0 over
-#      the following 150 days  (NOT a simple 0→1 remap over 180 days)
-#   2. BO: prize × age_weight (no event stakes); normalised with
-#      curve(min(1.0, sum / 5th_team_sum))
-#   3. BC: uses opponent's BO factor × age × event_stakes, then
-#      curve(sum_top10 / 10)  — curve IS applied
-#   4. ON: uses opponent's ON factor × age × event_stakes, then
-#      sum_top10 / 10  — NO curve; iterative (PageRank-like)
-#   5. LAN: 1.0 × age_weight per LAN win; sum_top10 / 10; NO curve,
-#      NO event stakes; no LAN multiplier anywhere in H2H
-#   6. Seeding: simple unweighted average of the 4 factors (25% each)
-#   7. H2H K = BASE_K × age_weight ONLY (no event stakes, no LAN mult)
-# ══════════════════════════════════════════════════════════════════
+from vrs_engine import (
+    compute_vrs,
+    DECAY_DAYS, FLAT_DAYS, DECAY_RAMP, RD_FIXED, Q_GLICKO,
+    BASE_K, PRIZE_CAP, TOP_N, ON_ITERS, SEED_MIN, SEED_MAX,
+    curve, event_stakes, age_weight, lerp,
+    g_rd, expected_win, top_n_sum, G_FIXED
+)
+from data_loaders import load_valve_github_data
+from data_loaders.github_loader import _find_all_dates
+from utils import get_team_meta, KNOWN_META, COLOR_CYCLE
+from utils.ui_helpers import (
+    region_pill, rank_badge, change_arrow, add_meta, add_regional_rank
+)
 
-# ── Constants ──────────────────────────────────────────────────────
-DECAY_DAYS  = 180           # Total lookback window (days)
-FLAT_DAYS   = 30            # Days at the start that hold 1.0 age weight
-DECAY_RAMP  = 150           # Days over which weight ramps 1.0 → 0.0
-RD_FIXED    = 75            # Fixed Glicko RD → Elo-equivalent behaviour
-Q_GLICKO    = math.log(10) / 400   # ≈ 0.005756
-BASE_K      = 32            # H2H base K-factor (scaled by age only)
-PRIZE_CAP   = 1_000_000     # Prize pool cap for event stakes (USD)
-TOP_N       = 10            # Bucket size — top-N results per factor
-ON_ITERS    = 6             # PageRank iterations for Opponent Network
-
-SEED_MIN = 400
-SEED_MAX = 2000
-
-
-# ── Core maths ────────────────────────────────────────────────────
-
-def curve(x: float) -> float:
-    """
-    Valve's normalisation curve:  f(x) = 1 / (1 + |log₁₀(x)|)
-
-    · f(1.0)  = 1.000  — exactly at the reference point
-    · f(0.1)  = 0.500  — one order of magnitude below
-    · f(0.01) = 0.333  — two orders of magnitude below
-    · f(10)   = 0.500  — one order of magnitude above
-    · Always in (0, 1] for x > 0; peaks at x = 1
-    """
-    if x <= 0:
-        return 0.0
-    return 1.0 / (1.0 + abs(math.log10(x)))
-
-
-def event_stakes(prize_pool: float) -> float:
-    """
-    Event weight applied to BC and ON calculations:
-      stakes = curve(pool / $1,000,000)
-
-    A $1M event  → stakes = curve(1.0) = 1.000
-    A $250k event→ stakes = curve(0.25) ≈ 0.602
-    A $100k event→ stakes = curve(0.1)  = 0.500
-    Applied to:  BC, ON   (NOT to BO or LAN)
-    """
-    ratio = min(max(prize_pool, 1.0), PRIZE_CAP) / PRIZE_CAP
-    return curve(ratio)
-
-
-def age_weight(match_date: datetime, cutoff: datetime) -> float:
-    """
-    Age Weight (Time Modifier) — verified against official Vitality data.
-
-    · Days 0–30 before cutoff: weight = 1.000 (flat)
-    · Days 31–180:             weight = 1.0 – (days_ago – 30) / 150
-    · Beyond 180 days:         excluded (weight = 0.0)
-
-    Examples at cutoff 2026-03-02:
-      2026-01-31 (30 days):  1.000  ✓
-      2026-01-24 (37 days):  0.953  ✓
-      2025-12-14 (78 days):  0.680  ✓
-      2025-11-09 (113 days): 0.447  ✓
-      2025-10-12 (141 days): 0.260  ✓
-      2025-09-07 (176 days): 0.027  ✓
-    """
-    days_ago = (cutoff - match_date).days
-    if days_ago < 0:
-        return 1.0          # future match (should not occur)
-    if days_ago <= FLAT_DAYS:
-        return 1.0
-    if days_ago >= DECAY_DAYS:
-        return 0.0
-    return 1.0 - (days_ago - FLAT_DAYS) / DECAY_RAMP
-
-
-def lerp(a: float, b: float, t: float) -> float:
-    """Linear interpolation: a + (b–a)×t, t clamped to [0, 1]."""
-    return a + (b - a) * max(0.0, min(1.0, t))
-
-
-# ── Glicko helpers ─────────────────────────────────────────────────
-
-def g_rd(rd: float = RD_FIXED) -> float:
-    """
-    Glicko g(RD) dampening factor.
-    With RD fixed at 75 this is constant ≈ 0.9728.
-    """
-    return 1.0 / math.sqrt(1.0 + 3.0 * Q_GLICKO**2 * rd**2 / math.pi**2)
-
-
-G_FIXED = g_rd(RD_FIXED)   # pre-computed; constant for the entire run
-
-
-def expected_win(r_self: float, r_opp: float) -> float:
-    """
-    Glicko expected score for r_self against r_opp:
-      E = 1 / (1 + 10^(−g(RD) × (r_self − r_opp) / 400))
-    """
-    return 1.0 / (1.0 + 10.0 ** (-G_FIXED * (r_self - r_opp) / 400.0))
-
-
-# ── Helper: top-N sum ───────────────────────────────────────────────
-
-def top_n_sum(values: list, n: int = TOP_N) -> float:
-    """Return the sum of the n largest values in the list."""
-    return float(sum(sorted(values, reverse=True)[:n]))
-
-
-# ══════════════════════════════════════════════════════════════════
-# MAIN VRS COMPUTATION
-# ══════════════════════════════════════════════════════════════════
-
-def compute_vrs(matches_df: pd.DataFrame, cutoff: datetime = None) -> pd.DataFrame:
-    """
-    Full two-phase VRS computation (v3, formula-verified).
-
-    Input DataFrame columns:
-        date         – datetime
-        winner       – str
-        loser        – str
-        prize_pool   – float  (USD, event total prize pool; 0 if none)
-        winner_prize – float  (USD earned by the winner)
-        loser_prize  – float  (USD earned by the loser)
-        is_lan       – bool
-
-    Returns one row per eligible team with full score breakdown.
-    Ineligible teams (0 wins OR <5 total matches) are excluded.
-    """
-    if cutoff is None:
-        cutoff = datetime.now()
-
-    window_start = cutoff - timedelta(days=DECAY_DAYS)
-
-    # ── Filter window, sort chronologically ──────────────────────
-    df = matches_df[
-        (matches_df["date"] >= window_start) &
-        (matches_df["date"] <= cutoff)
-    ].copy().sort_values("date").reset_index(drop=True)
-
-    if df.empty:
-        return pd.DataFrame()
-
-    # ── Per-match derived values ──────────────────────────────────
-    df["age_w"]    = df["date"].apply(lambda d: age_weight(d, cutoff))
-    df["ev_w"]     = df["prize_pool"].apply(event_stakes)   # for BC + ON only
-    df["has_prize"] = df["prize_pool"] > 0                  # event-weight gate
-
-    all_teams = sorted(set(df["winner"].tolist() + df["loser"].tolist()))
-
-    # ── Eligibility (pre-filter) ──────────────────────────────────
-    match_counts = {
-        t: int(len(df[(df["winner"] == t) | (df["loser"] == t)]))
-        for t in all_teams
-    }
-    wins_counts = {
-        t: int((df["winner"] == t).sum())
-        for t in all_teams
-    }
-    eligible = [
-        t for t in all_teams
-        if wins_counts.get(t, 0) > 0          # ≥1 win in window
-        and match_counts.get(t, 0) >= 5       # ≥5 matches in window
-    ]
-    if not eligible:
-        return pd.DataFrame()
-
-    # ══════════════════════════════════════════════════════════════
-    # PHASE 1 — SEEDING
-    # ══════════════════════════════════════════════════════════════
-
-    # ── Factor 1: Bounty Offered ───────────────────────────────────
-    # Each win contributes:  winner_prize × age_weight
-    # (NO event stakes — BO does not use event weight)
-    # Top-10 such contributions are summed into bo_sum.
-    # Normalised: curve(min(1.0, bo_sum / 5th_team_bo_sum))
-    # Teams ranked 1-5 by prize money all receive BO = 1.000.
-
-    bo_sum: dict[str, float] = {}
-    for team in all_teams:
-        wins = df[df["winner"] == team]
-        if wins.empty:
-            bo_sum[team] = 0.0
-        else:
-            contribs = wins["winner_prize"] * wins["age_w"]
-            bo_sum[team] = float(contribs.nlargest(TOP_N).sum())
-
-    # 5th-highest BO sum as the normalisation reference
-    sorted_bo_sums = sorted(bo_sum.values(), reverse=True)
-    ref_5th = sorted_bo_sums[4] if len(sorted_bo_sums) >= 5 else (
-              sorted_bo_sums[-1] if sorted_bo_sums else 1.0)
-    ref_5th = max(ref_5th, 1e-9)
-
-    # BO factor for every team (eligible and ineligible — needed for BC/ON)
-    bo_factor: dict[str, float] = {
-        t: curve(min(1.0, bo_sum[t] / ref_5th))
-        for t in all_teams
-    }
-
-    # ── Factor 2: Bounty Collected ─────────────────────────────────
-    # Each win (at an event with prize pool) contributes:
-    #   opponent_BO_factor × age_weight × event_weight
-    # Take top-10 such values, sum them, divide by 10, apply curve.
-    # BC = curve( Σ_top10(opp_BO × age × ev_stakes) / 10 )
-
-    bc_factor: dict[str, float] = {}
-    bc_sum_raw: dict[str, float] = {}   # pre-curve sum/10, for display
-    for team in eligible:
-        wins_ev = df[(df["winner"] == team) & df["has_prize"]]
-        if wins_ev.empty:
-            bc_factor[team] = 0.0
-            bc_sum_raw[team] = 0.0
-            continue
-        entries = [
-            bo_factor.get(row["loser"], 0.0) * row["age_w"] * row["ev_w"]
-            for _, row in wins_ev.iterrows()
-        ]
-        s = top_n_sum(entries) / TOP_N
-        bc_sum_raw[team] = s
-        bc_factor[team]  = curve(s)
-
-    # ── Factor 3: Opponent Network ──────────────────────────────────
-    # Each win (at an event with prize pool) contributes:
-    #   opponent_ON_factor × age_weight × event_weight
-    # Take top-10, sum, divide by 10.  NO curve applied.
-    # ON = Σ_top10(opp_ON × age × ev_stakes) / 10
-    #
-    # Circular dependency → iterate (PageRank-style).
-    # Initialise with BO factors as the first estimate of each team's
-    # "network value", then update ON_ITERS times.
-
-    on_factor: dict[str, float] = dict(bo_factor)   # seed estimate
-
-    for _iter in range(ON_ITERS):
-        new_on: dict[str, float] = {}
-        for team in eligible:
-            wins_ev = df[(df["winner"] == team) & df["has_prize"]]
-            if wins_ev.empty:
-                new_on[team] = 0.0
-                continue
-            entries = [
-                on_factor.get(row["loser"], 0.0) * row["age_w"] * row["ev_w"]
-                for _, row in wins_ev.iterrows()
-            ]
-            new_on[team] = top_n_sum(entries) / TOP_N
-        # Update only eligible teams; ineligible keep their BO seed
-        on_factor.update(new_on)
-
-    on_factor_final: dict[str, float] = {t: on_factor.get(t, 0.0) for t in eligible}
-
-    # ── Factor 4: LAN Wins ─────────────────────────────────────────
-    # Each LAN win contributes: 1.0 × age_weight
-    # (no event stakes, no curve — pure time-weighted count)
-    # LAN = Σ_top10(1.0 × age) / 10
-
-    lan_factor: dict[str, float] = {}
-    lan_wins_ct: dict[str, int] = {}
-    for team in eligible:
-        lan_wins = df[(df["winner"] == team) & df["is_lan"]]
-        lan_wins_ct[team] = len(lan_wins)
-        if lan_wins.empty:
-            lan_factor[team] = 0.0
-        else:
-            entries = lan_wins["age_w"].tolist()
-            lan_factor[team] = top_n_sum(entries) / TOP_N
-
-    # ── Combine → Seed ─────────────────────────────────────────────
-    # Simple unweighted average of the four factor values (25% each).
-    # Then lerp to [400, 2000] via min-max across eligible teams.
-
-    combined: dict[str, float] = {
-        t: (bo_factor[t] + bc_factor[t] + on_factor_final[t] + lan_factor[t]) / 4.0
-        for t in eligible
-    }
-
-    avg_vals = list(combined.values())
-    min_avg  = min(avg_vals)
-    max_avg  = max(avg_vals)
-    span_avg = max(max_avg - min_avg, 1e-9)
-
-    seeds: dict[str, float] = {
-        t: lerp(SEED_MIN, SEED_MAX, (combined[t] - min_avg) / span_avg)
-        for t in eligible
-    }
-
-    # ══════════════════════════════════════════════════════════════
-    # PHASE 2 — HEAD-TO-HEAD  (Glicko / Elo, chronological)
-    # ══════════════════════════════════════════════════════════════
-    # K = BASE_K × age_weight  ONLY.
-    # No event stakes, no LAN multiplier — confirmed from official data.
-    # Matches are processed oldest-first so ratings evolve naturally.
-
-    ratings:   dict[str, float] = {t: seeds[t] for t in eligible}
-    h2h_delta: dict[str, float] = {t: 0.0      for t in eligible}
-
-    for _, row in df.iterrows():
-        w, l = str(row["winner"]), str(row["loser"])
-        if w not in ratings or l not in ratings:
-            continue
-
-        r_w, r_l = ratings[w], ratings[l]
-        E_w = expected_win(r_w, r_l)   # E_l = 1 – E_w implicitly
-
-        K = BASE_K * float(row["age_w"])
-
-        d_w =  K * (1.0 - E_w)          # winner always gains
-        d_l =  K * (0.0 - (1.0 - E_w))  # loser always loses (= –K × E_w)
-
-        ratings[w]   += d_w
-        ratings[l]   += d_l
-        h2h_delta[w] += d_w
-        h2h_delta[l] += d_l
-
-    # ── Build output DataFrame ─────────────────────────────────────
-    records = []
-    for t in eligible:
-        seed  = seeds[t]
-        h2h   = h2h_delta[t]
-        total = seed + h2h
-
-        records.append({
-            "team":             t,
-            "total_points":     round(total, 1),
-            "seed":             round(seed,  1),
-            "h2h_delta":        round(h2h,   1),
-            # Raw factor scores (pre-combination)
-            "bo_sum":           round(bo_sum.get(t, 0.0),        2),
-            "bo_factor":        round(bo_factor.get(t, 0.0),     4),
-            "bc_pre_curve":     round(bc_sum_raw.get(t, 0.0),    4),
-            "bc_factor":        round(bc_factor.get(t, 0.0),     4),
-            "on_factor":        round(on_factor_final.get(t,0.0),4),
-            "lan_factor":       round(lan_factor.get(t, 0.0),    4),
-            "lan_wins":         int(lan_wins_ct.get(t, 0)),
-            # Combined average (input to lerp)
-            "seed_combined":    round(combined.get(t, 0.0),      4),
-            # Match counts
-            "wins":             int(wins_counts.get(t, 0)),
-            "losses":           int(match_counts.get(t, 0) - wins_counts.get(t, 0)),
-            "total_matches":    int(match_counts.get(t, 0)),
-        })
-
-    result = (pd.DataFrame(records)
-              .sort_values("total_points", ascending=False)
-              .reset_index(drop=True))
-    result["rank"] = result.index + 1
-    return result
-
-
-# ══════════════════════════════════════════════════════════════════
-# ████████████  GITHUB DATA LOADER  ████████████████████████████████
-# ══════════════════════════════════════════════════════════════════
-#
-# Fetches live data from Valve's public GitHub repo.
-# All 300-400 team detail files are fetched in parallel (20 workers)
-# and cached for 1 hour via @st.cache_data.
-#
-# Data flow:
-#   1. GitHub API  → discover latest standings date
-#   2. standings_global_*.md → get team list + detail file paths  
-#   3. Parallel fetch all detail *.md files (ThreadPoolExecutor)
-#   4. Parse each file:
-#      · Pre-computed factor values (Valve's exact numbers)
-#      · Match history (for H2H simulation)
-# ══════════════════════════════════════════════════════════════════
-
-import json
-import re as _re
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-GITHUB_RAW  = ("https://raw.githubusercontent.com/ValveSoftware/"
-               "counter-strike_regional_standings/refs/heads/main")
-GITHUB_API  = ("https://api.github.com/repos/ValveSoftware/"
-               "counter-strike_regional_standings/contents")
-GH_FOLDER   = "invitation"   # "invitation" = ranked; "live" = continuous
-GH_WORKERS  = 20
-
-
-# ── Internal helpers ───────────────────────────────────────────────
-
-def _gh_get(url: str, timeout: int = 12) -> str | None:
-    """Fetch a URL; return text on 200, else None."""
-    try:
-        r = requests.get(url, timeout=timeout,
-                         headers={"User-Agent": "VRS-Simulator/1.0"})
-        return r.text if r.status_code == 200 else None
-    except Exception:
-        return None
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def _find_all_dates() -> list[tuple[str, str]]:
-    """
-    Discover all published VRS standing dates from the GitHub repo.
-    Returns list of (date_str, year) sorted newest-first.
-    e.g. [("2026_03_02","2026"), ("2026_02_03","2026"), ...]
-    """
-    result = []
-    for year in ("2026", "2025", "2024"):
-        text = _gh_get(f"{GITHUB_API}/{GH_FOLDER}/{year}")
-        if not text:
-            continue
-        try:
-            files = json.loads(text)
-            for f in files:
-                if not isinstance(f, dict):
-                    continue
-                if "standings_global" not in f.get("name", ""):
-                    continue
-                m = _re.search(r"(\d{4}_\d{2}_\d{2})", f.get("name", ""))
-                if m:
-                    result.append((m.group(1), year))
-        except Exception:
-            pass
-    result.sort(key=lambda x: x[0], reverse=True)
-    return result
-
-
-def _find_latest_date() -> tuple[str | None, str | None]:
-    """Return the most recent (date_str, year) pair."""
-    dates = _find_all_dates()
-    return (dates[0][0], dates[0][1]) if dates else (None, None)
-
-
-def _parse_standings_index(text: str) -> list[dict]:
-    """
-    Parse standings_global_*.md.
-    Returns list of {rank, points, team, detail_path}.
-    """
-    rows = []
-    for line in text.splitlines():
-        m = _re.match(
-            r"\|\s*(\d+)\s*\|\s*(\d+)\s*\|\s*([^|]+?)\s*"
-            r"\|[^|]*\|\s*\[details\]\(([^)]+)\)",
-            line,
-        )
-        if m:
-            rows.append({
-                "rank":        int(m.group(1)),
-                "points":      int(m.group(2)),
-                "team":        m.group(3).strip(),
-                "detail_path": m.group(4).strip(),
-            })
-    return rows
-
-
-def _parse_detail_md(team: str, rank: int, valve_pts: int, text: str) -> dict:
-    """
-    Parse one team detail markdown file.
-    Extracts pre-computed factor values and match history.
-    """
-    d: dict = {
-        "team": team, "rank": rank, "valve_points": valve_pts,
-        "total_points": float(valve_pts), "seed": float(valve_pts),
-        "h2h_delta": 0.0,
-        "bo_factor": 0.0, "bc_factor": 0.0, "on_factor": 0.0, "lan_factor": 0.0,
-        "seed_combined": 0.0, "bo_sum": 0.0, "bc_pre_curve": 0.0,
-        "wins": 0, "losses": 0, "lan_wins": 0, "total_matches": 0,
-        "matches": [],
-    }
-
-    # ── Score breakdown ─────────────────────────────────────────────
-    m = _re.search(
-        r"Final Rank Value[^(]*\(([-\d.]+)\)[^=]*=.*?"
-        r"Starting Rank Value[^(]*\(([-\d.]+)\).*?"
-        r"Head To Head Adjustments[^(]*\(([-\d.]+)\)",
-        text, _re.DOTALL,
-    )
-    if m:
-        d["total_points"] = float(m.group(1))
-        d["seed"]         = float(m.group(2))
-        d["h2h_delta"]    = float(m.group(3))
-
-    # ── Four factors ────────────────────────────────────────────────
-    for key, label in [
-        ("bo_factor", "Bounty Offered"), ("bc_factor", "Bounty Collected"),
-        ("on_factor", "Opponent Network"), ("lan_factor", "LAN Wins"),
-    ]:
-        m = _re.search(rf"- {label}:\s*([\d.]+)", text)
-        if m:
-            d[key] = float(m.group(1))
-
-    # ── Average (seed_combined) ──────────────────────────────────────
-    m = _re.search(r"average of these factors is ([\d.]+)", text)
-    if m:
-        d["seed_combined"] = float(m.group(1))
-
-    # ── BO sum + prize table ────────────────────────────────────────
-    m = _re.search(r"sum of their top 10 scaled winnings \(\$([\d,]+\.\d+)\)", text)
-    if m:
-        d["bo_sum"] = float(m.group(1).replace(",", ""))
-
-    # Parse the BO prize rows (table below "Top ten winnings for this roster:")
-    bo_prizes: list[dict] = []
-    in_bo_table = False
-    for line in text.splitlines():
-        if "Top ten winnings for this roster" in line:
-            in_bo_table = True
-            continue
-        if in_bo_table:
-            if not line.strip().startswith("|"):
-                if bo_prizes:   # non-table line after we've collected rows → done
-                    break
-                continue
-            cells = [c.strip() for c in line.split("|")[1:-1]]
-            if len(cells) < 4:
-                continue
-            if "---" in cells[0] or "Event Date" in cells[0]:
-                continue
-            try:
-                ev_date = cells[0]
-                age_w_p = float(cells[1])
-                prize_s = cells[2].replace("$", "").replace(",", "")
-                scaled_s = cells[3].replace("$", "").replace(",", "")
-                bo_prizes.append({
-                    "event_date":     ev_date,
-                    "age_weight":     age_w_p,
-                    "prize_won":      float(prize_s),
-                    "scaled_prize":   float(scaled_s),
-                })
-            except (ValueError, IndexError):
-                continue
-    d["bo_prizes"] = bo_prizes
-
-    # ── bc_pre_curve (back-calculate from bc_factor via curve inverse) ─
-    bf = d["bc_factor"]
-    if 0 < bf < 1.0:
-        try:
-            d["bc_pre_curve"] = round(10 ** (1.0 - 1.0 / bf), 4)
-        except Exception:
-            d["bc_pre_curve"] = bf
-    else:
-        d["bc_pre_curve"] = 1.0 if bf >= 1.0 else 0.0
-
-    # ── Match table ─────────────────────────────────────────────────
-    wins = losses = lan_wins = 0
-    for line in text.splitlines():
-        if not line.strip().startswith("|"):
-            continue
-        cells = [c.strip() for c in line.split("|")[1:-1]]
-        if len(cells) < 11:
-            continue
-        # Must start with a sequence integer
-        if not _re.match(r"^\d+$", cells[0].lstrip("-").strip()):
-            continue
-        try:
-            match_id = int(cells[1])
-            date_s   = cells[2]
-            opponent = cells[3]
-            result   = cells[4]
-            age_w_s  = cells[5]
-            ev_w_s   = cells[6]
-            lan_s    = cells[9]
-            h2h_s    = cells[10]
-
-            if not _re.match(r"\d{4}-\d{2}-\d{2}", date_s):
-                continue
-
-            age_w  = float(age_w_s)
-            ev_w   = float(ev_w_s) if ev_w_s not in ("-", "") else 0.0
-            is_lan = (lan_s not in ("-", "") and not lan_s.startswith("0"))
-            h2h_a  = float(h2h_s) if h2h_s not in ("-", "") else 0.0
-
-            # Extract opponent BO from Bounty Collected column: "0.017 (0.002)"
-            bc_s = cells[7] if len(cells) > 7 else "-"
-            opp_bo = 0.0
-            if bc_s not in ("-", ""):
-                _obo_m = _re.match(r"([\d.]+)", bc_s)
-                if _obo_m:
-                    opp_bo = float(_obo_m.group(1))
-
-            # Extract opponent ON from Opponent Network column: "0.349 (0.050)"
-            on_s = cells[8] if len(cells) > 8 else "-"
-            opp_on = 0.0
-            if on_s not in ("-", ""):
-                _oon_m = _re.match(r"([\d.]+)", on_s)
-                if _oon_m:
-                    opp_on = float(_oon_m.group(1))
-
-            # Approximate prize_pool from event_weight (curve inverse)
-            if 0 < ev_w <= 1.0:
-                pool = round(10 ** (1.0 - 1.0 / ev_w) * 1_000_000)
-            else:
-                pool = 0
-
-            dt = datetime.strptime(date_s, "%Y-%m-%d")
-
-            if result == "W":
-                wins += 1
-                if is_lan:
-                    lan_wins += 1
-            else:
-                losses += 1
-
-            d["matches"].append({
-                "match_id":  match_id,
-                "date":      dt,
-                "opponent":  opponent,
-                "result":    result,
-                "age_w":     age_w,
-                "ev_w":      ev_w,
-                "prize_pool": float(pool),
-                "is_lan":    is_lan,
-                "h2h_adj":   h2h_a,
-                "opp_bo":    opp_bo,
-                "opp_on":    opp_on,
-            })
-        except (ValueError, IndexError):
-            continue
-
-    d["wins"]          = wins
-    d["losses"]        = losses
-    d["lan_wins"]      = lan_wins
-    d["total_matches"] = wins + losses
-    return d
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_valve_github_data(date_str: str | None = None,
-                            year: str | None = None,
-                            _cache_v: int = 3) -> dict:
-    """
-    Fetch a VRS snapshot from GitHub.  If date_str is None, use the latest.
-
-    Returns
-    -------
-    dict with keys:
-        standings           pd.DataFrame  — one row per team, Valve exact numbers
-        matches             pd.DataFrame  — win-level rows (for simulator)
-        team_match_history  dict[str, list[dict]]  — all matches per team incl losses
-        cutoff_date         str           — e.g. "2026_03_02"
-        cutoff_datetime     datetime
-        total_teams         int
-        source              str           — "github" or "fallback"
-        error               str | None
-    """
-    result = {
-        "standings":          pd.DataFrame(),
-        "matches":            pd.DataFrame(),
-        "team_match_history": {},
-        "cutoff_date":        "2026_03_02",
-        "cutoff_datetime":    datetime(2026, 3, 2),
-        "total_teams":        0,
-        "source":             "fallback",
-        "error":              None,
-    }
-
-    # ── Step 1: Resolve date ─────────────────────────────────────────
-    if not date_str:
-        date_str, year = _find_latest_date()
-    if not date_str:
-        result["error"] = "GitHub unreachable — using fallback data"
-        return result
-
-    # ── Step 2: Fetch standings index ───────────────────────────────
-    idx_url = f"{GITHUB_RAW}/{GH_FOLDER}/{year}/standings_global_{date_str}.md"
-    idx_text = _gh_get(idx_url)
-    if not idx_text:
-        result["error"] = f"Could not fetch standings index for {date_str}"
-        return result
-
-    teams = _parse_standings_index(idx_text)
-    if not teams:
-        result["error"] = "Standings index parsed 0 teams"
-        return result
-
-    # Also fetch regional standings to get region mapping
-    region_map: dict[str, str] = {}
-    for region_tag, region_label in [
-        ("europe", "Europe"), ("americas", "Americas"),
-        ("asia", "Asia"), ("asia-pacific", "Asia"),
-        ("middle-east", "Middle East"),
-    ]:
-        r_url = f"{GITHUB_RAW}/{GH_FOLDER}/{year}/standings_{region_tag}_{date_str}.md"
-        r_text = _gh_get(r_url)
-        if r_text:
-            for row in _parse_standings_index(r_text):
-                region_map.setdefault(row["team"], region_label)
-
-    # ── Step 3: Parallel-fetch all detail files ───────────────────
-    detail_base = f"{GITHUB_RAW}/{GH_FOLDER}/{year}/"
-
-    def _fetch_one(t: dict) -> tuple[dict, str | None]:
-        return t, _gh_get(detail_base + t["detail_path"])
-
-    parsed: list[dict] = []
-    with ThreadPoolExecutor(max_workers=GH_WORKERS) as ex:
-        futs = {ex.submit(_fetch_one, t): t for t in teams}
-        for fut in as_completed(futs):
-            t, text = fut.result()
-            if text:
-                d = _parse_detail_md(t["team"], t["rank"], t["points"], text)
-                d["region"] = region_map.get(t["team"], "Global")
-                parsed.append(d)
-
-    if not parsed:
-        result["error"] = "Could not parse any detail files"
-        return result
-
-    # ── Step 4: Build standings DataFrame ───────────────────────────
-    rows = [{
-        "team":          d["team"],
-        "rank":          d["rank"],
-        "total_points":  d["total_points"],
-        "seed":          d["seed"],
-        "h2h_delta":     d["h2h_delta"],
-        "bo_factor":     d["bo_factor"],
-        "bc_factor":     d["bc_factor"],
-        "on_factor":     d["on_factor"],
-        "lan_factor":    d["lan_factor"],
-        "bo_sum":        d["bo_sum"],
-        "bc_pre_curve":  d["bc_pre_curve"],
-        "on_raw":        d["on_factor"],
-        "lan_wins":      d["lan_wins"],
-        "seed_combined": d["seed_combined"],
-        "wins":          d["wins"],
-        "losses":        d["losses"],
-        "total_matches": d["total_matches"],
-        "region":        d["region"],
-        "flag":          "🌍",
-        "color":         "#58a6ff",
-    } for d in parsed]
-    # store bo_prizes per team for explainer page
-    _bo_prizes_map: dict[str, list] = {d["team"]: d.get("bo_prizes", []) for d in parsed}
-
-    standings_df = (pd.DataFrame(rows)
-                    .sort_values("rank")
-                    .reset_index(drop=True))
-
-    # ── Step 5: Build match DataFrame (deduplicated) ─────────────────
-    seen: set[int] = set()
-    match_rows = []
-    for d in parsed:
-        for m in d.get("matches", []):
-            mid = m["match_id"]
-            if m["result"] == "W" and mid not in seen:
-                seen.add(mid)
-                match_rows.append({
-                    "date":         m["date"],
-                    "winner":       d["team"],
-                    "loser":        m["opponent"],
-                    "prize_pool":   m["prize_pool"],
-                    "winner_prize": 0.0,
-                    "loser_prize":  0.0,
-                    "is_lan":       m["is_lan"],
-                    "event":        "",
-                })
-
-    matches_df = pd.DataFrame(match_rows) if match_rows else pd.DataFrame()
-
-    try:
-        cutoff_dt_p = datetime.strptime(date_str, "%Y_%m_%d")
-    except Exception:
-        cutoff_dt_p = datetime(2026, 3, 2)
-
-    # ── Build per-team match history (wins + losses, for explainer) ─
-    team_match_history: dict[str, list[dict]] = {
-        d["team"]: d.get("matches", []) for d in parsed
-    }
-
-    result.update({
-        "standings":          standings_df,
-        "matches":            matches_df,
-        "team_match_history": team_match_history,
-        "bo_prizes_map":      _bo_prizes_map,
-        "cutoff_date":        date_str,
-        "cutoff_datetime":    cutoff_dt_p,
-        "total_teams":        len(standings_df),
-        "source":             "github",
-        "error":              None,
-    })
-    return result
-
-
-# ══════════════════════════════════════════════════════════════════
-# TEAM META  —  region / flag / colour (overrides for known teams)
-# ══════════════════════════════════════════════════════════════════
-
-_KNOWN_META: dict[str, dict] = {
-    "Vitality":       {"flag": "🇫🇷", "color": "#F5A623"},
-    "PARIVISION":     {"flag": "🇷🇺", "color": "#E91E63"},
-    "Natus Vincere":  {"flag": "🇺🇦", "color": "#FFD600"},
-    "Spirit":         {"flag": "🇷🇺", "color": "#7B68EE"},
-    "MOUZ":           {"flag": "🇩🇪", "color": "#E53935"},
-    "FaZe":           {"flag": "🌍",  "color": "#EC407A"},
-    "Aurora":         {"flag": "🇷🇺", "color": "#00BCD4"},
-    "G2":             {"flag": "🇪🇸", "color": "#F44336"},
-    "3DMAX":          {"flag": "🇫🇷", "color": "#607D8B"},
-    "Astralis":       {"flag": "🇩🇰", "color": "#1565C0"},
-    "Falcons":        {"flag": "🇸🇦", "color": "#0288D1"},
-    "FURIA":          {"flag": "🇧🇷", "color": "#F5A623"},
-    "Liquid":         {"flag": "🇺🇸", "color": "#00B0FF"},
-    "NRG":            {"flag": "🇺🇸", "color": "#FF5722"},
-    "paiN":           {"flag": "🇧🇷", "color": "#D32F2F"},
-    "The MongolZ":    {"flag": "🇲🇳", "color": "#FF6F00"},
-    "TYLOO":          {"flag": "🇨🇳", "color": "#C62828"},
-    "Rare Atom":      {"flag": "🇨🇳", "color": "#00897B"},
-    "GamerLegion":    {"flag": "🇩🇰", "color": "#9C27B0"},
-    "FUT":            {"flag": "🇹🇷", "color": "#FF9800"},
-    "B8":             {"flag": "🇺🇦", "color": "#4CAF50"},
-    "Gentle Mates":   {"flag": "🇪🇸", "color": "#AB47BC"},
-    "HEROIC":         {"flag": "🇩🇰", "color": "#FF7043"},
-    "Monte":          {"flag": "🇺🇦", "color": "#26C6DA"},
-    "BetBoom":        {"flag": "🇷🇺", "color": "#EF5350"},
-    "MIBR":           {"flag": "🇧🇷", "color": "#43A047"},
-    "9z":             {"flag": "🇦🇷", "color": "#1976D2"},
-    "BC.Game":        {"flag": "🌍",  "color": "#7E57C2"},
-    "Virtus.pro":     {"flag": "🇷🇺", "color": "#FF8F00"},
-}
-
-# Colour palette for teams not in the known list (cycles)
-_COLOR_CYCLE = [
-    "#58a6ff","#3fb950","#f0b429","#f85149","#79c0ff",
-    "#56d364","#e3b341","#ff7b72","#bc8cff","#39c5cf",
-]
-_color_idx = 0
-
-
-def get_team_meta(team: str, region: str = "Global") -> dict:
-    """Return {flag, color, region} for any team name."""
-    global _color_idx
-    known = _KNOWN_META.get(team, {})
-    flag  = known.get("flag", "🌍")
-    color = known.get("color", _COLOR_CYCLE[_color_idx % len(_COLOR_CYCLE)])
-    if team not in _KNOWN_META:
-        _color_idx += 1
-    return {"flag": flag, "color": color, "region": region}
-
-
-# ── Kept for backward-compatibility with display code ─────────────
-TEAM_META: dict[str, dict] = {
-    t: {**v, "region": "Global"}
-    for t, v in _KNOWN_META.items()
-}
-
-
-# ══════════════════════════════════════════════════════════════════
-# HELPERS  —  formatting utilities
-# ══════════════════════════════════════════════════════════════════
-
-def region_pill(region: str, regional_rank: int = 0) -> str:
-    cls = {"Europe": "pill-eu", "Americas": "pill-am", "Asia": "pill-as"}.get(region, "pill-eu")
-    rank_str = f' #{regional_rank}' if regional_rank > 0 else ''
-    return f'<span class="{cls}">{region}{rank_str}</span>'
-
-
-def rank_badge(rank: int) -> str:
-    cls = "top1" if rank == 1 else "top3" if rank <= 3 else "top10" if rank <= 10 else "rest"
-    return f'<span class="rank-badge {cls}">{rank}</span>'
-
-
-def change_arrow(delta: int) -> str:
-    if delta > 0:
-        return f'<span class="change-up">▲ {delta}</span>'
-    elif delta < 0:
-        return f'<span class="change-down">▼ {abs(delta)}</span>'
-    return '<span class="change-same">—</span>'
-
-
-def add_meta(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    if "region" not in df.columns:
-        df["region"] = df["team"].map(lambda t: TEAM_META.get(t, {}).get("region", "Global"))
-    df["flag"] = df["team"].map(
-        lambda t: _KNOWN_META.get(t, {}).get("flag",
-                  df.loc[df["team"]==t, "flag"].iloc[0]
-                  if "flag" in df.columns and (df["team"]==t).any() else "🌍")
-    )
-    return df
-
-
-def add_regional_rank(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["regional_rank"] = (df.groupby("region")["total_points"]
-                             .rank(ascending=False, method="first")
-                             .astype(int))
-    return df
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1580,7 +703,7 @@ if page == "📊 Ranking Dashboard":
             margin=dict(l=10, r=80, t=40, b=10),
             height=max(300, len(movers) * 26),
         )
-        st.plotly_chart(fig_decay, use_container_width=True)
+        st.plotly_chart(fig_decay, use_container_width=True, config={"staticPlot": True})
 
     st.markdown("---")
 
@@ -1740,7 +863,7 @@ if page == "📊 Ranking Dashboard":
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
             margin=dict(l=10, r=10, t=40, b=80), height=400,
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, config={"staticPlot": True})
 
     with col2:
         st.subheader("🕸️ Top 10 — Factor Radar")
@@ -1766,7 +889,7 @@ if page == "📊 Ranking Dashboard":
             legend=dict(orientation="v", x=1.05, y=0.5, font=dict(size=10)),
             margin=dict(l=10, r=120, t=10, b=10), height=400,
         )
-        st.plotly_chart(fig2, use_container_width=True)
+        st.plotly_chart(fig2, use_container_width=True, config={"staticPlot": True})
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1907,7 +1030,7 @@ elif page == "🔮 Scenario Simulator":
                     margin=dict(l=10, r=80, t=40, b=10),
                     height=max(300, len(plot_df) * 28),
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True, config={"staticPlot": True})
     else:
         st.info("👆 Add at least one match, then click **Simulate & Compare**.")
 
@@ -2005,7 +1128,7 @@ elif page == "⚔️ Team Comparison":
             legend=dict(orientation="h", yanchor="bottom", y=-0.15, xanchor="center", x=0.5),
             height=400, margin=dict(l=10, r=10, t=10, b=40),
         )
-        st.plotly_chart(fig_r, use_container_width=True)
+        st.plotly_chart(fig_r, use_container_width=True, config={"staticPlot": True})
 
     with col2:
         st.subheader("📊 Raw Factor Scores")
@@ -2036,7 +1159,7 @@ elif page == "⚔️ Team Comparison":
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
             height=400, margin=dict(l=10, r=10, t=40, b=10),
         )
-        st.plotly_chart(fig_b, use_container_width=True)
+        st.plotly_chart(fig_b, use_container_width=True, config={"staticPlot": True})
 
     # ── H2H record ────────────────────────────────────────────────
     st.markdown("---")
@@ -2361,25 +1484,42 @@ and therefore do **not contribute** to BC or ON at all.
             fig_ew = go.Figure()
             fig_ew.add_trace(go.Scatter(
                 x=[x/1e6 for x in _ew_xs], y=_ew_ys, mode="lines",
-                line=dict(color="#3fb950", width=2.5),
-                fill="tozeroy", fillcolor="rgba(63,185,80,0.07)"))
+                line=dict(color="#58a6ff", width=2.5),
+                fill="tozeroy", fillcolor="rgba(88,166,255,0.07)"))
             fig_ew.add_trace(go.Scatter(
                 x=[_ew_pool/1e6], y=[_ew_val], mode="markers",
-                marker=dict(color="#3fb950", size=12, symbol="diamond"), showlegend=False))
-            for pp, lbl in [(1e6, "$1M → 100%"), (1e5, "$100k → 50%")]:
+                marker=dict(color="#f0b429", size=12, symbol="diamond",
+                            line=dict(color="#c9d1d9", width=1.5)),
+                showlegend=False))
+            fig_ew.add_vrect(x0=1.0, x1=1.2, fillcolor="#3fb950", opacity=0.06,
+                line_width=0, annotation_text="Capped at $1M",
+                annotation_position="top right",
+                annotation=dict(font_color="#3fb950", font_size=10))
+            fig_ew.add_vline(x=1.0, line_dash="dot", line_color="#3fb950",
+                annotation_text="$1M cap", annotation_position="top left",
+                annotation=dict(font_color="#3fb950", font_size=10))
+            for pp, lbl, ax_off, ay_off in [
+                (1e6,  "$1M → 1.000",  -55, -25),
+                (5e5,  "$500k → 0.769", 50, -30),
+                (1e5,  "$100k → 0.500", 50, -20),
+                (2.5e4,"$25k → 0.286",  50,  20),
+            ]:
                 ev = event_stakes(max(pp, 1))
                 fig_ew.add_annotation(x=pp/1e6, y=ev, text=lbl,
-                    showarrow=True, arrowhead=0, ax=40, ay=-20,
-                    font=dict(size=9, color="#8b949e"))
+                    showarrow=True, arrowhead=2, arrowwidth=1,
+                    arrowcolor="#484f58", ax=ax_off, ay=ay_off,
+                    font=dict(size=9, color="#8b949e"),
+                    bgcolor="rgba(22,27,34,0.85)", bordercolor="#30363d", borderwidth=1)
             fig_ew.update_layout(
                 xaxis=dict(title="Prize Pool ($M)", gridcolor="#21262d",
                            tickvals=[0, 0.1, 0.25, 0.5, 0.75, 1.0, 1.2],
                            ticktext=["$0","$100k","$250k","$500k","$750k","$1M","$1.2M"]),
-                yaxis=dict(title="Event Weight", gridcolor="#21262d", range=[0, 1.1]),
+                yaxis=dict(title="Event Weight", gridcolor="#21262d",
+                           tickformat=".0%", range=[-0.05, 1.15]),
                 paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                 font=dict(color="#c9d1d9"), showlegend=False,
-                margin=dict(l=10,r=10,t=10,b=10), height=280)
-            st.plotly_chart(fig_ew, use_container_width=True)
+                margin=dict(l=10,r=10,t=20,b=10), height=300)
+            st.plotly_chart(fig_ew, use_container_width=True, config={"staticPlot": True})
             st.caption(
                 "Source: [Reddit — How Valve's CSGO Team Ranking System Works]"
                 "(https://www.reddit.com/r/GlobalOffensive/comments/15j0t5e/) · "
@@ -2462,7 +1602,7 @@ This is NOT a simple 0→1 remap over 180 days. The flat period is critical.
                 paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                 font=dict(color="#c9d1d9"), showlegend=False,
                 margin=dict(l=10,r=10,t=10,b=10), height=280)
-            st.plotly_chart(fig_aw, use_container_width=True)
+            st.plotly_chart(fig_aw, use_container_width=True, config={"staticPlot": True})
 
     # ══════════════════════════════════════════════════════════════
     with tab_curve:
@@ -2521,23 +1661,32 @@ scores to teams that are orders of magnitude below the top.
             ys_c = [curve(x) for x in xs_c]
             fig_c = go.Figure()
             fig_c.add_trace(go.Scatter(x=xs_c, y=ys_c,
-                mode="lines", line=dict(color="#3fb950", width=2.5),
-                fill="tozeroy", fillcolor="rgba(63,185,80,0.07)"))
+                mode="lines", line=dict(color="#bc8cff", width=2.5),
+                fill="tozeroy", fillcolor="rgba(188,140,255,0.07)"))
             fig_c.add_trace(go.Scatter(x=[_cv_input], y=[_cv_output], mode="markers",
-                marker=dict(color="#3fb950", size=12, symbol="diamond"), showlegend=False))
-            # Reference annotations
-            for xr, lbl in [(1.0, "f(1.0) = 1.000"), (0.5, "f(0.5) = 0.769"),
-                            (0.1, "f(0.1) = 0.500"), (0.01, "f(0.01) = 0.333")]:
+                marker=dict(color="#f0b429", size=12, symbol="diamond",
+                            line=dict(color="#c9d1d9", width=1.5)),
+                showlegend=False))
+            for xr, lbl, ax_off, ay_off in [
+                (1.00, "f(1.0) = 1.000", -65, -25),
+                (0.50, "f(0.5) = 0.769", -65, -25),
+                (0.10, "f(0.1) = 0.500",  50, -25),
+                (0.01, "f(0.01) = 0.333", 50,  20),
+            ]:
                 fig_c.add_annotation(x=xr, y=curve(xr), text=lbl,
-                    showarrow=True, arrowhead=0, ax=50, ay=-15,
-                    font=dict(size=9, color="#8b949e"))
+                    showarrow=True, arrowhead=2, arrowwidth=1,
+                    arrowcolor="#484f58", ax=ax_off, ay=ay_off,
+                    font=dict(size=9, color="#8b949e"),
+                    bgcolor="rgba(22,27,34,0.85)", bordercolor="#30363d", borderwidth=1)
             fig_c.update_layout(
-                xaxis=dict(title="Pre-curve value (x)", gridcolor="#21262d"),
-                yaxis=dict(title="f(x) — after curve", gridcolor="#21262d", range=[0, 1.1]),
+                xaxis=dict(title="Pre-curve value (x)", gridcolor="#21262d",
+                           tickvals=[0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]),
+                yaxis=dict(title="f(x) — after curve", gridcolor="#21262d",
+                           tickformat=".0%", range=[-0.05, 1.15]),
                 paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                 font=dict(color="#c9d1d9"), showlegend=False,
                 margin=dict(l=10,r=10,t=10,b=10), height=280)
-            st.plotly_chart(fig_c, use_container_width=True)
+            st.plotly_chart(fig_c, use_container_width=True, config={"staticPlot": True})
             st.caption(
                 "The curve is also used for Event Weight (see Event Weight tab), "
                 "but with prize_pool/$1M as input instead of factor values."
@@ -2884,6 +2033,31 @@ scores to teams that are orders of magnitude below the top.
                 st.info("Click **Calculate Bounty Collected** to see results.", icon="💡")
             else:
                 st.info("Add at least one win to start.", icon="💡")
+            st.markdown("#### Why BC rewards beating strong teams")
+            scenarios = [
+                ("1 win vs #1 (BO=1.0)", [1.0]),
+                ("5 wins vs mid (BO=0.5)", [0.5]*5),
+                ("10 wins vs weak (BO=0.1)", [0.1]*10),
+                ("Mix: 2 top + 6 mid", [1.0,1.0]+[0.5]*6),
+            ]
+            fig_bc = go.Figure()
+            for label, entries in scenarios:
+                bc_pre = sum(sorted(entries, reverse=True)[:10]) / 10
+                bc_val = curve(bc_pre)
+                fig_bc.add_trace(go.Bar(
+                    name=label, x=[label.split("(")[0].strip()], y=[bc_val],
+                    text=[f"{bc_val:.3f}"], textposition="outside",
+                    marker_color="#3fb950" if bc_val > 0.8 else
+                                 "#f0b429" if bc_val > 0.5 else "#f85149",
+                    showlegend=False,
+                ))
+            fig_bc.update_layout(
+                yaxis=dict(title="BC factor (after curve)", gridcolor="#21262d", range=[0,1.15]),
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                font=dict(color="#c9d1d9"), xaxis=dict(gridcolor="#21262d"),
+                margin=dict(l=10,r=10,t=10,b=10), height=320)
+            st.plotly_chart(fig_bc, use_container_width=True, config={"staticPlot": True})
+            st.caption("Beating one strong opponent can be worth more than beating 10 weak ones.")
 
     # ══════════════════════════════════════════════════════════════
     with tab_on2:
@@ -3051,6 +2225,51 @@ scores to teams that are orders of magnitude below the top.
                 st.info("Click **Calculate Opponent Network** to see results.", icon="💡")
             else:
                 st.info("Add at least one win to start.", icon="💡")
+            st.markdown("#### ON vs BC — what each rewards")
+            st.markdown("""
+| Scenario | BO rewards | ON rewards |
+|---|---|---|
+| Beat a rich team | ✅ High BC | Depends on their network |
+| Beat a team with many wins | Neutral | ✅ High ON |
+| Beat the same team 3× | Counted 3× in BC | **Counted 3× in ON too** |
+| Beat obscure teams | Low BC | Low ON |
+
+The key insight: ON propagates **connectivity**. A team that has beaten many opponents
+who have themselves beaten many opponents scores highly, regardless of prize money.
+""")
+            st.markdown("#### PageRank iterations (convergence demo)")
+            # Show how ON converges iteratively using real-ish values
+            on_init  = [1.0, 0.8, 0.6, 0.4, 0.2]  # fake 5-team initial (BO)
+            teams_pg = ["Team A", "Team B", "Team C", "Team D", "Team E"]
+            # Simulate 6 rounds of updates (toy example)
+            iters_data = {"Iter 0 (=BO)": on_init[:]}
+            vals = on_init[:]
+            for it in range(1, 7):
+                new_vals = [
+                    min(1.0, (vals[1]*0.9 + vals[2]*0.8) / 2),
+                    min(1.0, (vals[0]*0.5 + vals[3]*0.7) / 2),
+                    min(1.0, (vals[1]*0.6 + vals[4]*0.9) / 2),
+                    min(1.0, (vals[2]*0.8 + vals[0]*0.3) / 2),
+                    min(1.0, (vals[3]*0.7 + vals[2]*0.5) / 2),
+                ]
+                iters_data[f"Iter {it}"] = new_vals[:]
+                vals = new_vals
+            fig_pg = go.Figure()
+            for i, team in enumerate(teams_pg):
+                fig_pg.add_trace(go.Scatter(
+                    x=list(iters_data.keys()),
+                    y=[iters_data[k][i] for k in iters_data],
+                    mode="lines+markers", name=team,
+                ))
+            fig_pg.update_layout(
+                xaxis=dict(gridcolor="#21262d"),
+                yaxis=dict(gridcolor="#21262d", title="ON value"),
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                font=dict(color="#c9d1d9"),
+                legend=dict(orientation="h", y=1.15),
+                margin=dict(l=10,r=10,t=30,b=10), height=280)
+            st.plotly_chart(fig_pg, use_container_width=True, config={"staticPlot": True})
+            st.caption("Values converge within 5–6 iterations. We use 6 in the engine.")
 
     # ══════════════════════════════════════════════════════════════
     with tab_lan2:
@@ -3225,6 +2444,30 @@ scores to teams that are orders of magnitude below the top.
                 st.info("Click **Calculate LAN Wins** to see results.", icon="💡")
             else:
                 st.info("Add at least one win to start.", icon="💡")
+            st.markdown("#### Effect of age on LAN score")
+            scenarios_lan = [
+                ("10 wins last month\n(age=1.0 each)",  [1.0]*10),
+                ("5 fresh + 5 old\n(age 1.0 & 0.5)",   [1.0]*5+[0.5]*5),
+                ("10 wins 3 months ago\n(age≈0.5 each)",[0.5]*10),
+                ("5 wins last month\n(age=1.0 each)",   [1.0]*5),
+            ]
+            fig_lan = go.Figure()
+            for label, entries in scenarios_lan:
+                lan_val = top_n_sum(entries) / TOP_N
+                fig_lan.add_trace(go.Bar(
+                    x=[label.replace("\n","<br>")], y=[lan_val],
+                    text=[f"{lan_val:.3f}"], textposition="outside",
+                    marker_color="#f0b429" if lan_val > 0.8 else
+                                  "#79c0ff" if lan_val > 0.5 else "#f85149",
+                    showlegend=False,
+                ))
+            fig_lan.update_layout(
+                yaxis=dict(title="LAN factor", gridcolor="#21262d", range=[0,1.2]),
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                font=dict(color="#c9d1d9"), xaxis=dict(gridcolor="#21262d"),
+                margin=dict(l=10,r=10,t=10,b=80), height=340)
+            st.plotly_chart(fig_lan, use_container_width=True, config={"staticPlot": True})
+            st.caption("Recent LAN wins are worth much more than old ones. 10 wins 3 months ago scores the same as 5 wins last month.")
 
     # ══════════════════════════════════════════════════════════════
     with tab_h2h:
@@ -3324,7 +2567,7 @@ produce different, incorrect results.
                 paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                 font=dict(color="#c9d1d9"),
                 margin=dict(l=10,r=10,t=10,b=10), height=240)
-            st.plotly_chart(fig_sh, use_container_width=True)
+            st.plotly_chart(fig_sh, use_container_width=True, config={"staticPlot": True})
 
     # ══════════════════════════════════════════════════════════════
     with tab_seed:
@@ -3368,7 +2611,7 @@ $$\text{Factor Score} = 400 + \frac{0.846 - 0.000}{0.846 - 0.000} \times 1600 = 
             fig_weights.update_layout(
                 paper_bgcolor="rgba(0,0,0,0)", font=dict(color="#c9d1d9"),
                 showlegend=False, height=300, margin=dict(l=10,r=10,t=10,b=10))
-            st.plotly_chart(fig_weights, use_container_width=True)
+            st.plotly_chart(fig_weights, use_container_width=True, config={"staticPlot": True})
             st.markdown("""
 **Why lerp (not just sort)?**
 
@@ -3603,7 +2846,7 @@ elif page == "🔍 Team Breakdown":
                 height=320,
                 showlegend=False,
             )
-            st.plotly_chart(fig_wf, use_container_width=True)
+            st.plotly_chart(fig_wf, use_container_width=True, config={"staticPlot": True})
 
             # ── Insight text (directly under waterfall) ───────
             _drivers = [
@@ -3937,7 +3180,7 @@ When the eligible pool changes (teams drop out due to inactivity or window expir
             legend=dict(orientation="h", y=1.18),
             margin=dict(l=10,r=10,t=40,b=10), height=200,
         )
-        st.plotly_chart(fig_p2, use_container_width=True)
+        st.plotly_chart(fig_p2, use_container_width=True, config={"staticPlot": True})
 
         # All matches for H2H (newest first)
         if raw_ms:
@@ -4098,7 +3341,7 @@ When the eligible pool changes (teams drop out due to inactivity or window expir
                 margin=dict(l=10,r=10,t=40,b=10), height=350,
                 barmode="group",
             )
-            st.plotly_chart(fig_dual, use_container_width=True)
+            st.plotly_chart(fig_dual, use_container_width=True, config={"staticPlot": True})
 
             # Delta vs previous snapshot
             if len(hist_df) >= 2:
@@ -4138,7 +3381,7 @@ When the eligible pool changes (teams drop out due to inactivity or window expir
                 legend=dict(orientation="h", y=1.12),
                 margin=dict(l=10,r=10,t=40,b=10), height=280,
             )
-            st.plotly_chart(fig_f, use_container_width=True)
+            st.plotly_chart(fig_f, use_container_width=True, config={"staticPlot": True})
 
             st.markdown("---")
 
