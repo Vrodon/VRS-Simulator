@@ -117,7 +117,7 @@ div[data-testid="metric-container"] {
 # IMPORTS FROM VRS MODULES
 # ══════════════════════════════════════════════════════════════════
 from vrs_engine import (
-    compute_vrs,
+    Store, run_vrs,
     DECAY_DAYS, FLAT_DAYS, DECAY_RAMP, RD_FIXED, Q_GLICKO,
     BASE_K, PRIZE_CAP, TOP_N, ON_ITERS, SEED_MIN, SEED_MAX,
     curve, event_stakes, age_weight, lerp,
@@ -395,18 +395,16 @@ def _auto_fetch_updated_standings(
     progress_callback=None,
 ) -> dict:
     """
-    Auto-fetch all tournaments from Liquipedia since snapshot_cutoff,
-    inject them, and recompute standings with shifted cutoff to today.
+    Fetch all CS2 tournaments from Liquipedia since snapshot_cutoff,
+    build a clean Store, and run a full VRS recomputation with cutoff = today.
 
-    progress_callback: optional function(step: int, total: int, status: str) for UI updates
-
-    Returns: {
-        "standings": updated DataFrame or empty on error,
-        "cutoff": datetime.now(),
-        "source": "liquipedia" or "fallback",
-        "match_count": int,
-        "error": str or None,
-    }
+    Returns:
+        standings   pd.DataFrame  — updated rankings (empty on error)
+        match_h2h   dict          — per-match H2H detail for team breakdown
+        cutoff      datetime
+        source      "liquipedia" or "fallback"
+        match_count int           — number of new series results added
+        error       str or None
     """
     from data_loaders import (
         discover_liquipedia_from_portal,
@@ -416,28 +414,23 @@ def _auto_fetch_updated_standings(
         load_liquipedia_from_cache,
     )
 
-    today = datetime.now()
+    today          = datetime.now()
     start_date_str = snapshot_cutoff.strftime("%Y-%m-%d")
-    end_date_str = today.strftime("%Y-%m-%d")
+    end_date_str   = today.strftime("%Y-%m-%d")
 
-    # ── Step 1: Check cache ────────────────────────────────────────
-    cache_key_base = (start_date_str, end_date_str)
     try:
+        # ── Step 1: Discover + fetch Liquipedia tournaments ───────────
         if progress_callback:
             progress_callback(1, 3, "Discovering tournaments from Liquipedia Portal…")
 
-        # Attempt auto-discover to get tournament list for cache check
         discovered = discover_liquipedia_from_portal(
             start_date_str, end_date_str, min_tier="B-Tier", include_qualifiers=True
         )
         if not discovered:
-            # No tournaments found in date range
             return {
-                "standings": pd.DataFrame(),
-                "cutoff": today,
-                "source": "fallback",
-                "match_count": 0,
-                "error": "No tournaments found in Liquipedia for this date range."
+                "standings": pd.DataFrame(), "match_h2h": {},
+                "cutoff": today, "source": "fallback", "match_count": 0,
+                "error": "No tournaments found in Liquipedia for this date range.",
             }
 
         tournament_slugs = [d["slug"] for d in discovered]
@@ -445,422 +438,107 @@ def _auto_fetch_updated_standings(
         if progress_callback:
             progress_callback(2, 3, f"Fetching {len(tournament_slugs)} tournaments…")
 
-        # Check if cache exists and is fresh (< 2 hours old)
-        cache_fresh = False
+        # Serve from cache when fresh (< 2 hours old)
         if liquipedia_cache_exists(start_date_str, end_date_str, tournament_slugs):
             mtime = liquipedia_cache_mtime(start_date_str, end_date_str, tournament_slugs)
-            age_minutes = (datetime.now() - mtime).total_seconds() / 60
-            if age_minutes < 120:  # 2 hours
-                cache_fresh = True
+            if (datetime.now() - mtime).total_seconds() / 60 < 120:
                 if progress_callback:
                     progress_callback(2, 3, f"Loading {len(tournament_slugs)} tournaments from cache…")
-                matches_df = load_liquipedia_from_cache(start_date_str, end_date_str, tournament_slugs)
+                liq_df = load_liquipedia_from_cache(start_date_str, end_date_str, tournament_slugs)
             else:
-                # Cache is stale, re-fetch
-                matches_df = fetch_liquipedia_matches(
+                liq_df = fetch_liquipedia_matches(
                     start_date_str, end_date_str,
-                    tournament_slugs=tournament_slugs,
-                    force_refresh=True,
+                    tournament_slugs=tournament_slugs, force_refresh=True,
                     progress_callback=progress_callback,
                 )
         else:
-            # No cache, fetch fresh
-            matches_df = fetch_liquipedia_matches(
+            liq_df = fetch_liquipedia_matches(
                 start_date_str, end_date_str,
-                tournament_slugs=tournament_slugs,
-                force_refresh=False,
+                tournament_slugs=tournament_slugs, force_refresh=False,
                 progress_callback=progress_callback,
             )
 
-        if matches_df.empty:
+        if liq_df.empty:
             return {
-                "standings": pd.DataFrame(),
-                "cutoff": today,
-                "source": "fallback",
-                "match_count": 0,
-                "error": "Liquipedia fetch returned no matches."
+                "standings": pd.DataFrame(), "match_h2h": {},
+                "cutoff": today, "source": "fallback", "match_count": 0,
+                "error": "Liquipedia fetch returned no matches.",
             }
 
-        # ── Step 2: Filter to active rosters only (Layer 1) ──────────
-        # Identify active rosters from the SNAPSHOT standings BEFORE injection
-        active_rosters = _identify_active_rosters(snapshot_standings)
-
-        # Build a set of active team names for filtering
+        # ── Step 2: Active roster filtering ──────────────────────────
+        # Keeps only Liquipedia rows for teams whose active roster is in
+        # the snapshot (or brand-new teams not in the snapshot at all).
+        active_rosters    = _identify_active_rosters(snapshot_standings)
         active_team_names = set(
-            snapshot_standings.loc[active_rosters[team], "team"]
-            for team in active_rosters
+            snapshot_standings.loc[active_rosters[t], "team"]
+            for t in active_rosters
         )
+        snapshot_teams = set(snapshot_standings["team"].values)
 
-        # Separate series from prize-only rows
-        series_df = matches_df[matches_df["loser"] != ""].copy()
-        prize_df = matches_df[matches_df["loser"] == ""].copy()
+        def _is_ok(name: str) -> bool:
+            return name not in snapshot_teams or name in active_team_names
 
-        # Filter: keep matches where BOTH teams are either:
-        #   - Active rosters (if they have duplicates), OR
-        #   - Not in snapshot at all (unknown teams)
-        series_df_filtered = []
-        for _, row in series_df.iterrows():
-            winner = row["winner"]
-            loser = row["loser"]
+        series_mask = liq_df["loser"].astype(str) != ""
+        series_df   = liq_df[series_mask].copy()
+        prize_df    = liq_df[~series_mask].copy()
 
-            # Check if this match should be kept
-            winner_ok = winner not in snapshot_standings["team"].values or winner in active_team_names
-            loser_ok = loser not in snapshot_standings["team"].values or loser in active_team_names
+        series_df = series_df[
+            series_df["winner"].apply(_is_ok) & series_df["loser"].apply(_is_ok)
+        ].copy()
+        prize_df = prize_df[prize_df["winner"].apply(_is_ok)].copy()
 
-            if winner_ok and loser_ok:
-                series_df_filtered.append(row)
+        liq_filtered = pd.concat([series_df, prize_df], ignore_index=True)
+        new_match_count = len(series_df)
 
-        series_df = pd.DataFrame(series_df_filtered) if series_df_filtered else pd.DataFrame()
-
-        # Same for prizes: only apply to active rosters
-        prize_df_filtered = []
-        for _, row in prize_df.iterrows():
-            team = row["winner"]
-            if team not in snapshot_standings["team"].values or team in active_team_names:
-                prize_df_filtered.append(row)
-
-        prize_df = pd.DataFrame(prize_df_filtered) if prize_df_filtered else pd.DataFrame()
-
-        # ── Step 3: Extend tmh + bpm with Liquipedia data ──────────────
+        # ── Step 3: Build Store and run engine ────────────────────────
         if progress_callback:
-            progress_callback(3, 3, "Merging new matches and recalculating all factors…")
+            progress_callback(3, 3, "Running full VRS computation…")
 
-        # Build opponent factor lookup for new match entries
-        bo_lookup = snapshot_standings.set_index("team")["bo_factor"].to_dict()
-        on_lookup = snapshot_standings.set_index("team")["on_factor"].to_dict()
+        store = Store.from_valve(team_match_history, bo_prizes_map)
+        store.append_liquipedia(liq_filtered)
 
-        # Convert Liquipedia series results → tmh match-dict format.
-        # ev_w uses the same event_stakes(prize_pool) formula as Valve.
-        # opp_bo/opp_on are fallbacks; _simulate_time_decay looks up live values first.
-        new_tmh: dict = {}
-        match_id_offset = 10_000_000  # well above Valve's match IDs
-        for i, row in (series_df.iterrows() if not series_df.empty else iter([])):
-            winner     = str(row["winner"])
-            loser      = str(row["loser"])
-            match_date = row["date"] if isinstance(row["date"], datetime) \
-                         else datetime.combine(row["date"], datetime.min.time())
-            prize_pool = float(row.get("prize_pool", 0.0))
-            is_lan     = bool(row.get("is_lan", False))
-            ev_w       = event_stakes(prize_pool)
-            mid        = match_id_offset + i
+        engine_result = run_vrs(store, cutoff=today)
+        new_standings = engine_result["standings"]
+        match_h2h     = engine_result["match_h2h"]
 
-            for team, opp, result in [(winner, loser, "W"), (loser, winner, "L")]:
-                entry = {
-                    "match_id":  mid,
-                    "date":      match_date,
-                    "opponent":  opp,
-                    "result":    result,
-                    "age_w":     0.0,   # re-computed inside _simulate_time_decay
-                    "ev_w":      ev_w,
-                    "prize_pool": prize_pool,
-                    "is_lan":    is_lan,
-                    "h2h_adj":   0.0,
-                    "opp_bo":    bo_lookup.get(opp, 0.0),
-                    "opp_on":    on_lookup.get(opp, 0.0),
-                }
-                new_tmh.setdefault(team, []).append(entry)
-
-        # Merge: original tmh + new Liquipedia match entries
-        extended_tmh = {t: list(v) for t, v in team_match_history.items()}
-        for team, entries in new_tmh.items():
-            extended_tmh.setdefault(team, [])
-            extended_tmh[team] = extended_tmh[team] + entries
-
-        # Convert prize-only rows → bpm format for BO recalculation
-        new_bpm: dict = {}
-        for _, row in (prize_df.iterrows() if not prize_df.empty else iter([])):
-            team          = str(row["winner"])
-            prize_amount  = float(row.get("winner_prize", 0.0))
-            prize_date    = row["date"]
-            if prize_amount <= 0:
-                continue
-            date_str = prize_date.strftime("%Y-%m-%d") \
-                       if hasattr(prize_date, "strftime") else str(prize_date)
-            new_bpm.setdefault(team, []).append({
-                "event_date":  date_str,
-                "age_weight":  0.0,   # re-computed inside _simulate_time_decay
-                "prize_won":   prize_amount,
-                "scaled_prize": 0.0,
-            })
-
-        # Merge: original bpm + new prize entries
-        extended_bpm = {t: list(v) for t, v in bo_prizes_map.items()}
-        for team, prizes in new_bpm.items():
-            extended_bpm.setdefault(team, [])
-            extended_bpm[team] = extended_bpm[team] + prizes
-
-        # ── Step 4: Full VRS recomputation (all 4 factors + H2H) ───────
-        # This is the same pipeline Valve runs:
-        #   – All matches in the 180-day window, age-weighted to today
-        #   – BO, BC, ON, LAN recomputed from scratch
-        #   – Glicko H2H applied chronologically
-        # New Liquipedia matches are already in extended_tmh, so they
-        # participate in every factor calculation at their correct age weight.
-        sim_result = _simulate_time_decay(
-            extended_tmh, extended_bpm,
-            snapshot_standings, snapshot_cutoff, today,
-        )
-
-        if sim_result["standings"].empty:
+        if new_standings.empty:
             return {
-                "standings": pd.DataFrame(),
-                "cutoff": today,
-                "source": "fallback",
-                "match_count": len(series_df) if not series_df.empty else 0,
-                "error": "Full recomputation returned no eligible teams."
+                "standings": pd.DataFrame(), "match_h2h": {},
+                "cutoff": today, "source": "fallback",
+                "match_count": new_match_count,
+                "error": "Full recomputation returned no eligible teams.",
             }
+
+        # ── Step 4: Attach display metadata from snapshot ─────────────
+        # region, flag, color are not calculated — they come from Valve's
+        # snapshot or team_meta.  Merge here so the rest of app.py works.
+        meta_cols = [c for c in ["team", "region", "flag", "color"]
+                     if c in snapshot_standings.columns]
+        if len(meta_cols) > 1:
+            meta_df = (snapshot_standings[meta_cols]
+                       .drop_duplicates("team", keep="first"))
+            new_standings = new_standings.merge(meta_df, on="team", how="left")
+            new_standings["region"] = new_standings["region"].fillna("Global")
+            new_standings["flag"]   = new_standings["flag"].fillna("🌍")
+            new_standings["color"]  = new_standings["color"].fillna("#58a6ff")
+
+        new_standings = add_regional_rank(new_standings)
 
         return {
-            "standings": sim_result["standings"],
-            "match_h2h": sim_result.get("match_h2h", {}),
-            "cutoff": today,
-            "source": "liquipedia",
-            "match_count": len(series_df) if not series_df.empty else 0,
-            "error": None,
+            "standings":   new_standings,
+            "match_h2h":   match_h2h,
+            "cutoff":      today,
+            "source":      "liquipedia",
+            "match_count": new_match_count,
+            "error":       None,
         }
 
     except Exception as e:
-        import traceback as tb
         return {
-            "standings": pd.DataFrame(),
-            "cutoff": today,
-            "source": "fallback",
-            "match_count": 0,
-            "error": f"Liquipedia fetch failed: {str(e)[:100]}"
+            "standings": pd.DataFrame(), "match_h2h": {},
+            "cutoff": today, "source": "fallback", "match_count": 0,
+            "error": f"Liquipedia fetch failed: {str(e)[:100]}",
         }
-
-
-# ══════════════════════════════════════════════════════════════════
-# ████████████  TIME-DECAY SIMULATION  █████████████████████████████
-# ══════════════════════════════════════════════════════════════════
-#
-# Recomputes ALL four factors + H2H with a shifted cutoff date.
-# The only thing that changes is the age_weight of each match —
-# no new matches are added.  This shows the pure decay effect.
-# ══════════════════════════════════════════════════════════════════
-
-def _simulate_time_decay(
-    tmh: dict,                   # team_match_history
-    bpm: dict,                   # bo_prizes_map
-    standings: pd.DataFrame,     # current base_standings (for meta)
-    old_cutoff: datetime,
-    new_cutoff: datetime,
-) -> pd.DataFrame:
-    """
-    Full VRS recomputation with a shifted cutoff date.
-
-    Returns a new standings DataFrame with recalculated factor scores,
-    seeds, and H2H adjustments reflecting the new age weights.
-    """
-    # ── Layer 2: Identify and filter to active rosters only ────────
-    # Instead of excluding duplicates entirely, filter to keep only the
-    # active roster for each team (lowest rank = active), then proceed
-    # with normal factor calculations.
-    active_rosters = _identify_active_rosters(standings)
-
-    # Filter standings to only active rosters
-    standings_active_only = []
-    for idx, row in standings.iterrows():
-        team_name = row["team"]
-        if active_rosters.get(team_name) == idx:
-            standings_active_only.append(row)
-
-    standings = pd.DataFrame(standings_active_only).reset_index(drop=True)
-
-    # Now work with the consolidated standings (no duplicates)
-    _clean_std = standings.sort_values("rank").reset_index(drop=True)
-    all_teams  = _clean_std["team"].tolist()
-
-    # Keep reference for region/flag/color data
-    _ref_std = standings.sort_values("rank").drop_duplicates("team", keep="first")
-    _dup_names = set()  # No duplicates anymore, but keep for compatibility
-
-    new_window_start = new_cutoff - timedelta(days=DECAY_DAYS)
-
-    # ── Eligibility in the new window ─────────────────────────────
-    wins_ct:  dict[str, int] = {}
-    match_ct: dict[str, int] = {}
-    for t in all_teams:
-        ms = tmh.get(t, [])
-        in_w = [m for m in ms if new_window_start <= m["date"] <= new_cutoff]
-        match_ct[t] = len(in_w)
-        wins_ct[t]  = sum(1 for m in in_w if m["result"] == "W")
-
-    eligible = [
-        t for t in all_teams
-        if wins_ct.get(t, 0) > 0 and match_ct.get(t, 0) >= 5
-    ]
-    if not eligible:
-        return {"standings": pd.DataFrame(), "match_h2h": {}, "dup_teams": _dup_names}
-
-    # ── Factor 1: Bounty Offered ──────────────────────────────────
-    # Compute from actual prize data (bpm) with new age weights.
-    # Teams with no prize data in bpm fall back to their Valve bo_sum.
-    bo_sum_new: dict[str, float] = {}
-    for t in all_teams:
-        prizes = bpm.get(t, [])
-        contribs = []
-        for bp in prizes:
-            try:
-                dt = datetime.strptime(str(bp["event_date"]).strip(), "%Y-%m-%d")
-            except Exception:
-                continue
-            aw = age_weight(dt, new_cutoff)
-            if aw > 0:
-                contribs.append(bp["prize_won"] * aw)
-        if contribs:
-            bo_sum_new[t] = top_n_sum(contribs, TOP_N)
-        else:
-            bo_sum_new[t] = float(
-                _ref_std.loc[_ref_std["team"] == t, "bo_sum"].iloc[0]
-                if t in _ref_std["team"].values else 0.0
-            )
-
-    # Normalise bo_sum → bo_factor (same formula as core.py)
-    sorted_bo = sorted(bo_sum_new.values(), reverse=True)
-    ref_5th_bo = sorted_bo[4] if len(sorted_bo) >= 5 else (sorted_bo[-1] if sorted_bo else 1.0)
-    ref_5th_bo = max(ref_5th_bo, 1e-9)
-    bo_f: dict[str, float] = {
-        t: curve(min(1.0, bo_sum_new[t] / ref_5th_bo))
-        for t in all_teams
-    }
-
-    # ── Factor 2: Bounty Collected ────────────────────────────────
-    # Use bo_f for opponents in standings; fall back to the per-match
-    # opp_bo parsed from Valve's detail page (covers small teams not
-    # in the published standings).
-    bc_f:   dict[str, float] = {}
-    bc_pre: dict[str, float] = {}
-    for t in eligible:
-        entries = []
-        for m in tmh.get(t, []):
-            if m["result"] != "W" or m.get("ev_w", 0) <= 0:
-                continue
-            if not (new_window_start <= m["date"] <= new_cutoff):
-                continue
-            aw = age_weight(m["date"], new_cutoff)
-            opp_bo_val = bo_f.get(m["opponent"], m.get("opp_bo", 0.0))
-            entries.append(opp_bo_val * aw * m["ev_w"])
-        s = top_n_sum(entries, TOP_N) / TOP_N
-        bc_pre[t] = s
-        bc_f[t]   = curve(s)
-
-    # ── Factor 3: Opponent Network ─────────────────────────────────
-    on_f: dict[str, float] = dict(bo_f)   # seed from BO factors (same as core.py)
-    for _iter in range(ON_ITERS):
-        new_on: dict[str, float] = {}
-        for t in eligible:
-            entries = []
-            for m in tmh.get(t, []):
-                if m["result"] != "W" or m.get("ev_w", 0) <= 0:
-                    continue
-                if not (new_window_start <= m["date"] <= new_cutoff):
-                    continue
-                aw = age_weight(m["date"], new_cutoff)
-                opp_on_val = on_f.get(m["opponent"], m.get("opp_on", 0.0))
-                entries.append(opp_on_val * aw * m["ev_w"])
-            new_on[t] = top_n_sum(entries, TOP_N) / TOP_N
-        on_f.update(new_on)
-    on_final: dict[str, float] = on_f
-
-    # ── Factor 4: LAN Wins ────────────────────────────────────────
-    lan_f:  dict[str, float] = {}
-    lan_ct: dict[str, int]   = {}
-    for t in eligible:
-        lw = [m for m in tmh.get(t, [])
-              if m["result"] == "W" and m.get("is_lan")
-              and new_window_start <= m["date"] <= new_cutoff]
-        lan_ct[t] = len(lw)
-        entries   = [age_weight(m["date"], new_cutoff) for m in lw]
-        lan_f[t]  = top_n_sum(entries, TOP_N) / TOP_N
-
-    # ── Combine → Seed ────────────────────────────────────────────
-    combined: dict[str, float] = {
-        t: (bo_f.get(t, 0) + bc_f.get(t, 0)
-            + on_final.get(t, 0) + lan_f.get(t, 0)) / 4.0
-        for t in eligible
-    }
-    avg_vals = list(combined.values())
-    min_avg  = min(avg_vals)
-    max_avg  = max(avg_vals)
-    span     = max(max_avg - min_avg, 1e-9)
-    seeds: dict[str, float] = {
-        t: lerp(SEED_MIN, SEED_MAX, (combined[t] - min_avg) / span)
-        for t in eligible
-    }
-
-    # ── H2H (chronological) ──────────────────────────────────────
-    ratings: dict[str, float] = {t: seeds[t] for t in eligible}
-    h2h_d:   dict[str, float] = {t: 0.0     for t in eligible}
-
-    seen_ids: set[int] = set()
-    all_ms: list[tuple] = []
-    for t in eligible:
-        for m in tmh.get(t, []):
-            if m["match_id"] in seen_ids or m["result"] != "W":
-                continue
-            if not (new_window_start <= m["date"] <= new_cutoff):
-                continue
-            seen_ids.add(m["match_id"])
-            all_ms.append((m["date"], t, m["opponent"], m["match_id"]))
-    all_ms.sort()
-
-    # Per-match H2H tracking for team breakdown display
-    match_h2h: dict[int, dict] = {}   # match_id → {winner, loser, w_delta, l_delta}
-
-    for dt, w, l, mid in all_ms:
-        if w not in ratings or l not in ratings:
-            continue
-        E_w = expected_win(ratings[w], ratings[l])
-        K   = BASE_K * age_weight(dt, new_cutoff)
-        d_w =  K * (1.0 - E_w)
-        d_l = -K * E_w
-        ratings[w] += d_w;  ratings[l] += d_l
-        h2h_d[w]   += d_w;  h2h_d[l]   += d_l
-        match_h2h[mid] = {"winner": w, "loser": l, "w_delta": d_w, "l_delta": d_l}
-
-    # ── Build DataFrame ───────────────────────────────────────────
-    region_map = _ref_std.set_index("team")["region"].to_dict()
-    flag_map   = _ref_std.set_index("team")["flag"].to_dict()
-    color_map  = _ref_std.set_index("team")["color"].to_dict()
-
-    records = []
-    for t in eligible:
-        seed = seeds[t]
-        h2h  = h2h_d[t]
-        records.append({
-            "team":          t,
-            "total_points":  round(seed + h2h, 1),
-            "seed":          round(seed, 1),
-            "h2h_delta":     round(h2h, 1),
-            "bo_sum":        round(bo_sum_new.get(t, 0), 2),
-            "bo_factor":     round(bo_f.get(t, 0), 4),
-            "bc_pre_curve":  round(bc_pre.get(t, 0), 4),
-            "bc_factor":     round(bc_f.get(t, 0), 4),
-            "on_factor":     round(on_final.get(t, 0), 4),
-            "on_raw":        round(on_final.get(t, 0), 4),
-            "lan_factor":    round(lan_f.get(t, 0), 4),
-            "lan_wins":      lan_ct.get(t, 0),
-            "seed_combined": round(combined.get(t, 0), 4),
-            "wins":          wins_ct.get(t, 0),
-            "losses":        match_ct.get(t, 0) - wins_ct.get(t, 0),
-            "total_matches": match_ct.get(t, 0),
-            "region":        region_map.get(t, "Global"),
-            "flag":          flag_map.get(t, "🌍"),
-            "color":         color_map.get(t, "#58a6ff"),
-        })
-
-    result = pd.DataFrame(records)
-
-    # ── Sort and rank ─────────────────────────────────────────────
-    # (No duplicate merging needed — we filtered to active rosters only)
-    result = (result.sort_values("total_points", ascending=False)
-              .reset_index(drop=True))
-    result["rank"] = result.index + 1
-    result = add_regional_rank(result)
-    return {"standings": result, "match_h2h": match_h2h,
-            "dup_teams": set()}
-
 
 # ══════════════════════════════════════════════════════════════════
 # STANDINGS MODE EXECUTION
