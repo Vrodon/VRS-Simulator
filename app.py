@@ -129,6 +129,13 @@ from data_loaders import (
     fetch_hltv_matches, load_from_cache,
     cache_exists, cache_mtime, clear_cache,
 )
+from data_loaders import (
+    fetch_liquipedia_matches,
+    load_liquipedia_from_cache,
+    liquipedia_cache_exists,
+    liquipedia_cache_mtime,
+    clear_liquipedia_cache,
+)
 from utils import get_team_meta, KNOWN_META, COLOR_CYCLE
 TEAM_META = KNOWN_META   # alias used throughout app
 
@@ -181,20 +188,21 @@ with st.sidebar:
         "📖 How VRS Works",
         "📊 Ranking Dashboard",
         "🔍 Team Breakdown",
-        "🔮 Scenario Simulator",
+        "🔮 What-If Predictor",
         "⚔️ Team Comparison",
     ], label_visibility="collapsed", key="main_nav")
     st.markdown("---")
 
-    # ── Simulation toggle ─────────────────────────────────────────
-    sim_enabled = st.toggle(
-        "🔮 Simulate next month",
-        value=False,
-        key="sim_toggle",
-        help="Shift the cutoff forward ~1 month (no new matches). Shows pure time-decay effect on standings.",
+    # ── Standings Mode selector ───────────────────────────────────
+    standings_mode = st.radio(
+        "Standings Mode",
+        ["🏛️ As Published", "📡 Updated to Today"],
+        index=0,
+        key="standings_mode",
+        help="As Published: Official Valve standings. Updated to Today: includes all results since publication (auto-fetched).",
     )
 
-    # ── Historical date selector ──────────────────────────────────
+    # ── Historical date selector (only for "As Published" mode) ────
     if _all_dates:
         _date_labels = []
         for ds, yr in _all_dates:
@@ -210,12 +218,12 @@ with st.sidebar:
             "📅 VRS Snapshot",
             _date_labels,
             index=0,
-            disabled=sim_enabled,
-            help=("⚠️ Fixiert auf letzten Snapshot während Simulation."
-                  if sim_enabled else
+            disabled=(standings_mode == "📡 Updated to Today"),
+            help=("Latest snapshot is used for Updated to Today mode."
+                  if standings_mode == "📡 Updated to Today" else
                   "Valve publishes new standings monthly. Select any historical snapshot."),
         )
-        if sim_enabled:
+        if standings_mode == "📡 Updated to Today":
             _sel_date, _sel_year = _all_dates[0]
         else:
             _sel_idx   = _date_labels.index(_sel_label)
@@ -274,42 +282,357 @@ if "regional_rank" not in base_standings.columns or base_standings["regional_ran
     base_standings = add_regional_rank(base_standings)
 
 
-def compute_standings(extra_matches: pd.DataFrame = None, cutoff: datetime = None) -> pd.DataFrame:
+def compute_standings(
+    extra_matches: pd.DataFrame = None,
+    extra_prizes: list = None,
+    cutoff: datetime = None,
+) -> pd.DataFrame:
     """
     For the scenario simulator.
-    Starts from Valve's published final scores (exact) and applies
-    H2H deltas for any hypothetical extra_matches.
-    Factor Score factors (BO/BC/ON/LAN) are held constant from Valve's snapshot.
+    Starts from Valve's published scores and applies:
+      1. BO adjustments from extra_prizes (recalculates seed for affected teams)
+      2. H2H deltas from extra_matches
     """
-    result = base_standings.copy()
-    if extra_matches is None or extra_matches.empty:
-        return result
+    if cutoff is None:
+        cutoff = datetime.now()
 
-    # Build mutable score dict starting from Valve's published totals
-    scores: dict[str, float] = result.set_index("team")["total_points"].to_dict()
+    result = base_standings.copy()
+
+    # ── Step 1: BO adjustment from new prize earnings ─────────────
+    if extra_prizes:
+        from collections import defaultdict
+        new_contribs: dict[str, float] = defaultdict(float)
+        for p in extra_prizes:
+            aw = age_weight(p["date"] if isinstance(p["date"], datetime)
+                            else datetime.combine(p["date"], datetime.min.time()),
+                            cutoff)
+            new_contribs[p["team"]] += p["prize"] * aw
+
+        # Update bo_sum for teams with new prizes
+        for team, extra_bo in new_contribs.items():
+            mask = result["team"] == team
+            if mask.any():
+                result.loc[mask, "bo_sum"] = result.loc[mask, "bo_sum"] + extra_bo
+
+        # Recompute bo_factor for all teams
+        all_bo = result["bo_sum"].values
+        sorted_bo = sorted(all_bo, reverse=True)
+        ref_5th = max(sorted_bo[4] if len(sorted_bo) >= 5 else sorted_bo[-1], 1e-9)
+        result["bo_factor"] = result["bo_sum"].apply(
+            lambda s: curve(min(1.0, s / ref_5th))
+        )
+
+        # Recompute seed from updated factors
+        result["seed_combined"] = (
+            result["bo_factor"] + result["bc_factor"] +
+            result["on_factor"] + result["lan_factor"]
+        ) / 4.0
+        min_c = result["seed_combined"].min()
+        max_c = result["seed_combined"].max()
+        span  = max(max_c - min_c, 1e-9)
+        result["seed"] = result["seed_combined"].apply(
+            lambda c: lerp(SEED_MIN, SEED_MAX, (c - min_c) / span)
+        )
+        result["total_points"] = result["seed"] + result["h2h_delta"]
+
+    # ── Step 2: H2H deltas from new match results ─────────────────
+    scores:    dict[str, float] = result.set_index("team")["total_points"].to_dict()
     h2h_extra: dict[str, float] = {t: 0.0 for t in scores}
 
-    # Process hypothetical matches chronologically
-    for _, row in extra_matches.sort_values("date").iterrows():
-        w, l = str(row["winner"]), str(row["loser"])
-        if w not in scores or l not in scores:
-            continue
-        E_w = expected_win(scores[w], scores[l])
-        K   = BASE_K * 1.0   # new match → age_weight = 1.0
-        d_w =  K * (1.0 - E_w)
-        d_l = -K * E_w
-        scores[w]     += d_w
-        scores[l]     += d_l
-        h2h_extra[w]  += d_w
-        h2h_extra[l]  += d_l
+    if extra_matches is not None and not extra_matches.empty:
+        _series = extra_matches[extra_matches["loser"] != ""] if "loser" in extra_matches.columns else extra_matches
+        for _, row in _series.sort_values("date").iterrows():
+            w, l = str(row["winner"]), str(row["loser"])
+            if w not in scores or l not in scores:
+                continue
+            E_w = expected_win(scores[w], scores[l])
+            K   = BASE_K * 1.0
+            d_w =  K * (1.0 - E_w)
+            d_l = -K * E_w
+            scores[w]    += d_w;  scores[l]    += d_l
+            h2h_extra[w] += d_w;  h2h_extra[l] += d_l
 
     result["total_points"] = result["team"].map(scores).fillna(result["total_points"])
     result["h2h_delta"]    = result["team"].map(
-        lambda t: result.loc[result["team"]==t, "h2h_delta"].iloc[0] + h2h_extra.get(t, 0.0)
+        lambda t: result.loc[result["team"] == t, "h2h_delta"].iloc[0] + h2h_extra.get(t, 0.0)
     )
     result = result.sort_values("total_points", ascending=False).reset_index(drop=True)
     result["rank"] = result.index + 1
     return result
+
+
+# ══════════════════════════════════════════════════════════════════
+# AUTO-FETCH "UPDATED TO TODAY" ORCHESTRATOR
+# ══════════════════════════════════════════════════════════════════
+
+def _identify_active_rosters(standings: pd.DataFrame) -> dict:
+    """
+    Dynamically identify which roster version is 'active' for each team.
+
+    Returns: dict[team_name] -> original_row_index_of_active_roster
+
+    Active roster = the one with the lowest rank (best ranking).
+    This is determined at runtime, no hard-coded lists.
+    For future-proofing: as rosters change next month, the function
+    automatically identifies the new active one.
+    """
+    active_map = {}
+
+    for team_name in standings["team"].unique():
+        team_rows = standings[standings["team"] == team_name]
+
+        if len(team_rows) == 1:
+            # No duplicates, trivially active
+            active_map[team_name] = team_rows.index[0]
+        else:
+            # Multiple rosters: pick the best-ranked one
+            best_idx = team_rows["rank"].idxmin()
+            active_map[team_name] = best_idx
+
+    return active_map
+
+
+def _auto_fetch_updated_standings(
+    snapshot_cutoff: datetime,
+    snapshot_standings: pd.DataFrame,
+    team_match_history: dict,
+    bo_prizes_map: dict,
+    progress_callback=None,
+) -> dict:
+    """
+    Auto-fetch all tournaments from Liquipedia since snapshot_cutoff,
+    inject them, and recompute standings with shifted cutoff to today.
+
+    progress_callback: optional function(step: int, total: int, status: str) for UI updates
+
+    Returns: {
+        "standings": updated DataFrame or empty on error,
+        "cutoff": datetime.now(),
+        "source": "liquipedia" or "fallback",
+        "match_count": int,
+        "error": str or None,
+    }
+    """
+    from data_loaders import (
+        discover_liquipedia_from_portal,
+        fetch_liquipedia_matches,
+        liquipedia_cache_exists,
+        liquipedia_cache_mtime,
+        load_liquipedia_from_cache,
+    )
+
+    today = datetime.now()
+    start_date_str = snapshot_cutoff.strftime("%Y-%m-%d")
+    end_date_str = today.strftime("%Y-%m-%d")
+
+    # ── Step 1: Check cache ────────────────────────────────────────
+    cache_key_base = (start_date_str, end_date_str)
+    try:
+        if progress_callback:
+            progress_callback(1, 3, "Discovering tournaments from Liquipedia Portal…")
+
+        # Attempt auto-discover to get tournament list for cache check
+        discovered = discover_liquipedia_from_portal(
+            start_date_str, end_date_str, min_tier="B-Tier", include_qualifiers=True
+        )
+        if not discovered:
+            # No tournaments found in date range
+            return {
+                "standings": pd.DataFrame(),
+                "cutoff": today,
+                "source": "fallback",
+                "match_count": 0,
+                "error": "No tournaments found in Liquipedia for this date range."
+            }
+
+        tournament_slugs = [d["slug"] for d in discovered]
+
+        if progress_callback:
+            progress_callback(2, 3, f"Fetching {len(tournament_slugs)} tournaments…")
+
+        # Check if cache exists and is fresh (< 2 hours old)
+        cache_fresh = False
+        if liquipedia_cache_exists(start_date_str, end_date_str, tournament_slugs):
+            mtime = liquipedia_cache_mtime(start_date_str, end_date_str, tournament_slugs)
+            age_minutes = (datetime.now() - mtime).total_seconds() / 60
+            if age_minutes < 120:  # 2 hours
+                cache_fresh = True
+                if progress_callback:
+                    progress_callback(2, 3, f"Loading {len(tournament_slugs)} tournaments from cache…")
+                matches_df = load_liquipedia_from_cache(start_date_str, end_date_str, tournament_slugs)
+            else:
+                # Cache is stale, re-fetch
+                matches_df = fetch_liquipedia_matches(
+                    start_date_str, end_date_str,
+                    tournament_slugs=tournament_slugs,
+                    force_refresh=True,
+                    progress_callback=progress_callback,
+                )
+        else:
+            # No cache, fetch fresh
+            matches_df = fetch_liquipedia_matches(
+                start_date_str, end_date_str,
+                tournament_slugs=tournament_slugs,
+                force_refresh=False,
+                progress_callback=progress_callback,
+            )
+
+        if matches_df.empty:
+            return {
+                "standings": pd.DataFrame(),
+                "cutoff": today,
+                "source": "fallback",
+                "match_count": 0,
+                "error": "Liquipedia fetch returned no matches."
+            }
+
+        # ── Step 2: Filter to active rosters only (Layer 1) ──────────
+        # Identify active rosters from the SNAPSHOT standings BEFORE injection
+        active_rosters = _identify_active_rosters(snapshot_standings)
+
+        # Build a set of active team names for filtering
+        active_team_names = set(
+            snapshot_standings.loc[active_rosters[team], "team"]
+            for team in active_rosters
+        )
+
+        # Separate series from prize-only rows
+        series_df = matches_df[matches_df["loser"] != ""].copy()
+        prize_df = matches_df[matches_df["loser"] == ""].copy()
+
+        # Filter: keep matches where BOTH teams are either:
+        #   - Active rosters (if they have duplicates), OR
+        #   - Not in snapshot at all (unknown teams)
+        series_df_filtered = []
+        for _, row in series_df.iterrows():
+            winner = row["winner"]
+            loser = row["loser"]
+
+            # Check if this match should be kept
+            winner_ok = winner not in snapshot_standings["team"].values or winner in active_team_names
+            loser_ok = loser not in snapshot_standings["team"].values or loser in active_team_names
+
+            if winner_ok and loser_ok:
+                series_df_filtered.append(row)
+
+        series_df = pd.DataFrame(series_df_filtered) if series_df_filtered else pd.DataFrame()
+
+        # Same for prizes: only apply to active rosters
+        prize_df_filtered = []
+        for _, row in prize_df.iterrows():
+            team = row["winner"]
+            if team not in snapshot_standings["team"].values or team in active_team_names:
+                prize_df_filtered.append(row)
+
+        prize_df = pd.DataFrame(prize_df_filtered) if prize_df_filtered else pd.DataFrame()
+
+        # ── Step 3: Extend tmh + bpm with Liquipedia data ──────────────
+        if progress_callback:
+            progress_callback(3, 3, "Merging new matches and recalculating all factors…")
+
+        # Build opponent factor lookup for new match entries
+        bo_lookup = snapshot_standings.set_index("team")["bo_factor"].to_dict()
+        on_lookup = snapshot_standings.set_index("team")["on_factor"].to_dict()
+
+        # Convert Liquipedia series results → tmh match-dict format.
+        # ev_w uses the same event_stakes(prize_pool) formula as Valve.
+        # opp_bo/opp_on are fallbacks; _simulate_time_decay looks up live values first.
+        new_tmh: dict = {}
+        match_id_offset = 10_000_000  # well above Valve's match IDs
+        for i, row in (series_df.iterrows() if not series_df.empty else iter([])):
+            winner     = str(row["winner"])
+            loser      = str(row["loser"])
+            match_date = row["date"] if isinstance(row["date"], datetime) \
+                         else datetime.combine(row["date"], datetime.min.time())
+            prize_pool = float(row.get("prize_pool", 0.0))
+            is_lan     = bool(row.get("is_lan", False))
+            ev_w       = event_stakes(prize_pool)
+            mid        = match_id_offset + i
+
+            for team, opp, result in [(winner, loser, "W"), (loser, winner, "L")]:
+                entry = {
+                    "match_id":  mid,
+                    "date":      match_date,
+                    "opponent":  opp,
+                    "result":    result,
+                    "age_w":     0.0,   # re-computed inside _simulate_time_decay
+                    "ev_w":      ev_w,
+                    "prize_pool": prize_pool,
+                    "is_lan":    is_lan,
+                    "h2h_adj":   0.0,
+                    "opp_bo":    bo_lookup.get(opp, 0.0),
+                    "opp_on":    on_lookup.get(opp, 0.0),
+                }
+                new_tmh.setdefault(team, []).append(entry)
+
+        # Merge: original tmh + new Liquipedia match entries
+        extended_tmh = {t: list(v) for t, v in team_match_history.items()}
+        for team, entries in new_tmh.items():
+            extended_tmh.setdefault(team, [])
+            extended_tmh[team] = extended_tmh[team] + entries
+
+        # Convert prize-only rows → bpm format for BO recalculation
+        new_bpm: dict = {}
+        for _, row in (prize_df.iterrows() if not prize_df.empty else iter([])):
+            team          = str(row["winner"])
+            prize_amount  = float(row.get("winner_prize", 0.0))
+            prize_date    = row["date"]
+            if prize_amount <= 0:
+                continue
+            date_str = prize_date.strftime("%Y-%m-%d") \
+                       if hasattr(prize_date, "strftime") else str(prize_date)
+            new_bpm.setdefault(team, []).append({
+                "event_date":  date_str,
+                "age_weight":  0.0,   # re-computed inside _simulate_time_decay
+                "prize_won":   prize_amount,
+                "scaled_prize": 0.0,
+            })
+
+        # Merge: original bpm + new prize entries
+        extended_bpm = {t: list(v) for t, v in bo_prizes_map.items()}
+        for team, prizes in new_bpm.items():
+            extended_bpm.setdefault(team, [])
+            extended_bpm[team] = extended_bpm[team] + prizes
+
+        # ── Step 4: Full VRS recomputation (all 4 factors + H2H) ───────
+        # This is the same pipeline Valve runs:
+        #   – All matches in the 180-day window, age-weighted to today
+        #   – BO, BC, ON, LAN recomputed from scratch
+        #   – Glicko H2H applied chronologically
+        # New Liquipedia matches are already in extended_tmh, so they
+        # participate in every factor calculation at their correct age weight.
+        sim_result = _simulate_time_decay(
+            extended_tmh, extended_bpm,
+            snapshot_standings, snapshot_cutoff, today,
+        )
+
+        if sim_result["standings"].empty:
+            return {
+                "standings": pd.DataFrame(),
+                "cutoff": today,
+                "source": "fallback",
+                "match_count": len(series_df) if not series_df.empty else 0,
+                "error": "Full recomputation returned no eligible teams."
+            }
+
+        return {
+            "standings": sim_result["standings"],
+            "match_h2h": sim_result.get("match_h2h", {}),
+            "cutoff": today,
+            "source": "liquipedia",
+            "match_count": len(series_df) if not series_df.empty else 0,
+            "error": None,
+        }
+
+    except Exception as e:
+        import traceback as tb
+        return {
+            "standings": pd.DataFrame(),
+            "cutoff": today,
+            "source": "fallback",
+            "match_count": 0,
+            "error": f"Liquipedia fetch failed: {str(e)[:100]}"
+        }
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -334,19 +657,28 @@ def _simulate_time_decay(
     Returns a new standings DataFrame with recalculated factor scores,
     seeds, and H2H adjustments reflecting the new age weights.
     """
-    # ── Detect duplicate team names (roster changes → 2 entries) ──
-    # These teams have unreliable match history (dict key collision)
-    # so we exclude them from simulation and keep their original values.
-    _name_counts = standings["team"].value_counts()
-    _dup_names   = set(_name_counts[_name_counts > 1].index)
+    # ── Layer 2: Identify and filter to active rosters only ────────
+    # Instead of excluding duplicates entirely, filter to keep only the
+    # active roster for each team (lowest rank = active), then proceed
+    # with normal factor calculations.
+    active_rosters = _identify_active_rosters(standings)
 
-    # Work with deduplicated, non-duplicate teams only
-    _clean_std = standings[~standings["team"].isin(_dup_names)].copy()
-    _clean_std = _clean_std.sort_values("rank").reset_index(drop=True)
+    # Filter standings to only active rosters
+    standings_active_only = []
+    for idx, row in standings.iterrows():
+        team_name = row["team"]
+        if active_rosters.get(team_name) == idx:
+            standings_active_only.append(row)
+
+    standings = pd.DataFrame(standings_active_only).reset_index(drop=True)
+
+    # Now work with the consolidated standings (no duplicates)
+    _clean_std = standings.sort_values("rank").reset_index(drop=True)
     all_teams  = _clean_std["team"].tolist()
 
-    # Keep ALL original rows for reference data (BO/ON factors)
+    # Keep reference for region/flag/color data
     _ref_std = standings.sort_values("rank").drop_duplicates("team", keep="first")
+    _dup_names = set()  # No duplicates anymore, but keep for compatibility
 
     new_window_start = new_cutoff - timedelta(days=DECAY_DAYS)
 
@@ -366,26 +698,10 @@ def _simulate_time_decay(
     if not eligible:
         return {"standings": pd.DataFrame(), "match_h2h": {}, "dup_teams": _dup_names}
 
-    # ── Factor 1: Bounty Offered (all teams, needed for BC/ON) ────
-    # USE VALVE'S PUBLISHED BO FACTORS FOR ALL TEAMS.
-    #
-    # Rationale: We don't have complete prize-pool data for every team
-    # (the "Top ten winnings" table is only parseable for ~40 teams).
-    # Mixing recalculated BO (with decay) for some teams with original
-    # BO for others creates an apples-to-oranges comparison.
-    #
-    # BO changes minimally over 30 days anyway (big prizes are recent).
-    # The real time-decay effect comes from BC, ON, LAN, and H2H where
-    # we DO have full match-level data and CAN properly shift age weights.
-    #
-    # This keeps the "opponent strength" baseline consistent for all teams.
-    orig_bo_map = _ref_std.set_index("team")["bo_factor"].to_dict()
-    bo_f: dict[str, float] = {t: orig_bo_map.get(t, 0.0) for t in all_teams}
-
-    # Still compute bo_sum for the selected team's display (where prize data exists)
+    # ── Factor 1: Bounty Offered ──────────────────────────────────
+    # Compute from actual prize data (bpm) with new age weights.
+    # Teams with no prize data in bpm fall back to their Valve bo_sum.
     bo_sum_new: dict[str, float] = {}
-    _bo_from_prizes = 0
-    _bo_from_fallback = 0
     for t in all_teams:
         prizes = bpm.get(t, [])
         contribs = []
@@ -399,12 +715,20 @@ def _simulate_time_decay(
                 contribs.append(bp["prize_won"] * aw)
         if contribs:
             bo_sum_new[t] = top_n_sum(contribs, TOP_N)
-            _bo_from_prizes += 1
         else:
-            # Use original bo_sum for display purposes
-            bo_sum_new[t] = float(_ref_std.loc[_ref_std["team"] == t, "bo_sum"].iloc[0]
-                                  if t in _ref_std["team"].values else 0.0)
-            _bo_from_fallback += 1
+            bo_sum_new[t] = float(
+                _ref_std.loc[_ref_std["team"] == t, "bo_sum"].iloc[0]
+                if t in _ref_std["team"].values else 0.0
+            )
+
+    # Normalise bo_sum → bo_factor (same formula as core.py)
+    sorted_bo = sorted(bo_sum_new.values(), reverse=True)
+    ref_5th_bo = sorted_bo[4] if len(sorted_bo) >= 5 else (sorted_bo[-1] if sorted_bo else 1.0)
+    ref_5th_bo = max(ref_5th_bo, 1e-9)
+    bo_f: dict[str, float] = {
+        t: curve(min(1.0, bo_sum_new[t] / ref_5th_bo))
+        for t in all_teams
+    }
 
     # ── Factor 2: Bounty Collected ────────────────────────────────
     # Use bo_f for opponents in standings; fall back to the per-match
@@ -427,24 +751,22 @@ def _simulate_time_decay(
         bc_f[t]   = curve(s)
 
     # ── Factor 3: Opponent Network ─────────────────────────────────
-    # Use Valve's published ON factors as the network baseline, then
-    # run a SINGLE iteration with new age weights to capture the decay.
-    # Fall back to per-match opp_on for opponents not in standings.
-    orig_on_map = _ref_std.set_index("team")["on_factor"].to_dict()
-    on_seed: dict[str, float] = {t: orig_on_map.get(t, 0.0) for t in all_teams}
-
-    on_final: dict[str, float] = {}
-    for t in eligible:
-        entries = []
-        for m in tmh.get(t, []):
-            if m["result"] != "W" or m.get("ev_w", 0) <= 0:
-                continue
-            if not (new_window_start <= m["date"] <= new_cutoff):
-                continue
-            aw = age_weight(m["date"], new_cutoff)
-            opp_on_val = on_seed.get(m["opponent"], m.get("opp_on", 0.0))
-            entries.append(opp_on_val * aw * m["ev_w"])
-        on_final[t] = top_n_sum(entries, TOP_N) / TOP_N
+    on_f: dict[str, float] = dict(bo_f)   # seed from BO factors (same as core.py)
+    for _iter in range(ON_ITERS):
+        new_on: dict[str, float] = {}
+        for t in eligible:
+            entries = []
+            for m in tmh.get(t, []):
+                if m["result"] != "W" or m.get("ev_w", 0) <= 0:
+                    continue
+                if not (new_window_start <= m["date"] <= new_cutoff):
+                    continue
+                aw = age_weight(m["date"], new_cutoff)
+                opp_on_val = on_f.get(m["opponent"], m.get("opp_on", 0.0))
+                entries.append(opp_on_val * aw * m["ev_w"])
+            new_on[t] = top_n_sum(entries, TOP_N) / TOP_N
+        on_f.update(new_on)
+    on_final: dict[str, float] = on_f
 
     # ── Factor 4: LAN Wins ────────────────────────────────────────
     lan_f:  dict[str, float] = {}
@@ -535,105 +857,111 @@ def _simulate_time_decay(
 
     result = pd.DataFrame(records)
 
-    # ── Merge back duplicate teams (unchanged original values) ────
-    if _dup_names:
-        dup_rows = standings[standings["team"].isin(_dup_names)].copy()
-        # Ensure dup_rows have all required columns with defaults
-        for col in result.columns:
-            if col not in dup_rows.columns:
-                dup_rows[col] = 0
-        result = pd.concat([result, dup_rows[result.columns]], ignore_index=True)
-
+    # ── Sort and rank ─────────────────────────────────────────────
+    # (No duplicate merging needed — we filtered to active rosters only)
     result = (result.sort_values("total_points", ascending=False)
               .reset_index(drop=True))
     result["rank"] = result.index + 1
     result = add_regional_rank(result)
     return {"standings": result, "match_h2h": match_h2h,
-            "diag_bo_prizes": _bo_from_prizes, "diag_bo_fallback": _bo_from_fallback,
-            "dup_teams": _dup_names}
+            "dup_teams": set()}
 
 
 # ══════════════════════════════════════════════════════════════════
-# SIMULATION EXECUTION
+# STANDINGS MODE EXECUTION
 # ══════════════════════════════════════════════════════════════════
 
-sim_active       = False
-sim_cutoff_dt    = None
-sim_match_h2h    = {}           # match_id → {winner, loser, w_delta, l_delta}
-_diag_prizes     = 0
-_diag_fallback   = 0
-_sim_dup_teams   = set()
-original_standings = base_standings.copy()
+mode_active          = "published"  # "published", "updated", or "fallback"
+mode_fetch_error     = None
+updated_match_count  = 0
+original_standings   = base_standings.copy()
+sim_match_h2h        = {}  # match_id → {winner, loser, w_delta, l_delta} from simulation
+sim_cutoff_dt        = datetime.now()  # cutoff used for simulation (for age_weight calc)
 
-if sim_enabled:
-    # Compute simulated cutoff: 1st of the month AFTER the snapshot
-    _snap_dt = _gd["cutoff_datetime"]
-    if _snap_dt.month == 12:
-        sim_cutoff_dt = datetime(_snap_dt.year + 1, 1, 1)
-    else:
-        sim_cutoff_dt = datetime(_snap_dt.year, _snap_dt.month + 1, 1)
+if standings_mode == "📡 Updated to Today":
+    _prog_bar = st.progress(0, text="📡 Fetching live tournaments…")
+    _prog_text = st.empty()
 
-    with st.spinner("🔮 Recalculating all factors with shifted cutoff…"):
-        _sim_out = _simulate_time_decay(
-            team_match_history, bo_prizes_map,
-            base_standings, _snap_dt, sim_cutoff_dt,
+    def _fetch_progress(step: int, total: int, status: str):
+        _prog_bar.progress(min(step / max(total, 1), 0.95), text=status)
+        _prog_text.caption(f"{status} ({step}/{total})")
+
+    try:
+        _fetch_result = _auto_fetch_updated_standings(
+            cutoff_dt, base_standings, team_match_history, bo_prizes_map,
+            progress_callback=_fetch_progress,
         )
+        _prog_bar.progress(1.0, text="✅ Done")
+        _prog_text.empty()
+    except Exception as e:
+        _prog_bar.empty()
+        _prog_text.empty()
+        _fetch_result = {
+            "standings": pd.DataFrame(),
+            "cutoff": datetime.now(),
+            "source": "fallback",
+            "match_count": 0,
+            "error": f"Fetch error: {str(e)[:100]}"
+        }
 
-    _sim_result   = _sim_out["standings"]
-    sim_match_h2h = _sim_out["match_h2h"]
-    _diag_prizes  = _sim_out.get("diag_bo_prizes", 0)
-    _diag_fallback = _sim_out.get("diag_bo_fallback", 0)
-    _sim_dup_teams = _sim_out.get("dup_teams", set())
-
-    if not _sim_result.empty:
+    if _fetch_result["standings"].empty:
+        # Fetch failed, fallback to As Published
+        mode_active = "fallback"
+        mode_fetch_error = _fetch_result.get("error", "Unknown error during fetch")
+        st.warning(f"⚠️ Could not fetch live data: {mode_fetch_error}")
+    else:
+        # Success: update standings, cutoff, and state
         original_standings = base_standings.copy()
-        base_standings     = _sim_result
-        # Compute rank delta (positive = climbed, negative = dropped)
+        base_standings = _fetch_result["standings"]
+        updated_match_count = _fetch_result.get("match_count", 0)
+        cutoff_dt = _fetch_result["cutoff"]
+        cutoff_date = _fetch_result["cutoff"]
+        sim_cutoff_dt = _fetch_result["cutoff"]  # use simulation cutoff for age_weight calcs
+        sim_match_h2h = _fetch_result.get("match_h2h", {})
+        mode_active = "updated"
+
+        # Compute rank deltas
         _orig_rank_map = original_standings.sort_values("rank").drop_duplicates("team", keep="first").set_index("team")["rank"].to_dict()
         base_standings["rank_delta"] = base_standings.apply(
-            lambda r: (int(_orig_rank_map.get(r["team"], r["rank"])) - int(r["rank"])
-                       if r["team"] not in _sim_dup_teams else 0),
+            lambda r: (int(_orig_rank_map.get(r["team"], r["rank"])) - int(r["rank"])),
             axis=1,
         ).astype(int)
-        cutoff_dt          = sim_cutoff_dt
-        cutoff_date        = sim_cutoff_dt
-        sim_active         = True
+else:
+    # As Published mode: use snapshot as-is
+    mode_active = "published"
+    if "rank_delta" not in base_standings.columns:
+        base_standings["rank_delta"] = 0
 
-# ── Simulation banner (shown on all pages) ────────────────────────
-if sim_active:
-    _days_fwd = (sim_cutoff_dt - _gd["cutoff_datetime"]).days
-    # Merge original ranks for quick delta display
-    _orig_rank = original_standings.set_index("team")["rank"].to_dict()
-    _new_top5  = base_standings.head(5)
-    _top5_info = " · ".join(
-        f'**#{int(r["rank"])}** {r["team"]} ({r["total_points"]:,.0f})'
-        for _, r in _new_top5.iterrows()
-    )
+# ── Mode banner (shown on all pages) ────────────────────────────────
+if mode_active == "updated":
+    _days_fwd = (cutoff_dt - _gd["cutoff_datetime"]).days
     st.markdown(f"""
-    <div style="background:linear-gradient(135deg,#1a1040,#0d1117);border:1px solid #7c3aed;
+    <div style="background:linear-gradient(135deg,#0d3d1a,#0d1117);border:1px solid #3fb950;
                 border-radius:10px;padding:16px 20px;margin-bottom:16px;">
       <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
-        <span style="font-size:22px">🔮</span>
-        <span style="font-size:16px;font-weight:700;color:#c4b5fd;">
-          Simulation: Cutoff → {sim_cutoff_dt.strftime('%B %d, %Y')}</span>
-        <span style="background:#7c3aed;color:#fff;border-radius:12px;padding:2px 10px;
-                     font-size:11px;font-weight:600">+{_days_fwd} days</span>
+        <span style="font-size:22px">📡</span>
+        <span style="font-size:16px;font-weight:700;color:#3fb950;">
+          Updated to {cutoff_dt.strftime('%B %d, %Y')}</span>
+        <span style="background:#3fb950;color:#000;border-radius:12px;padding:2px 10px;
+                     font-size:11px;font-weight:600">+{updated_match_count} tournaments</span>
       </div>
-      <div style="font-size:12px;color:#a78bfa;line-height:1.6;">
-        BC, ON, LAN, and H2H fully recomputed with shifted age weights — no new matches assumed.<br>
-        BO uses Valve's published factors (consistent baseline; BO changes minimally over 30 days).
-        {f'<br><span style="color:#8b949e;font-size:11px">{len(_sim_dup_teams)} teams with roster splits excluded from simulation (kept original values): {", ".join(sorted(_sim_dup_teams)[:8])}{"…" if len(_sim_dup_teams) > 8 else ""}</span>' if _sim_dup_teams else ''}
+      <div style="font-size:12px;color:#56d364;line-height:1.6;">
+        Fetched all official tournaments and recomputed standings with latest results.
+        All four factors (BO, BC, ON, LAN) and H2H recalculated as of {cutoff_dt.strftime('%b %d, %H:%M UTC')}.
       </div>
     </div>""", unsafe_allow_html=True)
 
-# ── Sidebar status (after simulation state is resolved) ───────────
+elif mode_active == "fallback":
+    st.warning(f"⚠️ Using As Published standings (fetch failed: {mode_fetch_error[:80]})")
+
+# ── Sidebar status (after mode state is resolved) ───────────────────
 with st.sidebar:
-    if sim_active:
-        st.info(f"🔮 Simulation  ·  {sim_cutoff_dt.strftime('%Y_%m_%d')}")
-    elif _gd["source"] == "github":
-        st.success(f"✅ {_gd['total_teams']} teams  ·  {_gd['cutoff_date']}")
-    else:
-        st.error("❌ GitHub offline — limited data")
+    if mode_active == "updated":
+        st.success(f"📡 Updated  ·  {cutoff_dt.strftime('%Y_%m_%d')}")
+    elif mode_active == "published":
+        st.success(f"🏛️ Official  ·  {_gd['cutoff_date']}")
+    else:  # fallback
+        st.warning(f"⚠️ Fallback  ·  {_gd['cutoff_date']}")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -642,8 +970,17 @@ with st.sidebar:
 
 if page == "📊 Ranking Dashboard":
     st.title("📊 CS2 Valve Regional Standings")
+
+    # ── Mode banner ─────────────────────────────────────────────────
+    if mode_active == "updated":
+        st.info(f"📡 **Updated to {cutoff_dt.strftime('%B %d, %Y')}** — includes {updated_match_count} tournaments since publication")
+    elif mode_active == "published":
+        st.info(f"🏛️ **Official Valve standings** — as of {cutoff_dt.strftime('%B %d, %Y')}")
+    elif mode_active == "fallback":
+        st.warning(f"⚠️ **Fallback to official standings** — {mode_fetch_error}")
+
     st.caption(
-        f"Simulated standings · cutoff **{cutoff_date.strftime('%B %d, %Y')}** · "
+        f"Cutoff **{cutoff_date.strftime('%B %d, %Y')}** · "
         "Two-phase VRS engine (Factor Score + Glicko H2H) · "
         "Source: [Valve GitHub](https://github.com/ValveSoftware/counter-strike_regional_standings)"
     )
@@ -664,14 +1001,14 @@ if page == "📊 Ranking Dashboard":
     c3.metric("🌎 Americas #1", am["team"],   f'{am["total_points"]:,.0f} pts')
     c4.metric("🌏 Asia #1",     asia["team"], f'{asia["total_points"]:,.0f} pts')
 
-    # ── Simulation impact summary (only when sim is active) ────────
-    if sim_active:
+    # ── Mode impact summary (only when updated) ──────────────────────
+    if mode_active == "updated":
         st.markdown("---")
-        st.markdown("### 📉 Time-Decay Impact")
+        st.markdown("### 📉 Rankings Impact (vs Official)")
         _orig_map  = original_standings.sort_values("rank").drop_duplicates("team", keep="first").set_index("team")
         _sim_map   = base_standings.sort_values("rank").drop_duplicates("team", keep="first").set_index("team")
-        # Only compare teams that were actually simulated (exclude roster-split teams)
-        _both      = sorted((set(_orig_map.index) & set(_sim_map.index)) - _sim_dup_teams)
+        # Compare all teams that appear in both
+        _both      = sorted(set(_orig_map.index) & set(_sim_map.index))
 
         _deltas = []
         for t in _both:
@@ -753,7 +1090,7 @@ if page == "📊 Ranking Dashboard":
         rows = []
         for _, row in display.iterrows():
             rk   = int(row["rank"])
-            rd   = int(row.get("rank_delta", 0)) if sim_active else 0
+            rd   = int(row.get("rank_delta", 0)) if mode_active == "updated" else 0
             rd_s = (f' <span class="change-up" style="font-size:10px">▲{rd}</span>' if rd > 0 else
                     f' <span class="change-down" style="font-size:10px">▼{abs(rd)}</span>' if rd < 0 else
                     '') if rd != 0 else ''
@@ -832,7 +1169,7 @@ if page == "📊 Ranking Dashboard":
     with tab_eu:
         eu_df = base_standings[base_standings["region"] == "Europe"].reset_index(drop=True)
         eu_df["rank"] = eu_df.index + 1
-        if sim_active:
+        if mode_active == "updated":
             _orig_eu = original_standings[original_standings["region"] == "Europe"].sort_values("total_points", ascending=False).reset_index(drop=True)
             _orig_eu["rank"] = _orig_eu.index + 1
             _oem = _orig_eu.set_index("team")["rank"].to_dict()
@@ -842,7 +1179,7 @@ if page == "📊 Ranking Dashboard":
     with tab_am:
         am_df = base_standings[base_standings["region"] == "Americas"].reset_index(drop=True)
         am_df["rank"] = am_df.index + 1
-        if sim_active:
+        if mode_active == "updated":
             _orig_am = original_standings[original_standings["region"] == "Americas"].sort_values("total_points", ascending=False).reset_index(drop=True)
             _orig_am["rank"] = _orig_am.index + 1
             _oam = _orig_am.set_index("team")["rank"].to_dict()
@@ -852,7 +1189,7 @@ if page == "📊 Ranking Dashboard":
     with tab_as:
         as_df = base_standings[base_standings["region"] == "Asia"].reset_index(drop=True)
         as_df["rank"] = as_df.index + 1
-        if sim_active:
+        if mode_active == "updated":
             _orig_as = original_standings[original_standings["region"] == "Asia"].sort_values("total_points", ascending=False).reset_index(drop=True)
             _orig_as["rank"] = _orig_as.index + 1
             _oas = _orig_as.set_index("team")["rank"].to_dict()
@@ -918,244 +1255,109 @@ if page == "📊 Ranking Dashboard":
 # PAGE 2  ·  SCENARIO SIMULATOR
 # ══════════════════════════════════════════════════════════════════
 
-elif page == "🔮 Scenario Simulator":
-    st.title("🔮 What-If Scenario Simulator")
+elif page == "🔮 What-If Predictor":
+    st.title("🔮 What-If Predictor")
     st.markdown(
-        "Queue hypothetical match results and instantly see how the VRS standings shift. "
-        "Uses the full two-phase engine (seed recalculation + H2H) on every simulation."
+        "Build hypothetical scenarios on top of the current baseline standings. "
+        "Add match results and/or prize earnings to instantly see how standings would shift. "
+        "**Note:** Baseline automatically reflects your current mode selection (As Published or Updated to Today)."
     )
 
     all_teams = sorted(base_standings["team"].tolist()) if not base_standings.empty else sorted(TEAM_META.keys())
 
     if "hyp_matches" not in st.session_state:
         st.session_state.hyp_matches = []
-    if "hltv_df" not in st.session_state:
-        st.session_state.hltv_df = pd.DataFrame()
+    if "hyp_prizes" not in st.session_state:
+        st.session_state.hyp_prizes = []
 
-    # ══════════════════════════════════════════════════════════════
-    # HLTV LIVE MATCH LOADER
-    # ══════════════════════════════════════════════════════════════
-    with st.expander("📡 Load Live HLTV Matches", expanded=True):
-        st.markdown(
-            "Fetch real CS2 series results from HLTV.org and inject them into "
-            "the simulator queue. Data is cached to disk so re-opening the app "
-            "does not re-fetch. Click **Fetch** only when you want fresh data."
-        )
+    st.markdown("---")
 
-        _hc1, _hc2, _hc3 = st.columns([2, 2, 1])
-        _hltv_start = _hc1.date_input(
-            "From (inclusive)",
-            value=cutoff_dt.date(),
-            key="hltv_start",
-            help="Defaults to the Valve snapshot cutoff date.",
-        )
-        _hltv_end = _hc2.date_input(
-            "To (inclusive)",
-            value=datetime.today().date(),
-            key="hltv_end",
-        )
-        _hltv_lan_only = _hc3.toggle(
-            "LAN only", value=False, key="hltv_lan_only",
-            help="Filter the preview to LAN events only. "
-                 "Injection still uses the full filter setting below.",
-        )
+    # ── Input forms: matches (left) and prizes (right) ────────────
+    _form_left, _form_right = st.columns(2)
 
-        _sd_str = _hltv_start.strftime("%Y-%m-%d")
-        _ed_str = _hltv_end.strftime("%Y-%m-%d")
+    with _form_left:
+        with st.form("add_match"):
+            st.subheader("➕ Add Hypothetical Match")
+            c1, c2 = st.columns(2)
+            winner = c1.selectbox("🏆 Winner", all_teams, index=all_teams.index("G2"))
+            loser  = c2.selectbox("❌ Loser",
+                                  [t for t in all_teams if t != winner],
+                                  index=0)
+            c3, c4 = st.columns(2)
+            event_name = c3.text_input("🏟️ Event", value="Hypothetical Event")
+            prize_pool = c4.number_input("💵 Prize Pool (USD)", 10_000, 2_000_000, 250_000, 10_000)
+            c5, c6 = st.columns(2)
+            is_lan     = c5.toggle("🖥️ LAN?", value=True)
+            match_date = c6.date_input("📅 Match Date", value=datetime(2026, 3, 20))
 
-        # Cache status indicator
-        if cache_exists(_sd_str, _ed_str):
-            _mtime = cache_mtime(_sd_str, _ed_str)
-            st.caption(
-                f"💾 Disk cache found — last fetched "
-                f"**{_mtime.strftime('%d %b %Y, %H:%M')}**. "
-                f"Press **Fetch** to refresh, or **Load from Cache** to reuse."
-            )
-            _fb1, _fb2, _fb3 = st.columns(3)
-            _do_fetch = _fb1.button(
-                "🔄 Fetch Fresh Data", key="hltv_btn_fresh",
-                use_container_width=True,
-            )
-            _do_load_cache = _fb2.button(
-                "💾 Load from Cache", key="hltv_btn_cache",
-                use_container_width=True, type="primary",
-            )
-            _do_clear = _fb3.button(
-                "🗑️ Clear Cache", key="hltv_btn_clear",
-                use_container_width=True,
-            )
+            if st.form_submit_button("➕ Queue Match", use_container_width=True, type="primary"):
+                st.session_state.hyp_matches.append({
+                    "date":         datetime.combine(match_date, datetime.min.time()),
+                    "winner":       winner,
+                    "loser":        loser,
+                    "event":        event_name,
+                    "prize_pool":   float(prize_pool),
+                    "winner_prize": 0.0,
+                    "loser_prize":  0.0,
+                    "is_lan":       is_lan,
+                })
+                st.success(f"✅ Queued: **{winner}** def. **{loser}**")
 
-            if _do_clear:
-                clear_cache(_sd_str, _ed_str)
-                st.session_state.hltv_df = pd.DataFrame()
-                st.success("Cache cleared.")
-                st.rerun()
+    with _form_right:
+        with st.form("add_prize"):
+            st.subheader("🏅 Add Hypothetical Prize Earning")
+            p1, p2 = st.columns(2)
+            prize_team   = p1.selectbox("🏆 Team", all_teams, index=0)
+            prize_amount = p2.number_input("💵 Prize (USD)", 1_000, 2_000_000, 50_000, 1_000)
+            p3, p4 = st.columns(2)
+            prize_event  = p3.text_input("🏟️ Event", value="Hypothetical Event")
+            prize_date   = p4.date_input("📅 Tournament End Date", value=datetime(2026, 3, 20))
 
-            if _do_load_cache:
-                _cached = load_from_cache(_sd_str, _ed_str)
-                if _cached is not None:
-                    st.session_state.hltv_df = _cached
-                    st.success(f"Loaded **{len(_cached)}** series from cache.")
-                    st.rerun()
-        else:
-            st.caption("No disk cache for this date range. Press **Fetch** to load data.")
-            _do_fetch        = st.button(
-                "🌐 Fetch HLTV Matches", key="hltv_btn_fetch",
-                type="primary", use_container_width=False,
-            )
-            _do_load_cache   = False
+            if st.form_submit_button("➕ Queue Prize", use_container_width=True, type="primary"):
+                st.session_state.hyp_prizes.append({
+                    "team":  prize_team,
+                    "prize": float(prize_amount),
+                    "event": prize_event,
+                    "date":  datetime.combine(prize_date, datetime.min.time()),
+                })
+                st.success(f"✅ Queued: **{prize_team}** earns **${prize_amount:,.0f}**")
 
-        # ── Live fetch ─────────────────────────────────────────────
-        if _do_fetch:
-            from data_loaders.hltv_loader import _MAX_PAGES as _MAX_HLTV_PAGES
-            _prog_bar  = st.progress(0, text="Connecting to HLTV…")
-            _prog_text = st.empty()
+    # ── Queue display: matches (left) and prizes (right) ──────────
+    _has_matches = bool(st.session_state.hyp_matches)
+    _has_prizes  = bool(st.session_state.hyp_prizes)
 
-            def _progress(page: int, total: int, status: str):
-                _prog_bar.progress(min(page / (_MAX_HLTV_PAGES + 1), 0.95), text=status)
-                _prog_text.caption(f"{total} map rows collected so far…")
-            try:
-                _hltv_result = fetch_hltv_matches(
-                    _sd_str, _ed_str,
-                    force_refresh=True,
-                    progress_callback=_progress,
-                )
-                _prog_bar.progress(1.0, text="Done.")
-                _prog_text.empty()
-                st.session_state.hltv_df = _hltv_result
-                if _hltv_result.empty:
-                    st.warning(
-                        "Fetch returned 0 series. "
-                        "HLTV may have returned no results for this date range, "
-                        "or all rows could not be parsed."
-                    )
-                else:
-                    st.success(
-                        f"✅ Fetched **{len(_hltv_result)} series** "
-                        f"({_hltv_result['is_lan'].sum()} LAN · "
-                        f"{(~_hltv_result['is_lan']).sum()} Online)."
-                    )
-                    st.rerun()
-            except RuntimeError as _e:
-                _prog_bar.empty()
-                _prog_text.empty()
-                st.error(f"⚠️ HLTV fetch failed: {_e}")
-            except Exception as _e:
-                _prog_bar.empty()
-                _prog_text.empty()
-                st.error(f"Unexpected error during HLTV fetch: {_e}")
+    if _has_matches or _has_prizes:
+        _ql, _qr = st.columns(2)
 
-        # ── Preview & inject ───────────────────────────────────────
-        _hdf = st.session_state.hltv_df
-        if not _hdf.empty:
-            _ranked_teams = set(base_standings["team"].tolist())
-            _hdf_view     = _hdf[_hdf["is_lan"]] if _hltv_lan_only else _hdf
-            _hdf_ranked   = _hdf[
-                _hdf["winner"].isin(_ranked_teams) & _hdf["loser"].isin(_ranked_teams)
-            ]
-            _hdf_view_ranked = _hdf_view[
-                _hdf_view["winner"].isin(_ranked_teams) & _hdf_view["loser"].isin(_ranked_teams)
-            ]
+        with _ql:
+            st.caption(f"Match queue — {len(st.session_state.hyp_matches)} series")
+            if _has_matches:
+                _qm = pd.DataFrame(st.session_state.hyp_matches)[
+                    ["winner", "loser", "event", "is_lan", "date"]]
+                _qm["date"] = pd.to_datetime(_qm["date"]).dt.strftime("%Y-%m-%d")
+                _qm.columns = ["Winner", "Loser", "Event", "LAN", "Date"]
+                st.dataframe(_qm, use_container_width=True, hide_index=True, height=200)
 
-            # Stats row
-            _si1, _si2, _si3, _si4 = st.columns(4)
-            _si1.metric("Total series",   len(_hdf))
-            _si2.metric("LAN series",     int(_hdf["is_lan"].sum()))
-            _si3.metric("Ranked-team series", len(_hdf_ranked),
-                        help="Both winner and loser appear in the current Valve standings.")
-            _si4.metric("Events", _hdf["event"].nunique())
+        with _qr:
+            st.caption(f"Prize queue — {len(st.session_state.hyp_prizes)} entries")
+            if _has_prizes:
+                _qp = pd.DataFrame(st.session_state.hyp_prizes)[["team", "prize", "event", "date"]]
+                _qp["date"]  = pd.to_datetime(_qp["date"]).dt.strftime("%Y-%m-%d")
+                _qp["prize"] = _qp["prize"].apply(lambda x: f"${x:,.0f}")
+                _qp.columns = ["Team", "Prize", "Event", "Date"]
+                st.dataframe(_qp, use_container_width=True, hide_index=True, height=200)
 
-            # Preview table
-            _preview = _hdf_view[["date", "winner", "loser", "event", "prize_pool", "is_lan"]].copy()
-            _preview["date"]       = _preview["date"].dt.strftime("%Y-%m-%d")
-            _preview["prize_pool"] = _preview["prize_pool"].apply(
-                lambda x: f"${x:,.0f}" if x else "—"
-            )
-            _preview.columns = ["Date", "Winner", "Loser", "Event", "Prize Pool", "LAN"]
-            st.dataframe(_preview, use_container_width=True, hide_index=True, height=260)
-
-            st.markdown("**Inject into simulator queue:**")
-            _ij1, _ij2, _ij3 = st.columns(3)
-
-            if _ij1.button("➕ All series", use_container_width=True, key="hltv_inj_all"):
-                _records = _hdf.to_dict("records")
-                st.session_state.hyp_matches.extend(_records)
-                st.success(f"Injected {len(_records)} series into the queue.")
-                st.rerun()
-
-            if _ij2.button(
-                "➕ Ranked teams only", use_container_width=True, key="hltv_inj_ranked",
-                help="Only injects series where both teams appear in the current Valve standings.",
-            ):
-                _records = _hdf_ranked.to_dict("records")
-                st.session_state.hyp_matches.extend(_records)
-                st.success(f"Injected {len(_records)} series (ranked teams only).")
-                st.rerun()
-
-            if _ij3.button(
-                "➕ LAN + Ranked only", use_container_width=True, key="hltv_inj_lan_ranked",
-                help="Only LAN series between two ranked teams — the highest-signal matches for VRS.",
-            ):
-                _lan_ranked = _hdf[
-                    _hdf["is_lan"]
-                    & _hdf["winner"].isin(_ranked_teams)
-                    & _hdf["loser"].isin(_ranked_teams)
-                ]
-                _records = _lan_ranked.to_dict("records")
-                st.session_state.hyp_matches.extend(_records)
-                st.success(f"Injected {len(_records)} LAN series (ranked teams only).")
-                st.rerun()
-
-        st.markdown("---")
-
-    # ── Input form ────────────────────────────────────────────────
-    with st.form("add_match"):
-        st.subheader("➕ Add a Hypothetical Match")
-        c1, c2, c3 = st.columns(3)
-        winner = c1.selectbox("🏆 Winner", all_teams, index=all_teams.index("G2"))
-        loser  = c2.selectbox("❌ Loser",
-                              [t for t in all_teams if t != winner],
-                              index=0)
-        event_name = c3.text_input("🏟️ Event", value="Hypothetical Event")
-
-        c4, c5, c6, c7 = st.columns(4)
-        prize_pool   = c4.number_input("💵 Prize Pool (USD)", 10_000, 2_000_000, 250_000, 10_000)
-        winner_pct   = c5.slider("🥇 Winner %", 10, 60, 35)
-        loser_pct    = c6.slider("🥈 Loser %",  0, 30, 20)
-        is_lan       = c7.toggle("🖥️ LAN?", value=True)
-        match_date   = st.date_input("📅 Match Date", value=datetime(2026, 3, 20))
-
-        if st.form_submit_button("➕ Queue Match", use_container_width=True, type="primary"):
-            pool = float(prize_pool)
-            st.session_state.hyp_matches.append({
-                "date":         datetime.combine(match_date, datetime.min.time()),
-                "winner":       winner,
-                "loser":        loser,
-                "event":        event_name,
-                "prize_pool":   pool,
-                "winner_prize": pool * winner_pct / 100,
-                "loser_prize":  pool * loser_pct  / 100,
-                "is_lan":       is_lan,
-            })
-            st.success(f"✅ Added: **{winner}** def. **{loser}**")
-
-    # ── Queue display ─────────────────────────────────────────────
-    if st.session_state.hyp_matches:
-        q = pd.DataFrame(st.session_state.hyp_matches)[
-            ["winner", "loser", "event", "prize_pool", "is_lan", "date"]]
-        q.columns = ["Winner", "Loser", "Event", "Prize Pool", "LAN", "Date"]
-        q["Prize Pool"] = q["Prize Pool"].apply(lambda x: f"${x:,.0f}")
-        st.dataframe(q, use_container_width=True, hide_index=True)
-
-        ca, cb = st.columns([3, 1])
-        if cb.button("🗑️ Clear Queue", use_container_width=True):
+        _btn_row_l, _btn_row_r = st.columns([3, 1])
+        if _btn_row_r.button("🗑️ Clear All Queues", use_container_width=True):
             st.session_state.hyp_matches = []
+            st.session_state.hyp_prizes  = []
             st.rerun()
 
-        if ca.button("🚀 Simulate & Compare", use_container_width=True, type="primary"):
+        if _btn_row_l.button("🚀 Simulate & Compare", use_container_width=True, type="primary"):
             with st.spinner("Recalculating full VRS…"):
-                hyp_df       = pd.DataFrame(st.session_state.hyp_matches)
-                new_standings = compute_standings(extra_matches=hyp_df)
+                hyp_df        = pd.DataFrame(st.session_state.hyp_matches) if _has_matches else pd.DataFrame()
+                hyp_prizes    = st.session_state.hyp_prizes
+                new_standings = compute_standings(extra_matches=hyp_df, extra_prizes=hyp_prizes)
 
             if new_standings.empty:
                 st.warning("Not enough data to compute standings with the queued matches.")
@@ -1172,7 +1374,7 @@ elif page == "🔮 Scenario Simulator":
             merged["points_delta"] = merged["total_points_new"] - merged["total_points_old"]
             merged = merged.sort_values("rank_new")
 
-            affected = set(hyp_df["winner"].tolist() + hyp_df["loser"].tolist())
+            affected = set(hyp_df["winner"].tolist() + hyp_df["loser"].tolist()) if not hyp_df.empty else set()
 
             rows = []
             for _, row in merged.iterrows():
@@ -3002,17 +3204,17 @@ elif page == "🔍 Team Breakdown":
 
     # ── Original values for delta display (sim mode) ──────────────
     _orig_ex = None
-    if sim_active and sel_team in original_standings["team"].values:
+    if (mode_active == "updated") and sel_team in original_standings["team"].values:
         _orig_matches = original_standings[original_standings["team"] == sel_team].sort_values("rank")
         _orig_ex = _orig_matches.iloc[0]
 
-    if sim_active:
+    if (mode_active == "updated"):
         st.markdown(
-            '<div style="background:#1a1040;border:1px solid #7c3aed;border-radius:8px;'
-            'padding:10px 14px;font-size:12px;color:#c4b5fd;margin-bottom:12px;">'
-            '🔮 <strong>Simulation active</strong> — All values reflect the '
-            f'simulated cutoff ({sim_cutoff_dt.strftime("%b %d, %Y")}). '
-            'Age weights, H2H adjustments, and factor scores are fully recalculated.'
+            '<div style="background:#0d3d1a;border:1px solid #3fb950;border-radius:8px;'
+            'padding:10px 14px;font-size:12px;color:#56d364;margin-bottom:12px;">'
+            '📡 <strong>Updated to today</strong> — All values reflect standings as of '
+            f'{cutoff_dt.strftime("%b %d, %Y")}. '
+            'Age weights, H2H adjustments, and factor scores are fully recalculated with live data.'
             '</div>',
             unsafe_allow_html=True,
         )
@@ -3029,14 +3231,14 @@ elif page == "🔍 Team Breakdown":
         return f' <span style="color:{c};font-size:{fs};font-weight:600">({d:{fmt}})</span>'
 
     def _eff_age(m):
-        """Return the effective age weight for a match (sim-aware)."""
-        if sim_active:
+        """Return the effective age weight for a match (mode-aware)."""
+        if (mode_active == "updated"):
             return age_weight(m["date"], sim_cutoff_dt)
         return m["age_w"]
 
     def _eff_h2h(m, team):
         """Return the effective H2H adjustment for a match (sim-aware)."""
-        if sim_active:
+        if mode_active == "updated":
             mid = m.get("match_id")
             if mid in sim_match_h2h:
                 entry = sim_match_h2h[mid]
@@ -3159,7 +3361,7 @@ elif page == "🔍 Team Breakdown":
             # ── Waterfall chart ────────────────────────────────
 
             _old_label = _gd["cutoff_datetime"].strftime("%b")
-            _new_label = sim_cutoff_dt.strftime("%b")
+            _new_label = cutoff_dt.strftime("%b")
             _wf_labels = [
                 f"{_old_label} Score<br><b>{_orig_ex['total_points']:,.0f}</b>",
                 "🏆 BO",
@@ -3236,7 +3438,7 @@ elif page == "🔍 Team Breakdown":
 
             # Lerp context data
             _orig_pool = original_standings["team"].nunique()
-            _sim_pool  = base_standings[~base_standings["team"].isin(_sim_dup_teams)]["team"].nunique()
+            _sim_pool  = base_standings["team"].nunique()
             _dropped   = max(0, _orig_pool - _sim_pool)
             _orig_min_avg = original_standings["seed_combined"].min()
             _orig_max_avg = original_standings["seed_combined"].max()
@@ -3297,10 +3499,10 @@ When the eligible pool changes (teams drop out due to inactivity or window expir
                 _disp_bo = []
                 for bp in bo_prizes:
                     bp_copy = dict(bp)
-                    if sim_active:
+                    if mode_active == "updated":
                         try:
                             dt = datetime.strptime(str(bp["event_date"]).strip(), "%Y-%m-%d")
-                            bp_copy["age_weight"] = age_weight(dt, sim_cutoff_dt)
+                            bp_copy["age_weight"] = age_weight(dt, cutoff_dt)
                             bp_copy["scaled_prize"] = bp["prize_won"] * bp_copy["age_weight"]
                         except Exception:
                             pass
@@ -3543,15 +3745,17 @@ When the eligible pool changes (teams drop out due to inactivity or window expir
         if raw_ms:
             # Filter to matches in the sim window if active
             _h2h_ms = raw_ms
-            if sim_active:
+            if mode_active == "updated":
                 _new_ws = sim_cutoff_dt - timedelta(days=DECAY_DAYS)
                 _h2h_ms = [m for m in raw_ms if _new_ws <= m["date"] <= sim_cutoff_dt]
 
             m_rows = []
             total_h2h = 0.0
+            h2h_match_ids = []  # DEBUG: track which matches contribute to total
             for m in sorted(_h2h_ms, key=lambda x: x["date"], reverse=True):
                 h2h      = _eff_h2h(m, sel_team)
                 total_h2h += h2h
+                h2h_match_ids.append((m.get("match_id"), h2h))  # DEBUG
                 is_win   = m["result"] == "W"
                 aw_disp  = _eff_age(m)
                 res_b    = (
@@ -3592,6 +3796,23 @@ When the eligible pool changes (teams drop out due to inactivity or window expir
                 f'<span>Total H2H: <strong style="color:{h2h_col}">{total_h2h:+.1f} pts</strong></span></div>',
                 unsafe_allow_html=True
             )
+
+            # DEBUG: Compare standings vs table
+            if mode_active == "updated":
+                standings_h2h = base_standings.loc[base_standings["team"] == sel_team, "h2h_delta"].values
+                if len(standings_h2h) > 0:
+                    standings_h2h_val = standings_h2h[0]
+                    with st.expander("🔧 DEBUG: H2H Diagnostics"):
+                        st.metric("Standings h2h_delta", f"{standings_h2h_val:.1f}")
+                        st.metric("Table Total H2H", f"{total_h2h:.1f}")
+                        st.metric("Difference", f"{standings_h2h_val - total_h2h:.1f}")
+                        st.metric("Matches displayed", len(_h2h_ms))
+                        st.metric("sim_match_h2h size", len(sim_match_h2h))
+
+                        # Show which matches have 0 H2H
+                        zero_h2h = [mid for mid, h2h in h2h_match_ids if h2h == 0.0]
+                        if zero_h2h:
+                            st.warning(f"⚠️ {len(zero_h2h)} matches have 0 H2H (not in sim_match_h2h): {zero_h2h[:10]}")
         else:
             st.info("No match history available.")
 
@@ -3633,7 +3854,7 @@ When the eligible pool changes (teams drop out due to inactivity or window expir
             hist_df = _load_team_history(sel_team, tuple(_hist_dates))
 
         # ── Append simulated data point if sim is active ─────────
-        if sim_active and not hist_df.empty and sel_team in base_standings["team"].values:
+        if (mode_active == "updated") and not hist_df.empty and sel_team in base_standings["team"].values:
             _sim_row = base_standings[base_standings["team"] == sel_team].iloc[0]
             sim_point = {
                 "date":         sim_cutoff_dt,

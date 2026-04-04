@@ -2,12 +2,15 @@
 GitHub Data Loader
 
 Fetches live VRS data from Valve's public GitHub repository.
+Includes disk caching to avoid repeated GitHub fetches.
 """
 
 import requests
 import json
+import pickle
 import re as _re
-from datetime import datetime
+import os
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 
@@ -17,6 +20,77 @@ GITHUB_API = ("https://api.github.com/repos/ValveSoftware/"
               "counter-strike_regional_standings/contents")
 GH_FOLDER = "invitation"
 GH_WORKERS = 20
+GH_CACHE_DIR = "cache/github_vrs"
+GH_CACHE_TTL_HOURS = 2  # Keep cache for 2 hours before re-fetching
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cache Management
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _ensure_cache_dir():
+    """Ensure cache directory exists."""
+    os.makedirs(GH_CACHE_DIR, exist_ok=True)
+
+
+def _get_cache_path(date_str: str, year: str) -> str:
+    """Get cache file path for a given date/year snapshot."""
+    _ensure_cache_dir()
+    return os.path.join(GH_CACHE_DIR, f"vrs_{year}_{date_str}.json")
+
+
+def _load_from_cache(date_str: str, year: str) -> dict | None:
+    """Load cached VRS data if it exists and is fresh."""
+    cache_path = _get_cache_path(date_str, year).replace('.json', '.pkl')
+
+    if not os.path.exists(cache_path):
+        return None
+
+    try:
+        mtime = datetime.fromtimestamp(os.path.getmtime(cache_path))
+        age_hours = (datetime.now() - mtime).total_seconds() / 3600
+
+        if age_hours > GH_CACHE_TTL_HOURS:
+            return None  # Cache is stale
+
+        with open(cache_path, 'rb') as f:
+            return pickle.load(f)
+    except Exception:
+        return None
+
+
+def _save_to_cache(date_str: str, year: str, data: dict):
+    """Save VRS data to cache using pickle (handles DataFrames)."""
+    cache_path = _get_cache_path(date_str, year).replace('.json', '.pkl')
+    try:
+        with open(cache_path, 'wb') as f:
+            pickle.dump(data, f)
+    except Exception:
+        pass  # Silently fail cache write
+
+
+def github_cache_exists(date_str: str, year: str) -> bool:
+    """Check if fresh cache exists."""
+    return _load_from_cache(date_str, year) is not None
+
+
+def github_cache_clear(date_str: str | None = None, year: str | None = None):
+    """Clear GitHub cache. If date/year provided, clear only that entry. Otherwise clear all."""
+    if date_str and year:
+        cache_path = _get_cache_path(date_str, year)
+        try:
+            os.remove(cache_path)
+        except Exception:
+            pass
+    else:
+        # Clear entire cache directory
+        try:
+            import shutil
+            if os.path.exists(GH_CACHE_DIR):
+                shutil.rmtree(GH_CACHE_DIR)
+            _ensure_cache_dir()
+        except Exception:
+            pass
 
 
 def _gh_get(url: str, timeout: int = 12) -> str | None:
@@ -261,6 +335,12 @@ def load_valve_github_data(date_str: str | None = None,
         result["error"] = "GitHub unreachable — using fallback data"
         return result
 
+    # Check cache first (before GitHub fetch)
+    cached = _load_from_cache(date_str, year)
+    if cached:
+        cached["source"] = "github_cache"
+        return cached
+
     idx_url = f"{GITHUB_RAW}/{GH_FOLDER}/{year}/standings_global_{date_str}.md"
     idx_text = _gh_get(idx_url)
     if not idx_text:
@@ -325,7 +405,21 @@ def load_valve_github_data(date_str: str | None = None,
         "flag":          "🌍",
         "color":         "#58a6ff",
     } for d in parsed]
-    _bo_prizes_map: dict[str, list] = {d["team"]: d.get("bo_prizes", []) for d in parsed}
+    # For teams with multiple roster versions (roster splits), always use the
+    # best-ranked (active) roster's match and prize data.  The simple dict
+    # comprehension would otherwise keep whichever entry was fetched last,
+    # which is non-deterministic because of ThreadPoolExecutor — and picking
+    # the inactive roster's match history causes massive wrong point drops in
+    # the "Updated to Today" simulation.
+    _team_best: dict[str, tuple] = {}  # team_name → (rank, matches, bo_prizes)
+    for d in parsed:
+        name, rank = d["team"], d["rank"]
+        if name not in _team_best or rank < _team_best[name][0]:
+            _team_best[name] = (rank, d.get("matches", []), d.get("bo_prizes", []))
+
+    _bo_prizes_map: dict[str, list] = {
+        name: v[2] for name, v in _team_best.items()
+    }
 
     standings_df = (pd.DataFrame(rows)
                     .sort_values("rank")
@@ -357,7 +451,7 @@ def load_valve_github_data(date_str: str | None = None,
         cutoff_dt_p = datetime(2026, 3, 2)
 
     team_match_history: dict[str, list[dict]] = {
-        d["team"]: d.get("matches", []) for d in parsed
+        name: v[1] for name, v in _team_best.items()
     }
 
     result.update({
@@ -371,4 +465,8 @@ def load_valve_github_data(date_str: str | None = None,
         "source":             "github",
         "error":              None,
     })
+
+    # Cache the result for next time
+    _save_to_cache(date_str, year, result)
+
     return result
