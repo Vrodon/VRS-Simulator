@@ -126,10 +126,6 @@ from vrs_engine import (
 from data_loaders import load_valve_github_data
 from data_loaders.github_loader import _find_all_dates
 from data_loaders import (
-    fetch_hltv_matches, load_from_cache,
-    cache_exists, cache_mtime, clear_cache,
-)
-from data_loaders import (
     fetch_liquipedia_matches,
     load_liquipedia_from_cache,
     liquipedia_cache_exists,
@@ -189,7 +185,6 @@ with st.sidebar:
         "📊 Ranking Dashboard",
         "🔍 Team Breakdown",
         "🔮 What-If Predictor",
-        "⚔️ Team Comparison",
     ], label_visibility="collapsed", key="main_nav")
     st.markdown("---")
 
@@ -1438,168 +1433,7 @@ elif page == "🔮 What-If Predictor":
 
 
 # ══════════════════════════════════════════════════════════════════
-# PAGE 3  ·  TEAM COMPARISON
-# ══════════════════════════════════════════════════════════════════
-
-elif page == "⚔️ Team Comparison":
-    st.title("⚔️ Team Comparison")
-
-    all_ranked = base_standings["team"].tolist()
-    default_a  = all_ranked.index("Vitality") if "Vitality" in all_ranked else 0
-    default_b  = all_ranked.index("NAVI")     if "NAVI"     in all_ranked else 1
-
-    ca, cb = st.columns(2)
-    team_a = ca.selectbox("Team A", all_ranked, index=default_a)
-    team_b = cb.selectbox("Team B", all_ranked, index=default_b)
-
-    def team_row(name):
-        r = base_standings[base_standings["team"] == name]
-        return r.iloc[0].to_dict() if not r.empty else {}
-
-    a, b = team_row(team_a), team_row(team_b)
-    if not a or not b:
-        st.warning("One or both teams not found in standings.")
-        st.stop()
-
-    st.markdown("---")
-
-    # ── Score cards ───────────────────────────────────────────────
-    def score_card(data, name, border_color, meta):
-        return f"""
-        <div style="text-align:center; padding:20px; background:#161b22;
-                    border-radius:12px; border:2px solid {border_color};">
-          <div style="font-size:36px">{meta.get('flag','🌍')}</div>
-          <div style="font-size:22px; font-weight:700; color:#c9d1d9; margin:8px 0">{name}</div>
-          <div style="font-size:12px; color:#8b949e">{meta.get('region','')}</div>
-          <div style="font-size:34px; font-weight:700; color:{border_color}; margin-top:10px">
-              {data['total_points']:,.1f}
-          </div>
-          <div style="color:#8b949e; font-size:12px">Total VRS Points</div>
-          <div style="font-size:15px; color:#8b949e; margin-top:4px">
-              Seed: <strong style="color:#79c0ff">{data['seed']:,.0f}</strong> &nbsp;+&nbsp;
-              H2H: <strong style="color:{'#3fb950' if data['h2h_delta']>=0 else '#f85149'}">
-              {data['h2h_delta']:+.0f}</strong>
-          </div>
-          <div style="font-size:18px; font-weight:600; color:#f0b429; margin-top:10px">
-              #{int(data['rank'])} Global &nbsp;·&nbsp;
-              #{int(data['regional_rank'])} {meta.get('region','')}
-          </div>
-        </div>"""
-
-    cc1, cc2, cc3 = st.columns([5, 1, 5])
-    with cc1:
-        st.markdown(score_card(a, team_a, "#58a6ff", TEAM_META.get(team_a, {})),
-                    unsafe_allow_html=True)
-    with cc2:
-        st.markdown("<div style='text-align:center;font-size:26px;font-weight:700;"
-                    "color:#8b949e;padding-top:60px'>VS</div>", unsafe_allow_html=True)
-    with cc3:
-        st.markdown(score_card(b, team_b, "#f85149", TEAM_META.get(team_b, {})),
-                    unsafe_allow_html=True)
-
-    st.markdown("---")
-
-    # ── Factor breakdown ──────────────────────────────────────────
-    pillars = ["bo_factor", "bc_factor", "on_factor", "lan_factor"]
-    labels  = ["Bounty Offered", "Bounty Collected", "Opp. Network", "LAN Wins"]
-    a_vals  = [a[p] for p in pillars]
-    b_vals  = [b[p] for p in pillars]
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.subheader("🕸️ Factor Radar")
-        fig_r = go.Figure()
-        fig_r.add_trace(go.Scatterpolar(
-            r=a_vals + [a_vals[0]], theta=labels + [labels[0]],
-            fill="toself", name=team_a,
-            line_color="#58a6ff", fillcolor="rgba(88,166,255,0.12)",
-        ))
-        fig_r.add_trace(go.Scatterpolar(
-            r=b_vals + [b_vals[0]], theta=labels + [labels[0]],
-            fill="toself", name=team_b,
-            line_color="#f85149", fillcolor="rgba(248,81,73,0.12)",
-        ))
-        fig_r.update_layout(
-            polar=dict(
-                radialaxis=dict(visible=True, range=[0, 1], gridcolor="#30363d", color="#8b949e"),
-                angularaxis=dict(gridcolor="#30363d", color="#8b949e"),
-                bgcolor="#161b22",
-            ),
-            paper_bgcolor="rgba(0,0,0,0)", font=dict(color="#c9d1d9"),
-            legend=dict(orientation="h", yanchor="bottom", y=-0.15, xanchor="center", x=0.5),
-            height=400, margin=dict(l=10, r=10, t=10, b=40),
-        )
-        st.plotly_chart(fig_r, use_container_width=True, config={"staticPlot": True})
-
-    with col2:
-        st.subheader("📊 Raw Factor Scores")
-        raw_labels = ["Bounty Offered\n(raw USD×stakes)",
-                      "Bounty Collected\n(sum opp. BO)",
-                      "Opp. Network\n(sum t_mod)",
-                      "LAN Wins\n(count)"]
-        raw_cols = ["bo_sum", "bc_pre_curve", "on_factor", "lan_wins"]
-        fig_b = go.Figure()
-        fig_b.add_trace(go.Bar(
-            name=team_a, x=labels,
-            y=[a[c] for c in raw_cols],
-            marker_color="#58a6ff",
-            text=[f"{a[c]:.2f}" for c in raw_cols], textposition="outside",
-        ))
-        fig_b.add_trace(go.Bar(
-            name=team_b, x=labels,
-            y=[b[c] for c in raw_cols],
-            marker_color="#f85149",
-            text=[f"{b[c]:.2f}" for c in raw_cols], textposition="outside",
-        ))
-        fig_b.update_layout(
-            barmode="group",
-            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-            font=dict(color="#c9d1d9"),
-            xaxis=dict(gridcolor="#21262d"),
-            yaxis=dict(gridcolor="#21262d"),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            height=400, margin=dict(l=10, r=10, t=40, b=10),
-        )
-        st.plotly_chart(fig_b, use_container_width=True, config={"staticPlot": True})
-
-    # ── H2H record ────────────────────────────────────────────────
-    st.markdown("---")
-    st.subheader("🤝 Head-to-Head Record (in dataset)")
-    h2h_df = base_matches[
-        ((base_matches["winner"] == team_a) & (base_matches["loser"] == team_b)) |
-        ((base_matches["winner"] == team_b) & (base_matches["loser"] == team_a))
-    ].sort_values("date", ascending=False)
-
-    if h2h_df.empty:
-        st.info(f"No direct matches between **{team_a}** and **{team_b}** in the dataset.")
-    else:
-        a_wins = int((h2h_df["winner"] == team_a).sum())
-        b_wins = int((h2h_df["winner"] == team_b).sum())
-        h1, h2, h3 = st.columns(3)
-        h1.metric(f"{team_a} Wins", a_wins)
-        h2.metric("Matches", len(h2h_df))
-        h3.metric(f"{team_b} Wins", b_wins)
-
-        disp = h2h_df[["date", "winner", "loser", "event", "prize_pool", "is_lan"]].copy()
-        disp["date"]       = disp["date"].dt.strftime("%Y-%m-%d")
-        disp["prize_pool"] = disp["prize_pool"].apply(lambda x: f"${x:,.0f}")
-        disp.columns = ["Date", "Winner", "Loser", "Event", "Prize Pool", "LAN"]
-        st.dataframe(disp, use_container_width=True, hide_index=True)
-
-    # ── Stat comparison ───────────────────────────────────────────
-    st.markdown("---")
-    st.subheader("📈 Stats Comparison")
-    s1, s2, s3, s4 = st.columns(4)
-    s1.metric(f"{team_a} Wins",    int(a["wins"]))
-    s2.metric(f"{team_a} Losses",  int(a["losses"]))
-    s3.metric(f"{team_b} Wins",    int(b["wins"]))
-    s4.metric(f"{team_b} Losses",  int(b["losses"]))
-
-
-
-# ══════════════════════════════════════════════════════════════════
-# PAGE 4  ·  HOW VRS WORKS  (Explainer — v3, formula-verified)
+# PAGE 3  ·  HOW VRS WORKS  (Explainer — v3, formula-verified)
 # ══════════════════════════════════════════════════════════════════
 
 elif page == "📖 How VRS Works":
@@ -3183,7 +3017,7 @@ $$\text{Factor Score} = 400 + \frac{0.846 - 0.000}{0.846 - 0.000} \times 1600 = 
     # ══════════════════════════════════════════════════════════════
 
 # ══════════════════════════════════════════════════════════════════
-# PAGE 5  ·  TEAM BREAKDOWN
+# PAGE 4  ·  TEAM BREAKDOWN
 # ══════════════════════════════════════════════════════════════════
 
 

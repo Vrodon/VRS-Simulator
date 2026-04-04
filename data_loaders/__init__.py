@@ -9,13 +9,6 @@ from .github_loader import (
     github_cache_exists,
     github_cache_clear,
 )
-from .hltv_loader import (
-    fetch_hltv_matches,
-    load_from_cache,
-    cache_exists,
-    cache_mtime,
-    clear_cache,
-)
 from .liquipedia_loader import (
     fetch_liquipedia_matches,
     search_tournaments as search_liquipedia_tournaments,
@@ -31,11 +24,6 @@ __all__ = [
     "find_latest_date",
     "github_cache_exists",
     "github_cache_clear",
-    "fetch_hltv_matches",
-    "load_from_cache",
-    "cache_exists",
-    "cache_mtime",
-    "clear_cache",
     "fetch_liquipedia_matches",
     "search_liquipedia_tournaments",
     "discover_liquipedia_from_portal",
