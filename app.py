@@ -1930,7 +1930,7 @@ scores to teams that are orders of magnitude below the top.
                                        "aw": _aw, "ew": _ew, "entry": _entry})
                     _calcs.sort(key=lambda x: x["entry"], reverse=True)
                     _top10   = _calcs[:10]
-                    _bc_pre  = sum(x["entry"] for x in _top10) / 10
+                    _bc_pre  = sum(x["entry"] for x in _top10) / len(_top10) if _top10 else 0.0
                     _bc_val  = curve(_bc_pre) if _bc_pre > 0 else 0.0
                     st.session_state.bc_sim_result = {
                         "calcs": _calcs, "top10": _top10,
@@ -1974,7 +1974,7 @@ scores to teams that are orders of magnitude below the top.
                     f'<span style="font-size:12px;color:#8b949e;">① Sum top {min(10, len(_r["calcs"]))}</span>'
                     f'<span style="font-size:13px;font-weight:700;color:#c9d1d9;">{sum(x["entry"] for x in _r["top10"]):.4f}</span></div>'
                     f'<div style="display:flex;justify-content:space-between;">'
-                    f'<span style="font-size:12px;color:#8b949e;">② BC_pre = &#x3A3; / 10</span>'
+                    f'<span style="font-size:12px;color:#8b949e;">② BC_pre = &#x3A3; / {len(_r["top10"])}</span>'
                     f'<span style="font-size:13px;font-weight:700;color:#c9d1d9;">{_r["bc_pre"]:.4f}</span></div>'
                     f'<div style="display:flex;justify-content:space-between;align-items:center;border-top:1px solid #30363d;padding-top:8px;">'
                     f'<span style="font-size:12px;color:#8b949e;">③ BC = curve({_r["bc_pre"]:.4f})</span>'
@@ -1990,15 +1990,26 @@ scores to teams that are orders of magnitude below the top.
     with tab_on2:
         st.subheader("🕸️ Factor 3 — Opponent Network")
 
-        if "on_sim_entries" not in st.session_state:
-            st.session_state.on_sim_entries = [
-                {"opponent": "NAVI",       "opp_on": 0.622, "pool": 1_000_000, "days_ago":  5},
-                {"opponent": "MOUZ",       "opp_on": 0.460, "pool":   500_000, "days_ago": 20},
-            ]
-        if "on_sim_result" not in st.session_state:
-            st.session_state.on_sim_result = None
+        _ON_PRESET_TEAMS = ["Vitality","FaZe","MOUZ","Mongolz","Spirit"]
+        _ON_PRESET_BO    = [1.0, 0.85, 0.70, 0.60, 0.50]
+        _ON_PRESET_STRICT_WINS = [
+            ("Vitality","FaZe"),("Vitality","MOUZ"),("Vitality","Mongolz"),("Vitality","Spirit"),
+            ("FaZe","MOUZ"),("FaZe","Mongolz"),("FaZe","Spirit"),
+            ("MOUZ","Mongolz"),("MOUZ","Spirit"),
+            ("Mongolz","Spirit"),
+        ]
+        if "on_net_teams" not in st.session_state:
+            st.session_state.on_net_teams = _ON_PRESET_TEAMS[:]
+        if "on_net_bo" not in st.session_state:
+            st.session_state.on_net_bo = _ON_PRESET_BO[:]
+        if "on_net_wins" not in st.session_state:
+            st.session_state.on_net_wins = list(_ON_PRESET_STRICT_WINS)
+        if "on_net_iter" not in st.session_state:
+            st.session_state.on_net_iter = 6
+        if "on_net_focus" not in st.session_state:
+            st.session_state.on_net_focus = "Vitality"
 
-        col_r, col_l = st.columns([2, 3])
+        col_r, col_l = st.columns([3, 2])
         with col_l:
             st.markdown(
                 '<div style="background:#0d0d1a;border:1px solid #484f58;border-radius:8px;'
@@ -2116,106 +2127,314 @@ scores to teams that are orders of magnitude below the top.
                 "Teams whose opponents have high ON scores see their own ON rise with each pass."
             )
 
+        def _compute_on_history(teams, bo_list, wins, n_iters=6, TOP_N=10):
+            """Simulate ON PageRank. Returns {iter_num: {team: on_value}}. age_w=1, no event weight."""
+            bo_dict = dict(zip(teams, bo_list))
+            history = {0: dict(bo_dict)}
+            current = dict(bo_dict)
+            for it in range(1, n_iters + 1):
+                new_vals = {}
+                for t in teams:
+                    beaten = [loser for (w, loser) in wins if w == t]
+                    entries = sorted([current[opp] for opp in beaten], reverse=True)[:TOP_N]
+                    new_vals[t] = sum(entries) / max(1, len(entries))
+                current = new_vals
+                history[it] = dict(current)
+            return history
+
         with col_r:
+            # ── Header ─────────────────────────────────────────────
             st.markdown(
-                '<div style="background:#1a0f2e;border:1px solid #7c3aed;border-radius:8px;padding:12px 16px;margin-bottom:14px;font-size:18px;font-weight:600;color:#c4b5fd;text-align:center;">✏️ <strong>Try it yourself!</strong>'
-                '</div>',
+                '<div style="background:#1a0f2e;border:1px solid #7c3aed;border-radius:8px;'
+                'padding:12px 16px;margin-bottom:12px;font-size:18px;font-weight:600;'
+                'color:#c4b5fd;text-align:center;">🕸️ <strong>Network Sandbox</strong></div>',
                 unsafe_allow_html=True)
-            st.markdown("#### Build an opponent network")
-            st.caption("The opp. ON values you enter represent those opponents' converged ON scores.")
+            st.caption("Build a match network and watch ON scores propagate through it over 6 iterations. "
+                       "Age and event weights are omitted here — pure network intuition.")
 
-            with st.form("on_add_form", clear_on_submit=True):
-                _oc1, _oc2 = st.columns(2)
-                _oopp   = _oc1.text_input("Opponent", placeholder="MOUZ")
-                _ooppon = _oc2.slider("Opp. ON factor", 0.0, 1.0, 0.45, 0.01)
-                _oc3, _oc4 = st.columns(2)
-                _opool  = _oc3.number_input("Prize pool ($)", min_value=0,
-                                            max_value=2_000_000, value=500_000, step=50_000)
-                _odays  = _oc4.number_input("Days ago", min_value=0, max_value=179, value=20)
-                if st.form_submit_button("➕ Add win", use_container_width=True) and _oopp:
-                    st.session_state.on_sim_entries.append(
-                        {"opponent": _oopp, "opp_on": float(_ooppon),
-                         "pool": int(_opool), "days_ago": int(_odays)})
-                    st.session_state.on_sim_result = None
+            # ── Section 1: Starting seeds (one slider per team) ────
+            st.markdown("**① Starting scores** — each team's initial ON guess (= their BO value)")
+            _bo_cols = st.columns(len(st.session_state.on_net_teams))
+            for _ti, _tname in enumerate(st.session_state.on_net_teams):
+                _new_bo = _bo_cols[_ti].slider(
+                    _tname,
+                    0.01, 1.0,
+                    float(st.session_state.on_net_bo[_ti]),
+                    0.01,
+                    key=f"on_bo_{_ti}",
+                )
+                if _new_bo != st.session_state.on_net_bo[_ti]:
+                    st.session_state.on_net_bo[_ti] = _new_bo
 
-            if st.session_state.on_sim_entries:
-                for _i, _e in enumerate(st.session_state.on_sim_entries):
-                    _ec1, _ec2, _ec3 = st.columns([3, 4, 0.7])
-                    _ec1.markdown(f"<span style='font-size:12px'>vs {_e['opponent']}</span>",
-                                  unsafe_allow_html=True)
-                    _ec2.markdown(
-                        f"<span style='font-size:11px;color:#8b949e'>ON={_e['opp_on']:.2f} · ${_e['pool']:,} · {_e['days_ago']}d</span>",
+            st.markdown("---")
+
+            # ── Section 2: Match results ────────────────────────────
+            st.markdown("**② Match results** — who beat whom?")
+
+            # Randomise button — BO-weighted, every pair plays twice
+            if st.button("🎲 Randomise Results", key="preset_rng", type="primary"):
+                _rng_teams = _ON_PRESET_TEAMS[:]
+                _rng_bo    = _ON_PRESET_BO[:]
+                _rng_wins  = []
+                # Full round-robin: each pair plays twice, winner probability ∝ BO³
+                for _ri in range(len(_rng_teams)):
+                    for _rj in range(_ri + 1, len(_rng_teams)):
+                        _t1, _t2   = _rng_teams[_ri], _rng_teams[_rj]
+                        _bo_a, _bo_b = _rng_bo[_ri], _rng_bo[_rj]
+                        _p_a = _bo_a**3 / (_bo_a**3 + _bo_b**3)
+                        for _ in range(2):
+                            if np.random.random() < _p_a:
+                                _rng_wins.append((_t1, _t2))
+                            else:
+                                _rng_wins.append((_t2, _t1))
+                # Guarantee every team has at least 2 wins
+                _win_counts = {t: 0 for t in _rng_teams}
+                for _w, _l in _rng_wins:
+                    _win_counts[_w] += 1
+                for _t in _rng_teams:
+                    while _win_counts[_t] < 2:
+                        _opp = np.random.choice([x for x in _rng_teams if x != _t])
+                        _rng_wins.append((_t, _opp))
+                        _win_counts[_t] += 1
+                st.session_state.on_net_teams = _rng_teams
+                st.session_state.on_net_bo    = _rng_bo
+                st.session_state.on_net_wins  = _rng_wins
+                st.session_state.on_net_iter  = 6
+                st.session_state.on_net_focus = "Vitality"
+                st.rerun()
+
+            # Add-win row
+            _wa, _wb, _wc, _wd = st.columns([2.8, 0.7, 2.8, 1.3])
+            _win_from = _wa.selectbox(
+                "Winner", st.session_state.on_net_teams,
+                key="on_win_from", label_visibility="collapsed")
+            _wb.markdown(
+                '<div style="padding-top:8px;text-align:center;font-size:12px;'
+                'color:#8b949e;">beat</div>',
+                unsafe_allow_html=True)
+            _win_to = _wc.selectbox(
+                "Loser", st.session_state.on_net_teams,
+                key="on_win_to", label_visibility="collapsed")
+            _wd.markdown('<div style="height:4px"></div>', unsafe_allow_html=True)
+            if _wd.button("➕ Add", use_container_width=True, type="primary"):
+                if (_win_from != _win_to
+                        and (_win_from, _win_to) not in st.session_state.on_net_wins):
+                    st.session_state.on_net_wins.append((_win_from, _win_to))
+                    st.rerun()
+
+            # CSS: make delete buttons compact (scoped via secondary kind)
+            st.markdown(
+                "<style>"
+                "div[data-testid='stButton'] button[kind='secondaryFormSubmit'],"
+                "div[data-testid='stButton'] button[kind='secondary']{"
+                "padding:1px 4px!important;"
+                "min-height:22px!important;"
+                "height:22px!important;"
+                "font-size:10px!important;"
+                "line-height:1!important;"
+                "border-radius:4px!important;"
+                "}</style>",
+                unsafe_allow_html=True,
+            )
+
+            # Match grid — one column per team, wins with inline ✕
+            _wins_by_team = {}
+            for _widx, (_wf, _wl) in enumerate(st.session_state.on_net_wins):
+                _wins_by_team.setdefault(_wf, []).append((_widx, _wl))
+
+            _match_cols = st.columns(len(st.session_state.on_net_teams))
+            for _ci, _cteam in enumerate(st.session_state.on_net_teams):
+                with _match_cols[_ci]:
+                    st.markdown(
+                        f'<div style="font-size:11px;font-weight:600;color:#79c0ff;'
+                        f'padding-bottom:4px;border-bottom:1px solid #21262d;'
+                        f'margin-bottom:4px;">{_cteam}</div>',
                         unsafe_allow_html=True)
-                    if _ec3.button("✕", key=f"on_rm_{_i}"):
-                        st.session_state.on_sim_entries.pop(_i)
-                        st.session_state.on_sim_result = None
-                        st.rerun()
+                    _team_wins = _wins_by_team.get(_cteam, [])
+                    if _team_wins:
+                        for _widx2, _wopp in _team_wins:
+                            _wname_col, _wdel_col = st.columns([5, 1])
+                            _wname_col.markdown(
+                                f'<div style="font-size:11px;color:#c9d1d9;'
+                                f'padding:1px 0;white-space:nowrap;overflow:hidden;'
+                                f'text-overflow:ellipsis;">'
+                                f'<span style="color:#484f58;margin-right:3px;">›</span>'
+                                f'{_wopp}</div>',
+                                unsafe_allow_html=True)
+                            if _wdel_col.button("×", key=f"on_wdel_{_widx2}"):
+                                st.session_state.on_net_wins.pop(_widx2)
+                                st.rerun()
+                    else:
+                        st.markdown(
+                            '<div style="font-size:12px;color:#30363d;padding:2px 0;">—</div>',
+                            unsafe_allow_html=True)
 
-                st.markdown("---")
-                if st.button("🧮 Calculate Opponent Network", use_container_width=True,
-                             type="primary"):
-                    _now = datetime.now()
-                    _calcs = []
-                    for _e in st.session_state.on_sim_entries:
-                        _md    = _now - timedelta(days=_e["days_ago"])
-                        _aw    = age_weight(_md, _now)
-                        _ew    = event_stakes(max(_e["pool"], 1)) if _e["pool"] > 0 else 0.0
-                        _entry = _e["opp_on"] * _aw * _ew
-                        _calcs.append({"opponent": _e["opponent"], "opp_on": _e["opp_on"],
-                                       "aw": _aw, "ew": _ew, "entry": _entry})
-                    _calcs.sort(key=lambda x: x["entry"], reverse=True)
-                    _top10  = _calcs[:10]
-                    _on_val = sum(x["entry"] for x in _top10) / 10
-                    st.session_state.on_sim_result = {
-                        "calcs": _calcs, "top10": _top10, "on_val": _on_val,
-                    }
+            st.markdown("---")
 
-            if st.session_state.on_sim_result:
-                _r = st.session_state.on_sim_result
-                st.markdown("##### 📋 Step-by-step result")
-                _rows = ""
-                for _idx, _x in enumerate(_r["calcs"]):
-                    _top   = _idx < 10
-                    _bg    = "background:#0d1626" if _top else "background:#161b22;opacity:0.55"
-                    _badge = ('<span style="background:#79c0ff;color:#000;border-radius:3px;'
-                              'padding:0 4px;font-size:9px;font-weight:700;margin-left:4px;">TOP10</span>'
-                              if _top else '')
-                    _rows += (
-                        f'<tr style="{_bg}">'
-                        f'<td style="padding:5px 6px;font-size:11px;color:#c9d1d9">vs {_x["opponent"]}{_badge}</td>'
-                        f'<td style="padding:5px 6px;font-size:11px;color:#79c0ff;text-align:right">{_x["opp_on"]:.3f}</td>'
-                        f'<td style="padding:5px 6px;font-size:11px;color:#79c0ff;text-align:right">{_x["aw"]:.3f}</td>'
-                        f'<td style="padding:5px 6px;font-size:11px;color:#8b949e;text-align:right">{_x["ew"]:.3f}</td>'
-                        f'<td style="padding:5px 6px;font-size:11px;color:#79c0ff;font-weight:700;text-align:right">{_x["entry"]:.4f}</td>'
-                        f'</tr>'
+            # ── Compute full iteration history ──────────────────────
+            _on_history = _compute_on_history(
+                st.session_state.on_net_teams,
+                st.session_state.on_net_bo,
+                st.session_state.on_net_wins,
+            )
+
+            # ── Iteration slider ────────────────────────────────────
+            _iter_val = st.slider(
+                "③ Iteration  — drag to step through the algorithm",
+                0, 6,
+                st.session_state.on_net_iter,
+                help="Iter 0 = BO seeds (starting guess). Each step recomputes ON using the previous round's values.",
+            )
+            st.session_state.on_net_iter = _iter_val
+            _on_now = _on_history[_iter_val]
+
+            # ── Charts side by side ─────────────────────────────────
+            _chart_c, _graph_c = st.columns([3, 2])
+
+            with _chart_c:
+                st.caption("ON per team across all 6 iterations — lines flatten as they converge.")
+                _fig_conv = go.Figure()
+                _team_colors = ["#79c0ff", "#56d364", "#f0b429", "#ff7b72", "#d2a8ff"]
+                for _ti2, _tname2 in enumerate(st.session_state.on_net_teams):
+                    _on_series = [_on_history[_it][_tname2] for _it in range(7)]
+                    _fig_conv.add_trace(go.Scatter(
+                        x=list(range(7)), y=_on_series,
+                        mode="lines+markers",
+                        name=_tname2,
+                        line=dict(color=_team_colors[_ti2 % len(_team_colors)], width=2),
+                        marker=dict(size=5),
+                    ))
+                _fig_conv.add_vline(
+                    x=_iter_val,
+                    line_dash="dash",
+                    line_color="rgba(255,255,255,0.35)",
+                    annotation_text=f"← iter {_iter_val}",
+                    annotation_font_color="#c9d1d9",
+                    annotation_font_size=10,
+                    annotation_position="top right",
+                )
+                _y_max = max(max(v.values()) for v in _on_history.values()) * 1.18 + 0.01
+                _fig_conv.update_layout(
+                    xaxis=dict(title="Iteration", tickvals=list(range(7)),
+                               gridcolor="#21262d", title_font_size=11),
+                    yaxis=dict(title="ON", gridcolor="#21262d",
+                               range=[0, _y_max], title_font_size=11),
+                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                    font=dict(color="#c9d1d9", size=10),
+                    legend=dict(orientation="h", y=1.2, font=dict(size=10)),
+                    margin=dict(l=10, r=10, t=35, b=10), height=260,
+                )
+                st.plotly_chart(_fig_conv, use_container_width=True,
+                                config={"staticPlot": False})
+
+            with _graph_c:
+                st.caption(f"Network at iter {_iter_val} — brightness = ON score.")
+                _teams_net = st.session_state.on_net_teams
+                _n_teams   = len(_teams_net)
+                _pos = {}
+                for _ti3, _tname3 in enumerate(_teams_net):
+                    _ang = 2 * math.pi * _ti3 / _n_teams - math.pi / 2
+                    _pos[_tname3] = (math.cos(_ang), math.sin(_ang))
+
+                _fig_net = go.Figure()
+                for (_fw2, _fl2) in st.session_state.on_net_wins:
+                    if _fw2 in _pos and _fl2 in _pos:
+                        _x0, _y0 = _pos[_fw2]
+                        _x1, _y1 = _pos[_fl2]
+                        _dx, _dy = _x1 - _x0, _y1 - _y0
+                        _dist = math.sqrt(_dx**2 + _dy**2) or 1.0
+                        _shrink = 0.20
+                        _fig_net.add_annotation(
+                            x=_x1 - _dx / _dist * _shrink,
+                            y=_y1 - _dy / _dist * _shrink,
+                            ax=_x0, ay=_y0,
+                            xref="x", yref="y", axref="x", ayref="y",
+                            showarrow=True, arrowhead=2, arrowsize=1.0,
+                            arrowwidth=1.6, arrowcolor="#79c0ff", opacity=0.65,
+                        )
+                _node_on = [_on_now[t] for t in _teams_net]
+                _fig_net.add_trace(go.Scatter(
+                    x=[_pos[t][0] for t in _teams_net],
+                    y=[_pos[t][1] for t in _teams_net],
+                    mode="markers+text",
+                    marker=dict(
+                        size=[max(22, int(26 + _on_now[t] * 28)) for t in _teams_net],
+                        color=_node_on,
+                        colorscale=[[0, "#0d1117"], [0.5, "#1f6feb"], [1.0, "#79c0ff"]],
+                        cmin=0, cmax=1,
+                        line=dict(color="#79c0ff", width=1.5),
+                    ),
+                    text=[f"<b>{t[:3]}</b><br>{_on_now[t]:.2f}" for t in _teams_net],
+                    textposition="middle center",
+                    textfont=dict(size=9, color="white"),
+                    hovertemplate=[
+                        f"<b>{t}</b><br>ON: {_on_now[t]:.4f}<extra></extra>"
+                        for t in _teams_net
+                    ],
+                    showlegend=False,
+                ))
+                _fig_net.update_layout(
+                    xaxis=dict(showgrid=False, zeroline=False, showticklabels=False,
+                               range=[-1.7, 1.7]),
+                    yaxis=dict(showgrid=False, zeroline=False, showticklabels=False,
+                               range=[-1.7, 1.7]),
+                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                    margin=dict(l=0, r=0, t=0, b=0), height=260,
+                )
+                st.plotly_chart(_fig_net, use_container_width=True,
+                                config={"staticPlot": True})
+
+            # ── Educational breakdown — one cell per team ───────────
+            st.markdown("---")
+            st.caption(
+                "**How each team's score is calculated** at the selected iteration. "
+                "Inputs = opponents' ON from the *previous* round — that's what makes it recursive."
+            )
+            _edu_teams = st.session_state.on_net_teams
+            _edu_cols  = st.columns(len(_edu_teams))
+            for _eci, _eteam in enumerate(_edu_teams):
+                _eval_on = _on_now[_eteam]
+                if _iter_val == 0:
+                    _ecell = (
+                        f'<strong style="color:#79c0ff;">{_eteam}</strong><br>'
+                        f'<span style="font-size:20px;font-weight:700;color:#79c0ff;">'
+                        f'{_eval_on:.3f}</span><br>'
+                        f'<span style="font-size:10px;color:#8b949e;">BO seed · iter 0</span>'
                     )
-                st.markdown(
-                    f'<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px;margin-bottom:10px;">'
-                    f'<table style="width:100%;border-collapse:collapse">'
-                    f'<thead><tr style="border-bottom:1px solid #30363d">'
-                    f'<th style="padding:5px 6px;font-size:11px;color:#8b949e;text-align:left">vs Opponent</th>'
-                    f'<th style="padding:5px 6px;font-size:11px;color:#8b949e;text-align:right">opp_ON</th>'
-                    f'<th style="padding:5px 6px;font-size:11px;color:#8b949e;text-align:right">AgeW</th>'
-                    f'<th style="padding:5px 6px;font-size:11px;color:#8b949e;text-align:right">EvW</th>'
-                    f'<th style="padding:5px 6px;font-size:11px;color:#8b949e;text-align:right">Entry</th>'
-                    f'</tr></thead><tbody>{_rows}</tbody></table></div>',
+                else:
+                    _e_beaten = [l for (w, l) in st.session_state.on_net_wins if w == _eteam]
+                    if not _e_beaten:
+                        _ecell = (
+                            f'<strong style="color:#79c0ff;">{_eteam}</strong><br>'
+                            f'<span style="font-size:20px;font-weight:700;color:#6e7681;">'
+                            f'0.000</span><br>'
+                            f'<span style="font-size:10px;color:#8b949e;">no wins</span>'
+                        )
+                    else:
+                        _eprev = _on_history[_iter_val - 1]
+                        _e_entries = sorted(
+                            [(_eprev[opp], opp) for opp in _e_beaten], reverse=True)
+                        _e_opp_lines = "".join(
+                            f'<span style="color:#8b949e;font-size:10px;">{_eopp}</span>'
+                            f'<span style="color:#79c0ff;font-size:10px;'
+                            f'font-family:monospace;float:right;">{_ev:.2f}</span><br>'
+                            for _ev, _eopp in _e_entries
+                        )
+                        _e_sum = sum(_ev for _ev, _ in _e_entries)
+                        _e_div = min(len(_e_entries), 10)
+                        _ecell = (
+                            f'<strong style="color:#79c0ff;">{_eteam}</strong><br>'
+                            f'<span style="font-size:20px;font-weight:700;color:#79c0ff;">'
+                            f'{_eval_on:.3f}</span><br>'
+                            f'<div style="margin-top:4px;">{_e_opp_lines}</div>'
+                            f'<span style="font-family:monospace;font-size:10px;color:#484f58;">'
+                            f'{_e_sum:.2f}/{_e_div}</span>'
+                        )
+                _edu_cols[_eci].markdown(
+                    f'<div style="background:#0d1117;border:1px solid #30363d;'
+                    f'border-radius:8px;padding:8px 10px;min-height:90px;">'
+                    f'{_ecell}</div>',
                     unsafe_allow_html=True)
-                st.markdown(
-                    f'<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:14px;">'
-                    f'<div style="display:flex;flex-direction:column;gap:8px;">'
-                    f'<div style="display:flex;justify-content:space-between;">'
-                    f'<span style="font-size:12px;color:#8b949e;">① Sum top {min(10, len(_r["calcs"]))}</span>'
-                    f'<span style="font-size:13px;font-weight:700;color:#c9d1d9;">{sum(x["entry"] for x in _r["top10"]):.4f}</span></div>'
-                    f'<div style="display:flex;justify-content:space-between;align-items:center;border-top:1px solid #30363d;padding-top:8px;">'
-                    f'<span style="font-size:12px;color:#8b949e;">② ON = &#x3A3; / 10 &nbsp;(no curve)</span>'
-                    f'<span style="font-size:30px;font-weight:700;color:#79c0ff;">{_r["on_val"]:.4f}</span></div>'
-                    f'<div style="font-size:10px;color:#8b949e;text-align:center;">In the real engine opp_ON values are themselves updated over 6 PageRank iterations</div>'
-                    f'</div></div>',
-                    unsafe_allow_html=True)
-            elif st.session_state.on_sim_entries:
-                st.info("Click **Calculate Opponent Network** to see results.", icon="💡")
-            else:
-                st.info("Add at least one win to start.", icon="💡")
 
     # ══════════════════════════════════════════════════════════════
     with tab_lan2:
@@ -2396,7 +2615,7 @@ scores to teams that are orders of magnitude below the top.
                     key=lambda x: x["entry"], reverse=True)
                 _excl     = [x for x in _calcs_all if not x["is_lan"]]
                 _top10    = _lan_only[:10]
-                _lan_val  = sum(x["entry"] for x in _top10) / 10 if _top10 else 0.0
+                _lan_val  = sum(x["entry"] for x in _top10) / len(_top10) if _top10 else 0.0
                 st.session_state.lan_sim_result = {
                     "lan_only": _lan_only, "excl": _excl,
                     "top10": _top10, "lan_val": _lan_val,
@@ -2454,7 +2673,7 @@ scores to teams that are orders of magnitude below the top.
                     f'<span style="font-size:12px;color:#8b949e;">① Sum top {min(10, len(_r["lan_only"]))}</span>'
                     f'<span style="font-size:13px;font-weight:700;color:#c9d1d9;">{sum(x["entry"] for x in _r["top10"]):.4f}</span></div>'
                     f'<div style="display:flex;justify-content:space-between;align-items:center;border-top:1px solid #30363d;padding-top:8px;">'
-                    f'<span style="font-size:12px;color:#8b949e;">② LAN = Σ / 10</span>'
+                    f'<span style="font-size:12px;color:#8b949e;">② LAN = Σ / {len(_r["top10"])}</span>'
                     f'<span style="font-size:30px;font-weight:700;color:#f85149;">{_r["lan_val"]:.4f}</span></div>'
                     f'</div></div>',
                     unsafe_allow_html=True)

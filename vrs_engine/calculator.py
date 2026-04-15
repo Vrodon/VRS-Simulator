@@ -26,7 +26,7 @@ from .math_helpers import curve, lerp, expected_win, top_n_sum
 def compute_bo(
     prizes_df: "pd.DataFrame",
     all_teams: list[str],
-) -> tuple[dict, dict]:
+) -> tuple[dict, dict, dict]:
     """
     For each team: sum of top-10 (prize_amount × age_w).
     Normalised using the 5th-highest bo_sum as reference → curve().
@@ -39,7 +39,9 @@ def compute_bo(
     Returns
     -------
     bo_sum    dict[team → float]   raw weighted prize total
-    bo_factor dict[team → float]   normalised via curve()
+    bo_ratio  dict[team → float]   raw normalised ratio (bo_sum / ref_5th, capped at 1)
+                                   ← used as input to BC and ON (NOT curve'd)
+    bo_factor dict[team → float]   curve(bo_ratio) — the BO factor score itself
     """
     bo_sum: dict[str, float] = {}
 
@@ -57,32 +59,42 @@ def compute_bo(
               sorted_sums[-1] if sorted_sums else 1.0)
     ref_5th = max(ref_5th, 1e-9)
 
-    bo_factor: dict[str, float] = {
-        t: curve(min(1.0, bo_sum[t] / ref_5th))
+    # bo_ratio: the raw normalised ratio used as opponent weight in BC and ON
+    bo_ratio: dict[str, float] = {
+        t: min(1.0, bo_sum[t] / ref_5th)
         for t in all_teams
     }
 
-    return bo_sum, bo_factor
+    # bo_factor: curve applied — this is the BO factor score shown in standings
+    bo_factor: dict[str, float] = {
+        t: curve(bo_ratio[t])
+        for t in all_teams
+    }
+
+    return bo_sum, bo_ratio, bo_factor
 
 
 # ── Factor 2: Bounty Collected ────────────────────────────────────────────────
 
 def compute_bc(
     matches_df: "pd.DataFrame",
-    bo_factor: dict,
+    bo_ratio: dict,
     eligible: list[str],
 ) -> tuple[dict, dict]:
     """
     For each eligible team: top-10 wins at prized events,
-    each scored as  bo_factor[opponent] × age_w × ev_w,
+    each scored as  bo_ratio[opponent] × age_w × ev_w,
     averaged (÷ TOP_N) then normalised via curve().
+
+    NOTE: uses bo_ratio (raw normalised ratio, NOT curve'd bo_factor) as the
+    opponent weight, matching Valve's formula exactly.
 
     Only wins at events with prize_pool > 0 (ev_w > 0) count.
 
     Parameters
     ----------
     matches_df  window-filtered matches with age_w and ev_w columns
-    bo_factor   dict[team → float] from compute_bo()
+    bo_ratio    dict[team → float] raw ratio from compute_bo() — NOT curve'd
     eligible    teams that pass the eligibility check
 
     Returns
@@ -103,7 +115,7 @@ def compute_bc(
             continue
 
         entries = [
-            bo_factor.get(row.loser, 0.0) * row.age_w * row.ev_w
+            bo_ratio.get(row.loser, 0.0) * row.age_w * row.ev_w
             for row in team_wins.itertuples(index=False)
         ]
         s = top_n_sum(entries) / TOP_N
@@ -123,37 +135,40 @@ def compute_on(
     """
     PageRank-style iteration (ON_ITERS = 6 rounds).
 
-    Initialised with bo_factor values for every team.
-    Each iteration: ON_new[team] = sum_top10(ON[opp] × age_w × ev_w) / TOP_N
-    Only wins at prized events count (ev_w > 0).
+    Initialised with bo_factor (curve'd) for every team.
+    Each iteration: ON_new[team] = sum_top10(ON[opp] × age_w) / TOP_N
 
-    ✓ VERIFIED: NO curve() applied — the raw average IS the ON score.
-    The iterative convergence keeps values in a comparable range.
+    KEY FINDINGS (verified against Valve's published standings):
+      - Seeded from bo_factor (curve'd), NOT bo_ratio (raw).
+      - Uses ALL wins in the window, NOT just wins at prized events.
+      - Weighted by age_w ONLY — ev_w is NOT applied in the ON formula.
+      - NO curve() applied — the raw iterated average IS the ON score.
 
     Parameters
     ----------
-    matches_df  window-filtered matches with age_w and ev_w columns
-    bo_factor   dict[team → float] — starting seed for all teams
+    matches_df  window-filtered matches with age_w column
+    bo_factor   dict[team → float] curve'd ratio from compute_bo()
     eligible    teams that pass the eligibility check
 
     Returns
     -------
     on_factor  dict[team → float]  (eligible teams only, after 6 iterations)
     """
-    # Seed from bo_factor for ALL teams (ineligible teams act as opponents)
+    # Seed from bo_factor (curve'd) for ALL teams
     on_factor: dict[str, float] = dict(bo_factor)
 
-    wins_ev = matches_df[matches_df["ev_w"] > 0]
+    # Use ALL wins — no ev_w filter (verified correct against Valve)
+    all_wins = matches_df  # full window-filtered match set
 
     for _ in range(ON_ITERS):
         new_on: dict[str, float] = {}
         for team in eligible:
-            team_wins = wins_ev[wins_ev["winner"] == team]
+            team_wins = all_wins[all_wins["winner"] == team]
             if team_wins.empty:
                 new_on[team] = 0.0
                 continue
             entries = [
-                on_factor.get(row.loser, 0.0) * row.age_w * row.ev_w
+                on_factor.get(row.loser, 0.0) * row.age_w
                 for row in team_wins.itertuples(index=False)
             ]
             new_on[team] = top_n_sum(entries) / TOP_N
@@ -285,8 +300,12 @@ def compute_h2h(
         E_w = expected_win(ratings[w], ratings[l])
         K   = BASE_K * float(row.age_w)
 
+        # Standard Elo: both sides adjust by the same magnitude (zero-sum).
+        # d_w = K × (1 − E_w)  → winner gains when they were the underdog
+        # d_l = −K × (1 − E_w) → loser is penalised when they were the favourite
+        # Previous bug was d_l = −K × E_w (inverted sign logic).
         d_w =  K * (1.0 - E_w)
-        d_l = -K * E_w
+        d_l = -K * (1.0 - E_w)   # == -d_w  (zero-sum)
 
         ratings[w]   += d_w
         ratings[l]   += d_l

@@ -126,16 +126,18 @@ def run(store: Store, cutoff: datetime = None) -> dict:
     # teams still appear as opponents in BC and ON calculations.
     # ═══════════════════════════════════════════════════════════════════════
 
-    bo_sum, bo_factor = compute_bo(prizes, all_teams)
+    bo_sum, bo_ratio, bo_factor = compute_bo(prizes, all_teams)
 
     # ═══════════════════════════════════════════════════════════════════════
     # STEP 5 — Bounty Collected (BC)
+    # Uses bo_ratio (raw normalised ratio, NOT curve'd bo_factor)
     # ═══════════════════════════════════════════════════════════════════════
 
-    bc_pre, bc_factor = compute_bc(matches, bo_factor, eligible)
+    bc_pre, bc_factor = compute_bc(matches, bo_ratio, eligible)
 
     # ═══════════════════════════════════════════════════════════════════════
     # STEP 6 — Opponent Network (ON)  — 6 PageRank iterations
+    # Seeded from bo_factor (curve'd); uses ALL wins, age_w only (no ev_w)
     # ═══════════════════════════════════════════════════════════════════════
 
     on_factor = compute_on(matches, bo_factor, eligible)

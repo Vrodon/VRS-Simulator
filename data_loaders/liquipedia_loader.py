@@ -98,6 +98,19 @@ LIQUIPEDIA_TO_VALVE: dict[str, str] = {
     "Rare Atom": "Rare Atom",
     "TYLOO": "TYLOO",
     "paiN": "paiN",
+    # ── Additional mappings found from live Liquipedia data ───────────────
+    "FUT Esports":          "FUT",
+    "ASTRAL Esports":       "ASTRAL",
+    "ESC Gaming":           "ESC",
+    "JUMBO TEAM":           "JUMBO",
+    "Leo Team":             "Leo",
+    "MANA eSports":         "MANA",
+    "Players (Russian team)": "Players",
+    "Rune Eaters Esports":  "Rune Eaters",
+    "Team Nemesis":         "Nemesis",
+    "TNC Esport":           "TNC",
+    "Tricked Esport":       "Tricked",
+    "UNiTY esports":        "UNiTY",
 }
 
 
