@@ -93,6 +93,7 @@ LIQUIPEDIA_TO_VALVE: dict[str, str] = {
     "NRG": "NRG",
     "Cloud9": "Cloud9",
     "Aurora": "Aurora",
+    "Aurora Gaming": "Aurora",
     "Falcons": "Falcons",
     "Monte": "Monte",
     "Rare Atom": "Rare Atom",

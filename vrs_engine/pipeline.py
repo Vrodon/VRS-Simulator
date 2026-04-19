@@ -136,11 +136,11 @@ def run(store: Store, cutoff: datetime = None) -> dict:
     bc_pre, bc_factor = compute_bc(matches, bo_ratio, eligible)
 
     # ═══════════════════════════════════════════════════════════════════════
-    # STEP 6 — Opponent Network (ON)  — 6 PageRank iterations
-    # Seeded from bo_factor (curve'd); uses ALL wins, age_w only (no ev_w)
+    # STEP 6 — Opponent Network (ON) — two-pass (ownNetwork → opponentNetwork)
+    # Reverse-engineered from Valve's team.js; see compute_on for details.
     # ═══════════════════════════════════════════════════════════════════════
 
-    on_factor = compute_on(matches, bo_factor, eligible)
+    on_factor = compute_on(matches, eligible)
 
     # ═══════════════════════════════════════════════════════════════════════
     # STEP 7 — LAN Wins

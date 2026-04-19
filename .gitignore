@@ -13,3 +13,9 @@ cache/
 # Environment
 .env
 *.env
+
+# ON factor analysis/debug scratch files
+on_*.py
+on_*.csv
+on_*.parquet
+ON_FORMULA_ANALYSIS_NOTES.md
