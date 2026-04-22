@@ -23,7 +23,6 @@ PRIZE_CAP = 1_000_000      # Prize pool cap for event stakes (USD)
 
 # Factor Calculation
 TOP_N = 10                 # Bucket size — top-N results per factor
-ON_ITERS = 6               # PageRank iterations for Opponent Network
 
 # Seeding Range
 SEED_MIN = 400

@@ -587,16 +587,100 @@ def _parse_match(
     }
 
 
+def _parse_matchlist_match(
+    el,
+    event_name: str,
+    prize_pool: float,
+    is_lan: bool,
+) -> dict | None:
+    """
+    Parse a single ``.brkts-matchlist-match`` element (Swiss / round-robin /
+    group-stage list-style matches).
+
+    Structure differs from bracket matches:
+      * Opponents live on ``.brkts-matchlist-opponent`` (not ``.brkts-opponent-entry``).
+      * Winner slot is marked with ``brkts-matchlist-slot-winner``.
+      * Scores live in ``.brkts-matchlist-score`` cells, whose direct child
+        ``.brkts-matchlist-cell-content`` holds the digit.
+      * Timer lives in a ``.timer-object`` inside the match popup, same as
+        bracket matches.
+    """
+    opponent_cells = el.select(".brkts-matchlist-opponent")
+    if len(opponent_cells) < 2:
+        return None
+
+    team1_raw = opponent_cells[0].get("aria-label", "").strip()
+    team2_raw = opponent_cells[1].get("aria-label", "").strip()
+    if not team1_raw or not team2_raw:
+        return None
+
+    # Scores: look inside .brkts-matchlist-score cells for a digit. Fall back
+    # to iterating cell-content children if the score markup varies.
+    score_cells = el.select(".brkts-matchlist-score")
+    scores: list[int] = []
+    for sc in score_cells:
+        txt = sc.get_text(strip=True)
+        if txt.isdigit():
+            scores.append(int(txt))
+    if len(scores) < 2:
+        return None
+
+    score1, score2 = scores[0], scores[1]
+    if score1 == score2:
+        return None  # undecided / forfeit shown as equal scores
+
+    # Winner: opponent cell with 'brkts-matchlist-slot-winner' class.
+    winner_raw: str | None = None
+    for op in opponent_cells:
+        if "brkts-matchlist-slot-winner" in op.get("class", []):
+            winner_raw = op.get("aria-label", "").strip() or None
+            break
+    if not winner_raw:
+        winner_raw = team1_raw if score1 > score2 else team2_raw
+    loser_raw = team2_raw if winner_raw == team1_raw else team1_raw
+
+    date_el = el.select_one(".timer-object")
+    match_date: datetime | None = None
+    if date_el:
+        match_date = _parse_date_str(date_el.get_text(strip=True))
+
+    return {
+        "date":         match_date,
+        "winner":       _norm(winner_raw),
+        "loser":        _norm(loser_raw),
+        "event":        event_name,
+        "prize_pool":   prize_pool,
+        "winner_prize": 0.0,
+        "loser_prize":  0.0,
+        "is_lan":       is_lan,
+    }
+
+
 # ── Tournament page fetcher ─────────────────────────────────────────────────────
 
 def fetch_tournament_page(
     slug: str,
     start_dt: datetime | None = None,
     end_dt: datetime | None = None,
+    snapshot_cutoff: datetime | None = None,
 ) -> list[dict]:
     """
     Fetch a single Liquipedia tournament page, parse the infobox and all
     .brkts-match elements. Optionally filter matches by date range.
+
+    Unfinished-event backfill
+    -------------------------
+    Valve's ranking algorithm drops every match from an event whose
+    ``finished`` flag is false at snapshot time (see Valve's data_loader.js,
+    ``filterInProgressEvents``). In practice: if an event's end date falls on
+    or after the snapshot release, the event is dropped whole — even matches
+    played days earlier are excluded.
+
+    To backfill those missing matches we need to fetch the *entire* event from
+    Liquipedia, not just matches after the snapshot cutoff. When
+    ``snapshot_cutoff`` is provided and the event's end date is on/after it,
+    this function bypasses the per-match ``start_dt`` filter. The ``end_dt``
+    filter is still applied (we never want matches beyond the current cutoff).
 
     Returns a list of match dicts (conforming to the 8-column output schema).
     """
@@ -613,25 +697,48 @@ def fetch_tournament_page(
     is_lan      = meta["is_lan"]
     event_end   = meta["end_date"]
 
+    # Detect unfinished-at-snapshot events (Valve excludes these entirely).
+    # For these, we fetch the whole event regardless of per-match date, so the
+    # early-round matches aren't lost between Valve's "finished" drop and our
+    # own post-cutoff window.
+    is_unfinished_at_snapshot = (
+        snapshot_cutoff is not None
+        and event_end is not None
+        and event_end >= snapshot_cutoff
+    )
+    effective_start_dt = None if is_unfinished_at_snapshot else start_dt
+
     # Prize distribution: team → amount they earned for their final placement
     team_prizes = _parse_prize_pool(soup)
     logger.debug("Prize pool entries for %s: %s", slug, team_prizes)
 
     matches: list[dict] = []
-    for el in soup.select(".brkts-match"):
-        try:
-            m = _parse_match(el, event_name, prize_pool, is_lan)
-            if m is None:
-                continue
-            # Date range filter (individual series use their own match date)
-            if m["date"] is not None:
-                if start_dt is not None and m["date"] < start_dt:
+
+    # Liquipedia uses two different match element types on the same page:
+    #   * ``.brkts-match``          — bracket (playoff) matches
+    #   * ``.brkts-matchlist-match`` — Swiss / round-robin / group-stage matches
+    # Both must be parsed; each uses a distinct aria/class layout, so a
+    # dedicated parser handles each.
+    for selector, parser in (
+        (".brkts-match",          _parse_match),
+        (".brkts-matchlist-match", _parse_matchlist_match),
+    ):
+        for el in soup.select(selector):
+            try:
+                m = parser(el, event_name, prize_pool, is_lan)
+                if m is None:
                     continue
-                if end_dt is not None and m["date"] > end_dt:
-                    continue
-            matches.append(m)
-        except Exception as exc:
-            logger.debug("Match parse error in %s: %s", slug, exc)
+                # Date range filter (individual series use their own match date).
+                # effective_start_dt is None for events that were unfinished at
+                # the Valve snapshot cutoff → we want the full event.
+                if m["date"] is not None:
+                    if effective_start_dt is not None and m["date"] < effective_start_dt:
+                        continue
+                    if end_dt is not None and m["date"] > end_dt:
+                        continue
+                matches.append(m)
+            except Exception as exc:
+                logger.debug("Match parse error in %s: %s", slug, exc)
 
     # ── Prize rows ────────────────────────────────────────────────────────────
     # One row per team per tournament, dated at the tournament END date.
@@ -661,19 +768,50 @@ def fetch_tournament_page(
                     "is_lan":       False,        # must not inflate LAN wins
                 })
 
-    logger.info("Parsed %d series + %d prize rows from %s",
-                len([m for m in matches if m["loser"] != ""]),
-                len([m for m in matches if m["loser"] == ""]),
-                slug)
+    n_series = len([m for m in matches if m["loser"] != ""])
+    n_prizes = len([m for m in matches if m["loser"] == ""])
+    if is_unfinished_at_snapshot:
+        logger.info(
+            "[backfill] %s end=%s strategy=full-event series=%d prizes=%d "
+            "(event was in-progress at snapshot cutoff %s)",
+            slug,
+            event_end.strftime("%Y-%m-%d") if event_end else "?",
+            n_series, n_prizes,
+            snapshot_cutoff.strftime("%Y-%m-%d"),
+        )
+    else:
+        logger.info("Parsed %d series + %d prize rows from %s",
+                    n_series, n_prizes, slug)
     return matches
 
 
 # ── Disk cache ──────────────────────────────────────────────────────────────────
 
-def _cache_key(start_date: str, end_date: str, tournament_slugs: list[str]) -> str:
-    """Return an 8-character md5 hash of the sorted slug list."""
+def _cache_key(
+    start_date: str,
+    end_date: str,
+    tournament_slugs: list[str],
+    snapshot_cutoff: datetime | None = None,
+) -> str:
+    """
+    Return an 8-character md5 hash over the sorted slug list plus the snapshot
+    cutoff date.
+
+    ``snapshot_cutoff`` is included because it changes per-event fetch
+    behaviour: events unfinished at the cutoff are fetched whole, while other
+    events honour the start-date filter. Two runs with different cutoffs would
+    otherwise produce different data under the same cache file.
+    """
+    # ``v`` is a parser-schema version; bump it when the set of matches
+    # returned for the same (slugs, cutoff) changes (e.g. new parser added).
+    # This forces a one-time cache invalidation without requiring users to
+    # manually delete cache files.
+    #   v1 = pre-matchlist (bracket-only parsing)
+    #   v2 = bracket + matchlist (Swiss / group-stage) parsing
     slugs_str = "|".join(sorted(tournament_slugs))
-    return hashlib.md5(slugs_str.encode()).hexdigest()[:8]
+    cutoff_str = snapshot_cutoff.strftime("%Y-%m-%d") if snapshot_cutoff else ""
+    payload = f"v2||{slugs_str}||cutoff={cutoff_str}"
+    return hashlib.md5(payload.encode()).hexdigest()[:8]
 
 
 def _cache_path(start_date: str, end_date: str, key: str) -> str:
@@ -685,9 +823,10 @@ def load_from_cache(
     start_date: str,
     end_date: str,
     tournament_slugs: list[str],
+    snapshot_cutoff: datetime | None = None,
 ) -> pd.DataFrame | None:
     """Return cached DataFrame if the cache file exists, else None."""
-    key = _cache_key(start_date, end_date, tournament_slugs)
+    key = _cache_key(start_date, end_date, tournament_slugs, snapshot_cutoff)
     path = _cache_path(start_date, end_date, key)
     if not os.path.exists(path):
         return None
@@ -708,8 +847,9 @@ def _save_cache(
     end_date: str,
     tournament_slugs: list[str],
     df: pd.DataFrame,
+    snapshot_cutoff: datetime | None = None,
 ) -> None:
-    key = _cache_key(start_date, end_date, tournament_slugs)
+    key = _cache_key(start_date, end_date, tournament_slugs, snapshot_cutoff)
     path = _cache_path(start_date, end_date, key)
     try:
         copy = df.copy()
@@ -724,8 +864,9 @@ def cache_exists(
     start_date: str,
     end_date: str,
     tournament_slugs: list[str],
+    snapshot_cutoff: datetime | None = None,
 ) -> bool:
-    key = _cache_key(start_date, end_date, tournament_slugs)
+    key = _cache_key(start_date, end_date, tournament_slugs, snapshot_cutoff)
     return os.path.exists(_cache_path(start_date, end_date, key))
 
 
@@ -733,8 +874,9 @@ def cache_mtime(
     start_date: str,
     end_date: str,
     tournament_slugs: list[str],
+    snapshot_cutoff: datetime | None = None,
 ) -> datetime | None:
-    key = _cache_key(start_date, end_date, tournament_slugs)
+    key = _cache_key(start_date, end_date, tournament_slugs, snapshot_cutoff)
     path = _cache_path(start_date, end_date, key)
     if not os.path.exists(path):
         return None
@@ -745,8 +887,9 @@ def clear_cache(
     start_date: str,
     end_date: str,
     tournament_slugs: list[str],
+    snapshot_cutoff: datetime | None = None,
 ) -> None:
-    key = _cache_key(start_date, end_date, tournament_slugs)
+    key = _cache_key(start_date, end_date, tournament_slugs, snapshot_cutoff)
     path = _cache_path(start_date, end_date, key)
     if os.path.exists(path):
         os.remove(path)
@@ -760,6 +903,7 @@ def fetch_liquipedia_matches(
     tournament_slugs: list[str],
     force_refresh: bool = False,
     progress_callback: Callable[[int, int, str], None] | None = None,
+    snapshot_cutoff: datetime | None = None,
 ) -> pd.DataFrame:
     """
     Fetch CS2 series results from Liquipedia for the given tournament slugs,
@@ -779,6 +923,12 @@ def fetch_liquipedia_matches(
     progress_callback:
         Optional callable(step: int, total: int, status: str).
         Called before each network request so the UI can show progress.
+    snapshot_cutoff:
+        Datetime of the Valve snapshot this fetch is backfilling. Events whose
+        end date is on/after this cutoff were in-progress ("not finished") in
+        Valve's snapshot and are excluded whole — so the fetcher pulls them
+        completely (not just matches after ``start_date``). Omit for a pure
+        windowed fetch.
 
     Returns
     -------
@@ -800,7 +950,9 @@ def fetch_liquipedia_matches(
 
     # ── Cache hit ──────────────────────────────────────────────────────
     if not force_refresh:
-        cached = load_from_cache(start_date, end_date, tournament_slugs)
+        cached = load_from_cache(
+            start_date, end_date, tournament_slugs, snapshot_cutoff
+        )
         if cached is not None:
             return cached
 
@@ -824,7 +976,12 @@ def fetch_liquipedia_matches(
         if progress_callback:
             progress_callback(i + 1, total, f"Fetching {slug} ({i + 1}/{total})…")
 
-        page_matches = fetch_tournament_page(slug, start_dt=start_dt, end_dt=end_dt)
+        page_matches = fetch_tournament_page(
+            slug,
+            start_dt=start_dt,
+            end_dt=end_dt,
+            snapshot_cutoff=snapshot_cutoff,
+        )
         all_matches.extend(page_matches)
 
         # Be polite — sleep between requests (skip after last slug)
@@ -855,5 +1012,5 @@ def fetch_liquipedia_matches(
     df["loser_prize"] = df["loser_prize"].astype(float)
     df["is_lan"] = df["is_lan"].astype(bool)
 
-    _save_cache(start_date, end_date, tournament_slugs, df)
+    _save_cache(start_date, end_date, tournament_slugs, df, snapshot_cutoff)
     return df

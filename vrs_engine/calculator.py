@@ -18,7 +18,7 @@ prizes_df   team, date, amount,
 """
 
 from .constants import TOP_N, SEED_MIN, SEED_MAX, BASE_K
-from .math_helpers import curve, lerp, expected_win, top_n_sum
+from .math_helpers import curve, lerp, expected_win
 
 
 # ── Factor 1: Bounty Offered ──────────────────────────────────────────────────
@@ -26,7 +26,7 @@ from .math_helpers import curve, lerp, expected_win, top_n_sum
 def compute_bo(
     prizes_df: "pd.DataFrame",
     all_teams: list[str],
-) -> tuple[dict, dict, dict]:
+) -> tuple[dict, dict, dict, dict]:
     """
     For each team: sum of top-10 (prize_amount × age_w).
     Normalised using the 5th-highest bo_sum as reference → curve().
@@ -42,16 +42,35 @@ def compute_bo(
     bo_ratio  dict[team → float]   raw normalised ratio (bo_sum / ref_5th, capped at 1)
                                    ← used as input to BC and ON (NOT curve'd)
     bo_factor dict[team → float]   curve(bo_ratio) — the BO factor score itself
+    contribs  dict[team → list[dict]]
+              per-prize attribution rows, sorted by weighted desc.
+              Each row: {date, amount, age_w, weighted, in_top10}.
     """
-    bo_sum: dict[str, float] = {}
+    bo_sum:   dict[str, float]      = {}
+    contribs: dict[str, list[dict]] = {}
 
     for team in all_teams:
         rows = prizes_df[prizes_df["team"] == team]
         if rows.empty:
-            bo_sum[team] = 0.0
-        else:
-            contribs = (rows["amount"] * rows["age_w"]).tolist()
-            bo_sum[team] = top_n_sum(contribs)
+            bo_sum[team]   = 0.0
+            contribs[team] = []
+            continue
+
+        entries = [
+            {
+                "date":     row.date,
+                "amount":   float(row.amount),
+                "age_w":    float(row.age_w),
+                "weighted": float(row.amount) * float(row.age_w),
+            }
+            for row in rows.itertuples(index=False)
+        ]
+        entries.sort(key=lambda e: e["weighted"], reverse=True)
+        for i, e in enumerate(entries):
+            e["in_top10"] = i < TOP_N
+
+        bo_sum[team]   = sum(e["weighted"] for e in entries[:TOP_N])
+        contribs[team] = entries
 
     # 5th-highest bo_sum is the normalisation reference
     sorted_sums = sorted(bo_sum.values(), reverse=True)
@@ -71,7 +90,7 @@ def compute_bo(
         for t in all_teams
     }
 
-    return bo_sum, bo_ratio, bo_factor
+    return bo_sum, bo_ratio, bo_factor, contribs
 
 
 # ── Factor 2: Bounty Collected ────────────────────────────────────────────────
@@ -80,7 +99,7 @@ def compute_bc(
     matches_df: "pd.DataFrame",
     bo_ratio: dict,
     eligible: list[str],
-) -> tuple[dict, dict]:
+) -> tuple[dict, dict, dict]:
     """
     For each eligible team: top-10 wins at prized events,
     each scored as  bo_ratio[opponent] × age_w × ev_w,
@@ -101,9 +120,14 @@ def compute_bc(
     -------
     bc_pre    dict[team → float]   pre-curve average
     bc_factor dict[team → float]   after curve()
+    contribs  dict[team → list[dict]]
+              per-win attribution rows, sorted by weighted desc. Each:
+              {match_id, date, opponent, opp_bo_ratio, age_w, ev_w,
+               weighted, in_top10}.
     """
-    bc_pre:    dict[str, float] = {}
-    bc_factor: dict[str, float] = {}
+    bc_pre:    dict[str, float]      = {}
+    bc_factor: dict[str, float]      = {}
+    contribs:  dict[str, list[dict]] = {}
 
     wins_ev = matches_df[matches_df["ev_w"] > 0]
 
@@ -112,17 +136,34 @@ def compute_bc(
         if team_wins.empty:
             bc_pre[team]    = 0.0
             bc_factor[team] = 0.0
+            contribs[team]  = []
             continue
 
         entries = [
-            bo_ratio.get(row.loser, 0.0) * row.age_w * row.ev_w
+            {
+                "match_id":     int(row.match_id),
+                "date":         row.date,
+                "opponent":     str(row.loser),
+                "opp_bo_ratio": float(bo_ratio.get(row.loser, 0.0)),
+                "age_w":        float(row.age_w),
+                "ev_w":         float(row.ev_w),
+                "weighted": (
+                    float(bo_ratio.get(row.loser, 0.0))
+                    * float(row.age_w) * float(row.ev_w)
+                ),
+            }
             for row in team_wins.itertuples(index=False)
         ]
-        s = top_n_sum(entries) / TOP_N
+        entries.sort(key=lambda e: e["weighted"], reverse=True)
+        for i, e in enumerate(entries):
+            e["in_top10"] = i < TOP_N
+
+        s = sum(e["weighted"] for e in entries[:TOP_N]) / TOP_N
         bc_pre[team]    = s
         bc_factor[team] = curve(s)
+        contribs[team]  = entries
 
-    return bc_pre, bc_factor
+    return bc_pre, bc_factor, contribs
 
 
 # ── Factor 3: Opponent Network ────────────────────────────────────────────────
@@ -130,7 +171,7 @@ def compute_bc(
 def compute_on(
     matches_df: "pd.DataFrame",
     eligible: list[str],
-) -> dict:
+) -> tuple[dict, dict, dict]:
     """
     Valve's Opponent Network algorithm — two-pass, NOT PageRank.
 
@@ -159,7 +200,14 @@ def compute_on(
 
     Returns
     -------
-    on_factor  dict[team → float]  (eligible teams only)
+    on_factor         dict[team → float]  (eligible teams only)
+    own_network_contribs
+                      dict[team → list[dict]]  Pass-1 entries:
+                      {opponent, max_age_w}  (sorted max_age_w desc).
+    on_contribs       dict[team → list[dict]]  Pass-2 entries per win,
+                      sorted by weighted desc:
+                      {match_id, date, opponent, opp_own_network,
+                       age_w, ev_w, weighted, in_top10}.
     """
     # ── Pass 1: ownNetwork for every team with at least one win ───
     # Most-recent win per (winner, loser) pair: max age_w collapses
@@ -168,6 +216,15 @@ def compute_on(
     distinct_def: dict[str, float] = (
         by_pair.groupby(level="winner").sum().to_dict()
     )
+
+    own_network_contribs: dict[str, list[dict]] = {}
+    for (winner, loser), max_age in by_pair.items():
+        own_network_contribs.setdefault(str(winner), []).append({
+            "opponent":  str(loser),
+            "max_age_w": float(max_age),
+        })
+    for rows in own_network_contribs.values():
+        rows.sort(key=lambda r: r["max_age_w"], reverse=True)
 
     sorted_vals = sorted(distinct_def.values(), reverse=True)
     ref = sorted_vals[4] if len(sorted_vals) >= 5 else (
@@ -179,19 +236,37 @@ def compute_on(
     }
 
     # ── Pass 2: on_factor (= opponentNetwork) for eligible teams ──
-    on_factor: dict[str, float] = {}
+    on_factor:   dict[str, float]      = {}
+    on_contribs: dict[str, list[dict]] = {}
     for team in eligible:
         team_wins = matches_df[matches_df["winner"] == team]
         if team_wins.empty:
-            on_factor[team] = 0.0
+            on_factor[team]   = 0.0
+            on_contribs[team] = []
             continue
         entries = [
-            own_network.get(row.loser, 0.0) * row.age_w * row.ev_w
+            {
+                "match_id":        int(row.match_id),
+                "date":            row.date,
+                "opponent":        str(row.loser),
+                "opp_own_network": float(own_network.get(row.loser, 0.0)),
+                "age_w":           float(row.age_w),
+                "ev_w":            float(row.ev_w),
+                "weighted": (
+                    float(own_network.get(row.loser, 0.0))
+                    * float(row.age_w) * float(row.ev_w)
+                ),
+            }
             for row in team_wins.itertuples(index=False)
         ]
-        on_factor[team] = top_n_sum(entries) / TOP_N
+        entries.sort(key=lambda e: e["weighted"], reverse=True)
+        for i, e in enumerate(entries):
+            e["in_top10"] = i < TOP_N
 
-    return on_factor
+        on_factor[team]   = sum(e["weighted"] for e in entries[:TOP_N]) / TOP_N
+        on_contribs[team] = entries
+
+    return on_factor, own_network_contribs, on_contribs
 
 
 # ── Factor 4: LAN Wins ────────────────────────────────────────────────────────
@@ -199,7 +274,7 @@ def compute_on(
 def compute_lan(
     matches_df: "pd.DataFrame",
     eligible: list[str],
-) -> tuple[dict, dict]:
+) -> tuple[dict, dict, dict]:
     """
     For each eligible team: sum of top-10 age_w values for LAN wins ÷ TOP_N.
     No curve() applied — max possible value is 1.0 (10 × full-weight LAN wins).
@@ -213,9 +288,13 @@ def compute_lan(
     -------
     lan_wins_ct  dict[team → int]    count of LAN wins in the window
     lan_factor   dict[team → float]  factor score
+    contribs     dict[team → list[dict]]
+                 per-LAN-win rows, sorted by age_w desc:
+                 {match_id, date, opponent, age_w, in_top10}.
     """
-    lan_wins_ct: dict[str, int]   = {}
-    lan_factor:  dict[str, float] = {}
+    lan_wins_ct: dict[str, int]        = {}
+    lan_factor:  dict[str, float]      = {}
+    contribs:    dict[str, list[dict]] = {}
 
     lan_wins = matches_df[matches_df["is_lan"] == True]
 
@@ -224,10 +303,26 @@ def compute_lan(
         lan_wins_ct[team] = len(team_lw)
         if team_lw.empty:
             lan_factor[team] = 0.0
-        else:
-            lan_factor[team] = top_n_sum(team_lw["age_w"].tolist()) / TOP_N
+            contribs[team]   = []
+            continue
 
-    return lan_wins_ct, lan_factor
+        entries = [
+            {
+                "match_id": int(row.match_id),
+                "date":     row.date,
+                "opponent": str(row.loser),
+                "age_w":    float(row.age_w),
+            }
+            for row in team_lw.itertuples(index=False)
+        ]
+        entries.sort(key=lambda e: e["age_w"], reverse=True)
+        for i, e in enumerate(entries):
+            e["in_top10"] = i < TOP_N
+
+        lan_factor[team] = sum(e["age_w"] for e in entries[:TOP_N]) / TOP_N
+        contribs[team]   = entries
+
+    return lan_wins_ct, lan_factor, contribs
 
 
 # ── Seeding ───────────────────────────────────────────────────────────────────
@@ -299,8 +394,19 @@ def compute_h2h(
         Cumulative Glicko adjustment per team (positive or negative).
 
     match_h2h  dict[match_id → dict]
-        Per-match detail for UI display:
-        { "winner": str, "loser": str, "w_delta": float, "l_delta": float }
+        Per-match detail for UI display (H2H replay timeline):
+        {
+            "date":      datetime,
+            "winner":    str,
+            "loser":     str,
+            "w_rating":  float,   # winner's live rating BEFORE this match
+            "l_rating":  float,   # loser's live rating BEFORE this match
+            "e_w":       float,   # expected win probability for the winner
+            "k":         float,   # BASE_K * age_w (information content)
+            "age_w":     float,
+            "w_delta":   float,
+            "l_delta":   float,
+        }
     """
     ratings:   dict[str, float] = {t: seeds[t] for t in eligible}
     h2h_delta: dict[str, float] = {t: 0.0      for t in eligible}
@@ -314,7 +420,12 @@ def compute_h2h(
         if w not in eligible_set or l not in eligible_set:
             continue
 
-        E_w = expected_win(ratings[w], ratings[l])
+        # Snapshot ratings BEFORE applying this match's delta — this is the
+        # "rating at the time" that the timeline UI needs to display.
+        pre_w = ratings[w]
+        pre_l = ratings[l]
+
+        E_w = expected_win(pre_w, pre_l)
         K   = BASE_K * float(row.age_w)
 
         # Standard Elo: both sides adjust by the same magnitude (zero-sum).
@@ -330,10 +441,16 @@ def compute_h2h(
         h2h_delta[l] += d_l
 
         match_h2h[int(row.match_id)] = {
-            "winner":  w,
-            "loser":   l,
-            "w_delta": d_w,
-            "l_delta": d_l,
+            "date":     row.date,
+            "winner":   w,
+            "loser":    l,
+            "w_rating": pre_w,
+            "l_rating": pre_l,
+            "e_w":      E_w,
+            "k":        K,
+            "age_w":    float(row.age_w),
+            "w_delta":  d_w,
+            "l_delta":  d_l,
         }
 
     return h2h_delta, match_h2h

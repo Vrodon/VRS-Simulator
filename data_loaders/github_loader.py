@@ -39,19 +39,28 @@ def _get_cache_path(date_str: str, year: str) -> str:
     return os.path.join(GH_CACHE_DIR, f"vrs_{year}_{date_str}.json")
 
 
-def _load_from_cache(date_str: str, year: str) -> dict | None:
-    """Load cached VRS data if it exists and is fresh."""
+def _load_from_cache(date_str: str, year: str, *, enforce_ttl: bool = True) -> dict | None:
+    """Load cached VRS data if it exists.
+
+    enforce_ttl=True   → honour GH_CACHE_TTL_HOURS (for the *latest* snapshot
+                         where Valve may push updates).
+    enforce_ttl=False  → always return the cache if present.  Historical
+                         snapshots are immutable, so there is no reason to
+                         expire them — doing so forces thousands of HTTP
+                         requests whenever an old snapshot is revisited
+                         (e.g. the Team Breakdown → Historical Development tab).
+    """
     cache_path = _get_cache_path(date_str, year).replace('.json', '.pkl')
 
     if not os.path.exists(cache_path):
         return None
 
     try:
-        mtime = datetime.fromtimestamp(os.path.getmtime(cache_path))
-        age_hours = (datetime.now() - mtime).total_seconds() / 3600
-
-        if age_hours > GH_CACHE_TTL_HOURS:
-            return None  # Cache is stale
+        if enforce_ttl:
+            mtime = datetime.fromtimestamp(os.path.getmtime(cache_path))
+            age_hours = (datetime.now() - mtime).total_seconds() / 3600
+            if age_hours > GH_CACHE_TTL_HOURS:
+                return None  # Cache is stale
 
         with open(cache_path, 'rb') as f:
             return pickle.load(f)
@@ -329,6 +338,11 @@ def load_valve_github_data(date_str: str | None = None,
         "error":              None,
     }
 
+    # Only the implicit "give me latest" path (date_str=None) should enforce
+    # the TTL — that's the request that needs freshness.  An explicit date is
+    # always a historical snapshot (immutable), so we must never expire it.
+    _is_latest_request = not date_str
+
     if not date_str:
         date_str, year = find_latest_date()
     if not date_str:
@@ -336,7 +350,7 @@ def load_valve_github_data(date_str: str | None = None,
         return result
 
     # Check cache first (before GitHub fetch)
-    cached = _load_from_cache(date_str, year)
+    cached = _load_from_cache(date_str, year, enforce_ttl=_is_latest_request)
     if cached:
         cached["source"] = "github_cache"
         return cached

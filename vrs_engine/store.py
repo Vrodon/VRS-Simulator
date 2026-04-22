@@ -146,8 +146,25 @@ class Store:
 
         id_start = _LIQ_ID_OFFSET + len(self.matches_df)
 
+        # Dedup guard: build a set of (date-of-day, winner, loser) keys already
+        # present from Valve's snapshot so we don't double-count a match that
+        # somehow appears in both sources. In normal operation Valve drops
+        # unfinished events whole, so overlap is zero — but the guard is cheap
+        # and protects against edge cases (e.g. an event Valve did include but
+        # that we re-fetch from Liquipedia during backfill).
+        existing_keys: set[tuple] = set()
+        if not self.matches_df.empty:
+            for m in self.matches_df.itertuples(index=False):
+                m_date = m.date
+                if isinstance(m_date, datetime):
+                    day = m_date.date()
+                else:
+                    day = pd.Timestamp(m_date).date()
+                existing_keys.add((day, str(m.winner), str(m.loser)))
+
         new_matches: list[dict] = []
         new_prizes:  list[dict] = []
+        skipped_dupes = 0
 
         # ── Series results ────────────────────────────────────────────
         for i, row in enumerate(series_df.itertuples(index=False)):
@@ -155,11 +172,19 @@ class Store:
             if not isinstance(date, datetime):
                 date = datetime.combine(date, datetime.min.time())
 
+            winner = str(row.winner)
+            loser  = str(row.loser)
+            key = (date.date(), winner, loser)
+            if key in existing_keys:
+                skipped_dupes += 1
+                continue
+            existing_keys.add(key)
+
             new_matches.append({
-                "match_id":  id_start + i,
+                "match_id":  id_start + len(new_matches),
                 "date":      date,
-                "winner":    str(row.winner),
-                "loser":     str(row.loser),
+                "winner":    winner,
+                "loser":     loser,
                 "prize_pool": float(getattr(row, "prize_pool", 0.0) or 0.0),
                 "is_lan":    bool(getattr(row, "is_lan", False)),
             })
@@ -173,6 +198,24 @@ class Store:
                     "amount": winner_prize,
                 })
 
+        # Dedup guard for prizes: avoid double-crediting an event whose prize
+        # rows are already in the store (Valve bpm produces one row per team
+        # per event, dated at the event end). Key is (team, date-of-day).
+        existing_prize_keys: set[tuple] = set()
+        if not self.prizes_df.empty:
+            for p in self.prizes_df.itertuples(index=False):
+                p_date = p.date
+                if isinstance(p_date, datetime):
+                    day = p_date.date()
+                else:
+                    day = pd.Timestamp(p_date).date()
+                existing_prize_keys.add((str(p.team), day))
+        # Also exclude prize rows we just added from the match loop above.
+        for np_row in new_prizes:
+            existing_prize_keys.add((np_row["team"], np_row["date"].date()))
+
+        skipped_prize_dupes = 0
+
         # ── Prize-only rows ───────────────────────────────────────────
         for row in prize_df.itertuples(index=False):
             amount = float(getattr(row, "winner_prize", 0.0) or 0.0)
@@ -181,11 +224,25 @@ class Store:
             date = row.date
             if not isinstance(date, datetime):
                 date = datetime.combine(date, datetime.min.time())
+            team = str(row.winner)
+            prize_key = (team, date.date())
+            if prize_key in existing_prize_keys:
+                skipped_prize_dupes += 1
+                continue
+            existing_prize_keys.add(prize_key)
             new_prizes.append({
-                "team":   str(row.winner),
+                "team":   team,
                 "date":   date,
                 "amount": amount,
             })
+
+        if skipped_dupes or skipped_prize_dupes:
+            import logging
+            logging.getLogger(__name__).info(
+                "append_liquipedia: skipped %d duplicate match(es) and %d "
+                "duplicate prize row(s) already in store",
+                skipped_dupes, skipped_prize_dupes,
+            )
 
         # ── Append to canonical tables ────────────────────────────────
         if new_matches:
@@ -201,3 +258,99 @@ class Store:
                  pd.DataFrame(new_prizes, columns=PRIZE_COLS)],
                 ignore_index=True,
             )
+
+    # ── Simulation append ─────────────────────────────────────────────────────
+
+    def append_simulation(
+        self,
+        extra_matches: list[dict] | pd.DataFrame | None = None,
+        extra_prizes:  list[dict] | None               = None,
+    ) -> None:
+        """
+        Append hypothetical sim rows to the store, so the full engine can be
+        re-run against a what-if scenario.
+
+        extra_matches  list of dicts or DataFrame; each entry has:
+                         date, winner, loser, prize_pool, is_lan
+                       (optional: winner_prize — treated as a BO prize if > 0)
+
+        extra_prizes   list of dicts; each entry has:
+                         team, date, prize
+                       (keys "amount" or "prize_won" are also accepted)
+
+        Artificial match IDs pick up where append_liquipedia left off, so
+        simulation rows never collide with Valve or Liquipedia match IDs.
+        """
+        # ── Matches ───────────────────────────────────────────────────
+        if extra_matches is not None:
+            if isinstance(extra_matches, pd.DataFrame):
+                match_iter = extra_matches.to_dict(orient="records")
+            else:
+                match_iter = list(extra_matches)
+
+            id_start = _LIQ_ID_OFFSET + len(self.matches_df)
+            new_matches: list[dict] = []
+            new_prizes_from_matches: list[dict] = []
+
+            for i, m in enumerate(match_iter):
+                loser = str(m.get("loser", "") or "")
+                if not loser:
+                    continue  # prize-only rows handled via extra_prizes
+                date = m["date"]
+                if not isinstance(date, datetime):
+                    date = datetime.combine(date, datetime.min.time())
+
+                new_matches.append({
+                    "match_id":  id_start + i,
+                    "date":      date,
+                    "winner":    str(m["winner"]),
+                    "loser":     loser,
+                    "prize_pool": float(m.get("prize_pool", 0.0) or 0.0),
+                    "is_lan":    bool(m.get("is_lan", False)),
+                })
+
+                winner_prize = float(m.get("winner_prize", 0.0) or 0.0)
+                if winner_prize > 0:
+                    new_prizes_from_matches.append({
+                        "team":   str(m["winner"]),
+                        "date":   date,
+                        "amount": winner_prize,
+                    })
+
+            if new_matches:
+                self.matches_df = pd.concat(
+                    [self.matches_df,
+                     pd.DataFrame(new_matches, columns=MATCH_COLS)],
+                    ignore_index=True,
+                )
+            if new_prizes_from_matches:
+                self.prizes_df = pd.concat(
+                    [self.prizes_df,
+                     pd.DataFrame(new_prizes_from_matches, columns=PRIZE_COLS)],
+                    ignore_index=True,
+                )
+
+        # ── Prizes ────────────────────────────────────────────────────
+        if extra_prizes:
+            new_prizes: list[dict] = []
+            for p in extra_prizes:
+                amount = float(
+                    p.get("amount", p.get("prize", p.get("prize_won", 0.0))) or 0.0
+                )
+                if amount <= 0:
+                    continue
+                date = p["date"]
+                if not isinstance(date, datetime):
+                    date = datetime.combine(date, datetime.min.time())
+                new_prizes.append({
+                    "team":   str(p["team"]),
+                    "date":   date,
+                    "amount": amount,
+                })
+
+            if new_prizes:
+                self.prizes_df = pd.concat(
+                    [self.prizes_df,
+                     pd.DataFrame(new_prizes, columns=PRIZE_COLS)],
+                    ignore_index=True,
+                )

@@ -52,6 +52,11 @@ def run(store: Store, cutoff: datetime = None) -> dict:
                                          breakdown display; keyed by match_id.
                                          Each value: {winner, loser,
                                                       w_delta, l_delta}
+
+        "attribution" dict  per-factor per-team contribution rows used by
+                            the Team Breakdown "Score Anatomy" panel.
+                            Keys: bo, bc, own_network, on, lan, h2h.
+                            Each (except h2h) is dict[team → list[dict]].
     """
     if cutoff is None:
         cutoff = datetime.now()
@@ -126,27 +131,27 @@ def run(store: Store, cutoff: datetime = None) -> dict:
     # teams still appear as opponents in BC and ON calculations.
     # ═══════════════════════════════════════════════════════════════════════
 
-    bo_sum, bo_ratio, bo_factor = compute_bo(prizes, all_teams)
+    bo_sum, bo_ratio, bo_factor, bo_contribs = compute_bo(prizes, all_teams)
 
     # ═══════════════════════════════════════════════════════════════════════
     # STEP 5 — Bounty Collected (BC)
     # Uses bo_ratio (raw normalised ratio, NOT curve'd bo_factor)
     # ═══════════════════════════════════════════════════════════════════════
 
-    bc_pre, bc_factor = compute_bc(matches, bo_ratio, eligible)
+    bc_pre, bc_factor, bc_contribs = compute_bc(matches, bo_ratio, eligible)
 
     # ═══════════════════════════════════════════════════════════════════════
     # STEP 6 — Opponent Network (ON) — two-pass (ownNetwork → opponentNetwork)
     # Reverse-engineered from Valve's team.js; see compute_on for details.
     # ═══════════════════════════════════════════════════════════════════════
 
-    on_factor = compute_on(matches, eligible)
+    on_factor, own_network_contribs, on_contribs = compute_on(matches, eligible)
 
     # ═══════════════════════════════════════════════════════════════════════
     # STEP 7 — LAN Wins
     # ═══════════════════════════════════════════════════════════════════════
 
-    lan_ct, lan_factor = compute_lan(matches, eligible)
+    lan_ct, lan_factor, lan_contribs = compute_lan(matches, eligible)
 
     # ═══════════════════════════════════════════════════════════════════════
     # STEP 8 — Factor Score (seed)
@@ -197,4 +202,17 @@ def run(store: Store, cutoff: datetime = None) -> dict:
     )
     standings["rank"] = standings.index + 1
 
-    return {"standings": standings, "match_h2h": match_h2h}
+    attribution = {
+        "bo":          bo_contribs,
+        "bc":          bc_contribs,
+        "own_network": own_network_contribs,
+        "on":          on_contribs,
+        "lan":         lan_contribs,
+        "h2h":         match_h2h,
+    }
+
+    return {
+        "standings":   standings,
+        "match_h2h":   match_h2h,
+        "attribution": attribution,
+    }

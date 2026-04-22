@@ -156,36 +156,56 @@ def load_all_data() -> dict:
     start_date_str   = (cutoff + timedelta(days=1)).strftime("%Y-%m-%d")
     end_date_str     = today.strftime("%Y-%m-%d")
 
+    # Snapshot cutoff for unfinished-event backfill. Events whose end date is
+    # on/after this datetime were in-progress in Valve's snapshot and must be
+    # fetched whole (Valve drops them via the `finished` flag).
+    # ``_determine_cutoff`` already returns a datetime — use it directly.
+    snapshot_cutoff_dt = cutoff
+
+    # Widen discovery backward so events in-progress at the snapshot (e.g. a
+    # Swiss stage that started days before the snapshot) are rediscovered.
+    discovery_start_str = (cutoff - timedelta(days=30)).strftime("%Y-%m-%d")
+
     # ── 3. Fetch Liquipedia data ──────────────────────────────────────────────
     try:
         discovered = discover_liquipedia_from_portal(
-            start_date_str, end_date_str,
+            discovery_start_str, end_date_str,
             min_tier="B-Tier", include_qualifiers=True,
         )
         if not discovered:
             return {
                 "error": (
                     f"No Liquipedia tournaments found between "
-                    f"{start_date_str} and {end_date_str}."
+                    f"{discovery_start_str} and {end_date_str}."
                 )
             }
 
         slugs = [d["slug"] for d in discovered]
 
         # Serve from cache if fresh (< 2 hours old)
-        if liquipedia_cache_exists(start_date_str, end_date_str, slugs):
-            mtime = liquipedia_cache_mtime(start_date_str, end_date_str, slugs)
+        if liquipedia_cache_exists(
+            start_date_str, end_date_str, slugs,
+            snapshot_cutoff=snapshot_cutoff_dt,
+        ):
+            mtime = liquipedia_cache_mtime(
+                start_date_str, end_date_str, slugs,
+                snapshot_cutoff=snapshot_cutoff_dt,
+            )
             fresh = (datetime.now() - mtime).total_seconds() < 7200
         else:
             fresh = False
 
         if fresh:
-            liq_df = load_liquipedia_from_cache(start_date_str, end_date_str, slugs)
+            liq_df = load_liquipedia_from_cache(
+                start_date_str, end_date_str, slugs,
+                snapshot_cutoff=snapshot_cutoff_dt,
+            )
         else:
             liq_df = fetch_liquipedia_matches(
                 start_date_str, end_date_str,
                 tournament_slugs=slugs,
                 force_refresh=not fresh,
+                snapshot_cutoff=snapshot_cutoff_dt,
             )
 
         if liq_df is None or liq_df.empty:

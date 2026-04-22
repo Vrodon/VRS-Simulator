@@ -23,7 +23,7 @@ from .pipeline import run as run_vrs
 from .constants import (
     DECAY_DAYS, FLAT_DAYS, DECAY_RAMP,
     RD_FIXED, Q_GLICKO, BASE_K, PRIZE_CAP,
-    TOP_N, ON_ITERS, SEED_MIN, SEED_MAX,
+    TOP_N, SEED_MIN, SEED_MAX,
 )
 
 # ── Math helpers (used directly in app.py for display / what-if logic) ────────
@@ -39,7 +39,7 @@ __all__ = [
     # Constants
     "DECAY_DAYS", "FLAT_DAYS", "DECAY_RAMP",
     "RD_FIXED", "Q_GLICKO", "BASE_K", "PRIZE_CAP",
-    "TOP_N", "ON_ITERS", "SEED_MIN", "SEED_MAX",
+    "TOP_N", "SEED_MIN", "SEED_MAX",
     # Math helpers
     "curve", "event_stakes", "age_weight", "lerp",
     "g_rd", "G_FIXED", "expected_win", "top_n_sum",
