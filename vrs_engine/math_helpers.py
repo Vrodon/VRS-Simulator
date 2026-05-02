@@ -5,8 +5,50 @@ Core mathematical functions: normalization curve, time decay, interpolation, Gli
 """
 
 import math
-from datetime import datetime
+from datetime import datetime, timedelta
 from .constants import FLAT_DAYS, DECAY_RAMP, DECAY_DAYS, Q_GLICKO, PRIZE_CAP, RD_FIXED
+
+
+# ── Valve publication schedule ────────────────────────────────────────
+# Empirically (cache/github_vrs Dec-2024 → present): Valve publishes the
+# new VRS on the **first Monday of each calendar month**.  These helpers
+# are used by the UI to anchor "expiring soon" and "recent boost" panels
+# to the next/previous publication boundary, not to today.
+
+def first_monday_of_month(year: int, month: int) -> datetime:
+    """Return the datetime of the first Monday in (year, month) at 00:00."""
+    d = datetime(year, month, 1)
+    return d + timedelta(days=(-d.weekday()) % 7)
+
+
+def next_valve_publication(from_date: datetime) -> datetime:
+    """First Monday strictly after `from_date`.
+
+    If `from_date` is before this month's first Monday, return that.
+    Otherwise return the first Monday of next month.
+    """
+    fm = first_monday_of_month(from_date.year, from_date.month)
+    if from_date.date() < fm.date():
+        return fm
+    if from_date.month == 12:
+        return first_monday_of_month(from_date.year + 1, 1)
+    return first_monday_of_month(from_date.year, from_date.month + 1)
+
+
+def prev_valve_publication(from_date: datetime) -> datetime:
+    """First Monday strictly before `from_date`.
+
+    If `from_date` is after this month's first Monday, return that.
+    Otherwise return the first Monday of last month.
+    Pre-Dec 2024 the actual cadence was inconsistent (Tue/Wed); the
+    helper still returns a reasonable approximation.
+    """
+    fm = first_monday_of_month(from_date.year, from_date.month)
+    if from_date.date() > fm.date():
+        return fm
+    if from_date.month == 1:
+        return first_monday_of_month(from_date.year - 1, 12)
+    return first_monday_of_month(from_date.year, from_date.month - 1)
 
 
 def curve(x: float) -> float:

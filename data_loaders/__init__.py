@@ -13,10 +13,16 @@ from .liquipedia_loader import (
     fetch_liquipedia_matches,
     search_tournaments as search_liquipedia_tournaments,
     discover_from_portal as discover_liquipedia_from_portal,
+    discover_upcoming_events as discover_liquipedia_upcoming_events,
     load_from_cache as load_liquipedia_from_cache,
     cache_exists as liquipedia_cache_exists,
     cache_mtime as liquipedia_cache_mtime,
     clear_cache as clear_liquipedia_cache,
+)
+from .bracket_parser import (
+    BracketMatch,
+    Stage,
+    parse_tournament_brackets,
 )
 
 __all__ = [
@@ -27,8 +33,12 @@ __all__ = [
     "fetch_liquipedia_matches",
     "search_liquipedia_tournaments",
     "discover_liquipedia_from_portal",
+    "discover_liquipedia_upcoming_events",
     "load_liquipedia_from_cache",
     "liquipedia_cache_exists",
     "liquipedia_cache_mtime",
     "clear_liquipedia_cache",
+    "BracketMatch",
+    "Stage",
+    "parse_tournament_brackets",
 ]

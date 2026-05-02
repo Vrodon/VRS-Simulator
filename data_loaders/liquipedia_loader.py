@@ -432,6 +432,86 @@ def _parse_infobox(soup) -> dict:
     return result
 
 
+def _infobox_field(soup, label: str) -> str:
+    """
+    Look up a labelled value in the .fo-nttax-infobox.
+
+    Liquipedia infobox rows are ``<div><div class="infobox-cell-2
+    infobox-description">Label:</div><div style="width:50%">Value</div></div>``
+    — i.e. the value is the **next sibling** of the description cell within a
+    wrapping div, not another ``.infobox-cell-2``. This helper finds the
+    description whose text matches ``label`` (case-insensitive, trailing colon
+    optional) and returns the sibling's text.
+
+    Returns "" when the label is not present.
+    """
+    infobox = soup.select_one(".fo-nttax-infobox")
+    if infobox is None:
+        return ""
+    needle = label.strip().rstrip(":").lower()
+    for desc in infobox.select(".infobox-description"):
+        text = desc.get_text(" ", strip=True).rstrip(":").strip().lower()
+        if text == needle:
+            value = desc.find_next_sibling()
+            if value is not None:
+                return value.get_text(" ", strip=True)
+            return ""
+    return ""
+
+
+def _parse_format(soup) -> str:
+    """
+    Extract a short, human-readable description of the tournament format.
+
+    Liquipedia tournament pages don't carry "Format" as an infobox field —
+    instead they have a ``<h3>Format</h3>`` section whose body lists bullet
+    points ("Single-elimination playoffs", "Swiss group stage", …). On modern
+    MediaWiki the heading is wrapped in ``<div class="mw-heading mw-heading3">``
+    so the prose paragraphs are siblings of the *wrapper*, not the bare h3.
+    This helper handles both the wrapped and bare layouts.
+
+    Walks forward from the Format heading collecting the text of every
+    ``<p>``, ``<ul>``, ``<ol>`` and ``<dl>`` until the next heading. Returns
+    "" when no Format section is present.
+
+    The full untruncated prose is returned — downstream consumers (the
+    structured ``format_parser.parse_format_prose`` parser, plus UI
+    rendering) handle their own truncation if they want a short version.
+    """
+    start = None
+    # Modern: <div class="mw-heading"> wraps the h2/h3
+    for wrap in soup.select("div.mw-heading"):
+        heading = wrap.find(["h2", "h3"])
+        if heading and heading.get_text(strip=True).lower() == "format":
+            start = wrap
+            break
+    # Fallback: bare h2/h3 (older Liquipedia / non-wrapped layout)
+    if start is None:
+        for h in soup.select("h2, h3"):
+            if h.get_text(strip=True).lower() == "format":
+                start = h
+                break
+    if start is None:
+        return ""
+
+    parts: list[str] = []
+    for sib in start.next_siblings:
+        name = getattr(sib, "name", None)
+        if name is None:
+            continue
+        # Stop at the next section heading (wrapper or bare)
+        if name in ("h2", "h3"):
+            break
+        if name == "div" and any(c.startswith("mw-heading") for c in sib.get("class", [])):
+            break
+        if name in ("p", "ul", "ol", "dl"):
+            chunk = sib.get_text(" ", strip=True)
+            if chunk:
+                parts.append(chunk)
+
+    return " · ".join(parts).strip()
+
+
 # ── Date string parsing ─────────────────────────────────────────────────────────
 
 def _parse_date_str(raw: str) -> datetime | None:
@@ -508,6 +588,198 @@ def _parse_prize_pool(soup) -> dict[str, float]:
                 team_prizes[_norm(team_raw)] = prize
 
     return team_prizes
+
+
+def _parse_prize_distribution_by_place(soup) -> dict[str, float]:
+    """
+    Parse the prize pool placement table keyed by placement label rather than
+    team name. Useful for upcoming events where the placement column carries a
+    label (``"1st"``, ``"2nd"``, ``"3rd-4th"``, …) but the team cells are still
+    empty.
+
+    Returns a dict like ``{"1st": 250000.0, "2nd": 100000.0, "3rd-4th": 35000.0}``.
+    Shared placements keep the merged label so the consumer can decide how to
+    distribute among slot-holders.
+    """
+    placements: dict[str, float] = {}
+    wrapper = soup.select_one(".prizepool-section-wrapper")
+    if wrapper is None:
+        return placements
+
+    for row in wrapper.select(".csstable-widget-row"):
+        if "prizepooltable-header" in row.get("class", []):
+            continue
+        if "ppt-toggle-expand" in row.get("class", []):
+            continue
+
+        cells = row.select(".csstable-widget-cell")
+        if len(cells) < 2:
+            continue
+
+        place_text = cells[0].get_text(" ", strip=True)
+        # Normalise dashes in shared placements ("3rd – 4th" → "3rd-4th")
+        place_norm = re.sub(
+            r"\s*[\u2013\u2014-]\s*", "-",
+            place_text.replace("\xa0", " ").strip(),
+        )
+        if not place_norm:
+            continue
+
+        prize_text = cells[1].get_text(strip=True).replace("$", "").replace(",", "").strip()
+        try:
+            prize = float(prize_text)
+        except ValueError:
+            continue
+        if prize <= 0:
+            continue
+
+        # Last entry wins on duplicate place labels (Liquipedia occasionally
+        # repeats rows for tokens / region pools — we already filtered to
+        # rows with a USD prize, so collisions are rare).
+        placements[place_norm] = prize
+
+    return placements
+
+
+# Withdrawal note pattern. Liquipedia phrases these as
+#   "April 4th - FUT Esports withdraw from the event; ..."
+#   "March 31st - 33 withdraw from the event due to visa issues; ..."
+# Anchor the team name on a space-flanked dash separator so the leading
+# date prefix isn't sucked into the capture by a non-greedy `.*?`.
+_WITHDRAW_NOTE_RE = re.compile(
+    r"\s[—–\-]\s+"
+    r"([A-Z0-9][\w .']*?)\s+"
+    r"(?:withdraws?|withdrew|has\s+withdrawn)\b",
+    re.IGNORECASE,
+)
+
+
+def _parse_withdrawn_teams(soup) -> set[str]:
+    """
+    Pull canonical names of teams flagged as withdrawn / replaced in the
+    page's ``div.inotes-inner`` blocks.
+
+    Liquipedia phrases withdrawal notes as e.g.
+    ``"FUT Esports withdraw from the event; they are replaced by K27 ."``
+    The first capture group of ``_WITHDRAW_NOTE_RE`` is the team that left.
+    """
+    out: set[str] = set()
+    for note_box in soup.select("div.inotes-inner"):
+        text = note_box.get_text(" ", strip=True)
+        for m in _WITHDRAW_NOTE_RE.finditer(text):
+            raw = m.group(1).strip().rstrip(".,;:")
+            canon = _norm(raw)
+            if canon:
+                out.add(canon)
+    return out
+
+
+_STAGE_INVITE_HEADING_RE = re.compile(
+    r"^\s*(Stage\s*\d+)\s+Invites?\s*$", re.IGNORECASE,
+)
+
+
+def _parse_per_stage_invites(soup) -> dict[str, list[str]]:
+    """
+    For Major-tier events whose Participants section carries h3 sub-headings
+    of the form ``"Stage N Invites"``, return ``{stage_name: [teams]}``
+    grouping each h3 block's teamcards under its stage label.
+
+    Returns ``{}`` when the page doesn't use this layout (i.e. all single-
+    stage events). Withdrawn teams (per ``_parse_withdrawn_teams``) are
+    excluded just like in ``_parse_seeded_teams``.
+    """
+    withdrawn = _parse_withdrawn_teams(soup)
+    out: dict[str, list[str]] = {}
+
+    for wrap in soup.select("div.mw-heading"):
+        h = wrap.find(["h2", "h3", "h4"])
+        if h is None:
+            continue
+        m = _STAGE_INVITE_HEADING_RE.match(h.get_text(" ", strip=True))
+        if m is None:
+            continue
+        stage_name = re.sub(r"\s+", " ", m.group(1).strip())
+        teams: list[str] = []
+        seen: set[str] = set()
+        for sib in wrap.next_siblings:
+            name = getattr(sib, "name", None)
+            if name is None:
+                continue
+            # Stop at the next mw-heading wrapper of any level.
+            if name == "div" and any(c.startswith("mw-heading")
+                                     for c in sib.get("class", [])):
+                break
+            if name in ("h2", "h3", "h4"):
+                break
+            # The sibling itself may *be* a teamcard, or contain teamcards as
+            # descendants (Liquipedia sometimes wraps cards in a row div).
+            cards = []
+            if hasattr(sib, "get") and "teamcard" in (sib.get("class") or []):
+                cards.append(sib)
+            if hasattr(sib, "select"):
+                cards.extend(sib.select(".teamcard"))
+            for card in cards:
+                head = card.find("center") or card
+                a = head.select_one("a[title][href^='/counterstrike/']")
+                if a is None:
+                    continue
+                tname = (a.get("title") or "").strip()
+                if not tname or ":" in tname or tname.upper() in {"TBD", "TBA"}:
+                    continue
+                canon = _norm(tname)
+                if canon in seen or canon in withdrawn:
+                    continue
+                seen.add(canon)
+                teams.append(canon)
+        if teams:
+            out[stage_name] = teams
+
+    return out
+
+
+def _parse_seeded_teams(soup) -> list[str]:
+    """
+    Parse participating / seeded team names from a tournament page.
+
+    Liquipedia renders each participant as a ``.teamcard`` block. The team's
+    name lives in the heading link (``<a title="Team Vitality" …>``) inside the
+    centred title row. Player rows under the same teamcard link to player
+    pages and are filtered out via the ``title`` attribute (player titles
+    typically include the team name as a parenthetical).
+
+    Teams flagged as withdrawn in ``div.inotes-inner`` notes (e.g. *"FUT
+    Esports withdraw from the event; they are replaced by K27"*) are
+    excluded — their replacement is already listed as its own teamcard.
+
+    Returns canonical (Valve-normalised) names with duplicates removed and
+    insertion order preserved.
+    """
+    withdrawn = _parse_withdrawn_teams(soup)
+
+    teams: list[str] = []
+    seen: set[str] = set()
+
+    for card in soup.select(".teamcard"):
+        # The first <center> in the teamcard holds the team title row; fall
+        # back to the card itself if the markup ever changes.
+        head = card.find("center") or card
+        a = head.select_one("a[title][href^='/counterstrike/']")
+        if a is None:
+            continue
+        name = (a.get("title") or "").strip()
+        if not name or ":" in name:
+            continue
+        # Skip TBD / placeholder cards
+        if name.upper() in {"TBD", "TBA"}:
+            continue
+        canon = _norm(name)
+        if canon in seen or canon in withdrawn:
+            continue
+        seen.add(canon)
+        teams.append(canon)
+
+    return teams
 
 
 # ── Match parsing ───────────────────────────────────────────────────────────────
@@ -1014,3 +1286,201 @@ def fetch_liquipedia_matches(
 
     _save_cache(start_date, end_date, tournament_slugs, df, snapshot_cutoff)
     return df
+
+
+# ── Upcoming-event discovery ────────────────────────────────────────────────────
+
+_UPCOMING_CACHE_TTL_SEC = 6 * 3600  # 6 hours: brackets / seeds shift daily near events
+
+
+# Bump when the discovery payload schema changes — invalidates all
+# previously cached upcoming-event JSON files.
+#   v1 = initial 6.1 payload
+#   v2 = full untruncated format prose (Phase 1 of bracket-system rewrite)
+_UPCOMING_CACHE_VERSION = "v2"
+
+
+def _upcoming_cache_path(start_date: str, end_date: str, min_tier: str) -> str:
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    key = hashlib.md5(
+        f"{_UPCOMING_CACHE_VERSION}|{start_date}|{end_date}|{min_tier}".encode()
+    ).hexdigest()[:8]
+    return os.path.join(CACHE_DIR, f"upcoming_{start_date}_{end_date}_{key}.json")
+
+
+def _load_upcoming_cache(path: str) -> list[dict] | None:
+    if not os.path.exists(path):
+        return None
+    if (time.time() - os.path.getmtime(path)) > _UPCOMING_CACHE_TTL_SEC:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            records = json.load(f)
+    except Exception as exc:
+        logger.warning("Upcoming cache read failed (%s): %s", path, exc)
+        return None
+    for rec in records:
+        for k in ("start_date", "end_date"):
+            if rec.get(k):
+                try:
+                    rec[k] = datetime.fromisoformat(rec[k])
+                except ValueError:
+                    rec[k] = None
+    return records
+
+
+def _save_upcoming_cache(path: str, records: list[dict]) -> None:
+    try:
+        out = []
+        for rec in records:
+            copy = dict(rec)
+            for k in ("start_date", "end_date"):
+                if isinstance(copy.get(k), datetime):
+                    copy[k] = copy[k].isoformat()
+            out.append(copy)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(out, f, indent=2)
+    except Exception as exc:
+        logger.warning("Upcoming cache write failed (%s): %s", path, exc)
+
+
+def discover_upcoming_events(
+    start_date: str,
+    end_date: str,
+    min_tier: str = "B-Tier",
+    today: datetime | None = None,
+    fetch_details: bool = True,
+    force_refresh: bool = False,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+) -> list[dict]:
+    """
+    Discover CS2 events whose end date is on/after ``today`` and which overlap
+    the ``[start_date, end_date]`` window. For each event the per-page infobox,
+    prize-pool table and participant teamcards are parsed to assemble the
+    payload required by the Tournament Predictor (Pillar 3).
+
+    Parameters
+    ----------
+    start_date, end_date : str
+        ISO date strings (YYYY-MM-DD) defining the discovery window.
+    min_tier : str
+        Lowest tier to include — see :func:`discover_from_portal`.
+    today : datetime | None
+        Reference "now". Events with ``end_date < today`` are filtered out
+        (they're in the past). Defaults to ``datetime.now()``.
+    fetch_details : bool
+        When False, skip per-event page fetches and return only the metadata
+        already known from the portal page (slug, name, tier, dates, url).
+        ``prize_pool``, ``is_lan``, ``format``, ``prize_distribution`` and
+        ``seeded_teams`` will be empty/zero. Useful for cheap UI previews.
+    force_refresh : bool
+        Bypass the on-disk cache.
+    progress_callback : Callable | None
+        ``(step, total, status)`` — invoked before each per-event fetch.
+
+    Returns
+    -------
+    list of dicts. Each dict has keys::
+
+        slug                str
+        name                str         (event_name from infobox; falls back to slug title)
+        url                 str
+        tier                str         ("S-Tier" | "A-Tier" | "B-Tier" | …)
+        start_date          datetime
+        end_date            datetime
+        prize_pool          float       (USD; 0.0 when unknown / not yet announced)
+        is_lan              bool
+        format              str         (e.g. "Single Elimination", "Swiss"; "" if unknown)
+        prize_distribution  dict[str, float]   (place label → USD; e.g. {"1st": 250000})
+        seeded_teams        list[str]   (canonical team names, in page order)
+
+    Sorted by start date ascending, then title.
+    """
+    if today is None:
+        today = datetime.now()
+    today_floor = today.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    cache_path = _upcoming_cache_path(start_date, end_date, min_tier)
+    if not force_refresh:
+        cached = _load_upcoming_cache(cache_path)
+        if cached is not None:
+            return [
+                rec for rec in cached
+                if rec.get("end_date") and rec["end_date"] >= today_floor
+            ]
+
+    portal_events = discover_from_portal(
+        start_date=start_date,
+        end_date=end_date,
+        min_tier=min_tier,
+        include_qualifiers=False,
+    )
+
+    upcoming = [
+        ev for ev in portal_events
+        if ev["end_date"] is not None and ev["end_date"] >= today_floor
+    ]
+
+    if not fetch_details:
+        results = [{
+            **ev,
+            "name":               ev["title"],
+            "prize_pool":         0.0,
+            "is_lan":             False,
+            "format":             "",
+            "prize_distribution": {},
+            "seeded_teams":       [],
+        } for ev in upcoming]
+        _save_upcoming_cache(cache_path, results)
+        return results
+
+    results: list[dict] = []
+    total = len(upcoming)
+    for i, ev in enumerate(upcoming):
+        if progress_callback:
+            progress_callback(i + 1, total, f"Inspecting {ev['slug']} ({i + 1}/{total})…")
+
+        html = _fetch_page(ev["slug"])
+        if html is None:
+            logger.warning("Skipping upcoming event (page fetch failed): %s", ev["slug"])
+        else:
+            soup = _bs4(html)
+            meta = _parse_infobox(soup)
+            fmt  = _parse_format(soup)
+            prize_dist   = _parse_prize_distribution_by_place(soup)
+            seeded_teams = _parse_seeded_teams(soup)
+
+            # Prefer infobox dates when present (more precise than portal range)
+            start_dt = meta["start_date"] or ev["start_date"]
+            end_dt   = meta["end_date"]   or ev["end_date"]
+            name     = meta["event_name"] or ev["title"]
+            prize_pool = meta["prize_pool"]
+            is_lan     = meta["is_lan"]
+
+            results.append({
+                "slug":               ev["slug"],
+                "name":               name,
+                "url":                ev["url"],
+                "tier":               ev["tier"],
+                "start_date":         start_dt,
+                "end_date":           end_dt,
+                "prize_pool":         prize_pool,
+                "is_lan":             is_lan,
+                "format":             fmt,
+                "prize_distribution": prize_dist,
+                "seeded_teams":       seeded_teams,
+            })
+
+        if i < total - 1:
+            time.sleep(_REQ_DELAY)
+
+    if progress_callback:
+        progress_callback(total, total, "Done.")
+
+    results.sort(key=lambda x: (x["start_date"] or datetime.max, x["name"]))
+    _save_upcoming_cache(cache_path, results)
+    logger.info(
+        "Upcoming discovery: %d events in %s – %s (today=%s)",
+        len(results), start_date, end_date, today_floor.strftime("%Y-%m-%d"),
+    )
+    return results

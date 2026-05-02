@@ -1,6 +1,6 @@
 # VRS Simulator — Next Steps Roadmap
 
-**Created:** 2026-04-19 · **Last revised:** 2026-04-21
+**Created:** 2026-04-19 · **Last revised:** 2026-04-24
 **Purpose:** One-week plan to make the VRS sim "fly". Self-contained — a future Claude session can pick this up cold.
 
 > **How to use:** Tell Claude `continue NEXT_STEPS.md` (or point at a specific Day/Pillar). When a task is finished, mark it `[x]` and add a one-line note about the actual outcome.
@@ -189,38 +189,27 @@ Replace the current static factor bars ([app.py:947](app.py:947)) with an expand
 
 **Goal:** Tell each team *what they need to do to climb*. Which factor is their ceiling. Who they should beat. What's about to expire.
 
-## Day 5 — "Climb Plan" section
+## Day 5 — "Climb Plan" section [x]
 
-### Task 5.1 — Bottleneck detector
-For each team, identify the **lowest-percentile factor** vs peers (e.g., teams within ±10 ranks).
-- "📉 Your weakest factor is **Opponent Network (0.31)** — peers in your bracket average 0.45."
-- Diagnose root cause from the attribution data:
-  - Low ON because few distinct opponents → "you've beaten the same 4 teams over and over; need to face new opponents"
-  - Low BC because beating low-BO opponents → "your wins are vs teams with low prize-money — need quality wins"
-  - Low LAN because no LAN events → "you have 1 LAN win in 180 days; top-10 teams average 6"
-- The diagnosis comes from comparing the team's attribution rows to peers'.
+A single `### 🧗 Climb Plan` block sits between the Match Impact Explorer and the Score Change Breakdown waterfall ([app.py:3917](app.py:3917)). Four stacked panels: bottleneck (cheap), expiring alert (cheap), target opponents (engine-gated button), path-to-rank (derived from target-opponent cache).
 
-### Task 5.2 — Target-team suggestions
-Engine-driven "what wins would help most?":
-- Generate hypothetical: "team X beats team Y in a BO3 at a $250K LAN event tomorrow."
-- Run engine, compute Δrank.
-- Sort top-20 candidate opponents by Δrank gain per win.
-- Show table: opponent, their rank, expected win % (from current ratings), Δrank if won, Δpoints if won.
-- User can click "simulate this" to add to the What-If Predictor.
+### Task 5.1 — Bottleneck detector [x]
+- **Outcome:** peer group = teams within ±10 ranks of this team (`base_standings["rank"].between(max(1, _cp_rank-10), _cp_rank+10)`, self excluded). For each of BO/BC/ON/LAN, compare factor value to peer mean and convert the delta to seed points via `_pts_per_factor`. The weakest factor (largest negative gap, if worse than −0.5 pts) drives a root-cause sentence: ON → "N distinct opponents beaten vs peer avg M — face new teams"; BC → "avg opponent BO ratio X — target top-ranked opponents"; LAN → "N LAN wins vs peer avg M"; BO → "top prize in window $X — deep runs at large events compound". If no factor lags, the panel shows a green "no weakness vs peers" card. Two-column layout: the weakest-factor card on the left, a full 4-row gap table on the right with self / peer-avg / pts-gap.
 
-### Task 5.3 — Path to rank N
-- "To overtake the team above you (rank N-1), you need +X points."
-- Find minimum-effort scenario: combinations of plausible wins (1, 2, 3, ... matches at next reasonable event) that achieve the gap.
-- Plausible = opponents with current expected win % > 30%.
-- Display as a checklist: "Win these 2 matches at the next $500K LAN → reach rank N-1."
+### Task 5.2 — Target-team suggestions [x]
+- **Outcome:** on-demand via `▶ Simulate climb plan` button (gated to avoid ≈10s engine work on every page render). Candidates = the 10 teams immediately above the selected team by rank (closest first); this maximises achievable Δrank per win and `opp_bo_ratio` already caps at 1.0 for any top-5 opponent, so widening the pool adds latency with little marginal insight. Per candidate: build a fresh `Store`, append one hypothetical BO3 win (`is_lan=True`, `prize_pool=$250K`, `date=_ref_cutoff`), re-run the engine with the same cutoff, diff standings vs `ex`. Session-cached in `st.session_state._climb_targets_cache` keyed by `(mode, cutoff_yyyymmdd, sel_team)` so later tab switches are instant. Progress bar during the run. Result table columns: **Opponent** (with current rank), **E(win)** (Glicko from `expected_win(ex.seed, opp.seed)`, green ≥ 50 / purple ≥ 30 / red < 30), **Δ pts**, **Rank change** (old → new), **Δ rank** arrow. Sort by Δrank asc, Δpts desc.
+- Deferred the "simulate this" deep-link into the What-If Predictor — adding a single-click route into a different page requires a session-state bridge that's worth its own small task. The table gives the same information the user would have copied across manually.
 
-### Task 5.4 — Expiring-points alert
-- Surfaces from Task 4.1 data: "⚠️ You're projected to lose 38 points over the next 14 days as old matches age out. To hold rank, you need wins worth +38 in that window."
-- Quantify "wins worth +38" using the engine: e.g., "1 LAN win vs top-10 opponent = ~25 pts, 2 mid-tier wins = ~40 pts."
+### Task 5.3 — Path to rank N [x]
+- **Outcome:** rendered only when 5.2's cache exists and `_cp_rank > 1`. Gap = `points_of_(rank-1) − team_points + 0.5` (small margin to actually pass). From 5.2's results, filter to "plausible" wins (E(win) ≥ 30% and Δpts > 0), sort by Δpts desc, greedily accumulate until sum ≥ gap. Success case → green checklist card: "N win(s), total +X pts (need +Y)". Failure case → yellow warning card: "No single-LAN plausible path closes the Y-pt gap — best achievable +X; a $1M event or multi-event stacking needed."
+
+### Task 5.4 — Expiring-points alert [x]
+- **Outcome:** reuses the `_window_items` list already built in the Time Window section (4.1), filtering to items with `age_w ≤ 14/DECAY_RAMP` (≈ 0.093) — the ones whose weight will reach 0 within 14 days. Point loss = `Σ pts` of those items. The "wins worth +X" estimate compares against a closed-form top-tier LAN boost: `(2 × 0.602/10 + 1/10) / 4 × 1600 / _avg_range` (BC + ON via `ev_w(250k) = curve(0.25) ≈ 0.602`, plus a LAN slot), and `× 0.55` for a mid-tier equivalent. The alert sentence resolves to "≈ N top-tier LAN wins, or ≈ M mid-tier wins" — the exact engine deltas live in the Target Opponents table. Turns green with a ✅ if there's nothing within 14 days of expiring.
 
 ### Acceptance
-- Every team has a "Climb Plan" tab/section showing their bottleneck factor, 5+ specific target opponents, a path-to-next-rank checklist, and an expiring-points alert.
-- Suggestions feel useful, not generic. (Validate by checking: do top-3 teams' suggestions involve the *right* upcoming events?)
+- [x] Every team has a Climb Plan section: bottleneck card + gap table, expiring alert, target-opponents table (10 candidates), and path-to-next-rank checklist.
+- [x] Suggestions are engine-driven (actual Δrank / Δpts, not heuristics). Bottleneck diagnosis is attribution-driven (distinct opponents, avg opp_bo, LAN count).
+- [x] All 26 tests pass (21 regression snapshots + 5 others) in ~17s — Climb Plan is UI-only, no engine changes.
 
 ---
 
@@ -228,38 +217,174 @@ Engine-driven "what wins would help most?":
 
 **Goal:** "Pick an upcoming event, click through the bracket, see exactly where teams end up." Should take a user under 2 minutes for a full Major bracket.
 
+## Architecture Decisions (locked via grill-me, 2026-04-25)
+
+These constrain Days 6–7. Every implementation choice traces back to one of these.
+
+### Reframings (apply globally)
+
+- **Predicted = third `standings_mode`.** Sidebar gains `"🔮 Predicted"` alongside `"🏛️ As Published"` / `"📡 Updated to Today"`. When active, every page (Ranking Dashboard, Team Breakdown) reflects the simulated future. Tournament Predictor page is the *definition surface*; mode toggle is the *propagation surface*.
+- **"🔮 What-If Predictor" page → deleted.** Tournament Predictor supersedes it. The `Store.append_simulation()` plumbing from Task 2.4 stays — Tournament Predictor uses the same call site. Only the orphan UI page (≈ `app.py:1045–~1500`) goes away.
+- **Persistent banner on other pages when mode=Predicted.** Format: "📡 Predicted: N events queued, last computed M min ago · [edit in Tournament Predictor]". ~10 lines in a shared header helper.
+
+### Decision sheet
+
+| # | Decision | Choice |
+|---|---|---|
+| 1 | Bracket source | Parse Liquipedia DOM (`.brkts-bracket` / `.brkts-matchlist`); generate-SE fallback when parse yields zero matches |
+| 2 | Match identity | Slot lineage path `"<stage_id>::<round><match>"` (e.g. `"s1::R1M0"`); `bracket_signature = hash(seeded_teams_tuple, format)` guards against upstream changes |
+| 3 | State shape | Scenario-aware from start: `bracket_state[slug] = {"scenarios": {name: {"picks": {...}, "created": ts}}, "active_scenario": "current", "seed_signature": h, "include_in_chain": bool}` |
+| 4 | Recompute trigger | Live on every pick + memoize by `(picks_hash, today_cutoff)` + user-toggleable Pause for batch fills |
+| 5 | Baseline | **No per-page toggle.** Predicted mode = Updated-to-Today data + active picks. One baseline, one engine path |
+| 6 | Auto-fill rule | Glicko `expected_win(seed_a, seed_b)`; unranked teams → SEED_MIN(400); ties broken alphabetically |
+| 7 | Mid-flight events | Lock played slots (read-only, "actual result" badge). Pre-playoff stages (Swiss/groups) auto-reflect Liquipedia data |
+| 8 | Match dates | Per-match Liquipedia date when present, else event `end_date`. Prize rows always at `end_date` |
+| 9 | Format scope | Full coverage: SE+bronze, double-elim, Swiss, groups |
+| 10 | Pick keys | Flat dict, stage-prefixed: `picks["s0::R1M0"] = "FaZe"`. Hashable in one line for engine cache |
+| 11 | Format detection | Hybrid structural-first + heading tiebreaker; walk page in document order, classify each stage container, tag `(stage_id, format, display_heading)` |
+| 12 | Cache layers | **L1** discovery (file, 6h TTL) — already shipped in 6.1. **L2** parsed brackets (file, 6h TTL, new). **L3** engine recompute (session memory, LRU 20). No cross-session pick persistence. Pick-mismatch on L2 refresh = banner + altered-slot badge, never auto-clear |
+| 13 | Multi-event chain | Implicit via `include_in_chain: bool` per event; chain run = concat picks from all flagged events sorted by date, single engine call |
+| 14 | Page integration | New sidebar entry `"🏆 Tournament Predictor"` replaces `"🔮 What-If Predictor"` slot |
+| 15 | Failure modes | Fail soft. Three-tier banner taxonomy: 🟡 warn (degraded but usable), 🟠 stale (picks vs structure mismatch), 🔴 error (can't compute). Never silently nuke user state |
+| 16 | Pick UX | Series-level only (no map score — engine works series-level). SE = clickable bracket. Bronze = extra slot in top round-center. Double-elim = UB+LB+GF nodes. **Swiss** = sequential rounds. R1 stays TBD until Liquipedia publishes OR the user clicks the per-stage **"🌱 auto-seed R1"** button (requires a VRS-snapshot pick). R>1 cascade fires from picks via the Buchholz pairer (`vrs_engine/swiss_pairer.py`); see `NEXT_STEPS_BRACKETS.md` §10 for the locked spec. **Groups** = matrix of pairings, click winner |
+
+### Format-detection algorithm (concrete from #11)
+
+```
+1. Walk page in document order. Collect stage containers (.brkts-bracket / .brkts-matchlist groups).
+2. For each, classify by structure:
+   - 1× .brkts-bracket  + extra-match-in-top-round-center → SE_with_bronze
+   - 1× .brkts-bracket  alone                              → SE
+   - 2× .brkts-bracket  adjacent                           → AMBIGUOUS (DE or 2-group GSL)
+   - 3-4× .brkts-bracket                                   → GSL_groups
+   - .brkts-matchlist × N grouped                          → AMBIGUOUS (Swiss or RR groups)
+3. For AMBIGUOUS stages, resolve via nearest preceding h2/h3:
+   - "Lower Bracket" / "Grand Final" present  → DE
+   - "Swiss" keyword                          → Swiss
+   - "Group" keyword                          → Groups
+4. Tag each stage: (stage_id="s{i}", format, display_heading).
+```
+
+### Placement → prize-label mapping (concrete from #9)
+
+For each format, derive `placement_label` per team after bracket fully resolved, then look up `prize_distribution[label]`:
+
+| Format | Mapping |
+|---|---|
+| SE no bronze | final winner=`"1st"`, finalist=`"2nd"`, SF losers=`"3rd-4th"`, QF losers=`"5th-8th"`, R1 losers=`"9th-16th"`, … |
+| SE w/ bronze | final winner=`"1st"`, finalist=`"2nd"`, bronze winner=`"3rd"`, bronze loser=`"4th"`, then QF/R1 as above |
+| Double-elim | GF winner=`"1st"`, GF loser=`"2nd"`, LB final loser=`"3rd"`, LB SF loser=`"4th"`, LB R(N-2) loser=`"5th-6th"`, … |
+| Swiss | by W-L bucket: 3-0=top, 3-1=next, 3-2=next, 2-3=next, 1-3=next, 0-3=bottom; map to whichever labels Liquipedia published |
+| Groups | within-group rank (1st-in-group, 2nd-in-group, …) → overall placement label per Liquipedia's tournament-wide breakdown |
+
+Missing label in `prize_distribution` (rare — finer bracket resolution than published prize tiers) → 0 prize for that team, log warning.
+
 ## Day 6 — Tournament Predictor MVP
 
-### Task 6.1 — Upcoming event discovery
-- Extend `data_loaders/liquipedia_loader.py` with `discover_upcoming_events(start_date, end_date)`.
-- Returns: `{slug, name, prize_pool, is_lan, start_date, end_date, format, prize_distribution: dict[place → amount], seeded_teams: list[str]}`.
-- Liquipedia's tournament page has all of this. Reuse the existing portal scraper.
+### Task 6.1 — Upcoming event discovery [x]
+- **Outcome:** added `discover_upcoming_events(start_date, end_date, min_tier, today, fetch_details, force_refresh, progress_callback)` in [data_loaders/liquipedia_loader.py](data_loaders/liquipedia_loader.py). Reuses `discover_from_portal()` for slug discovery, then per-event fetches the page and runs four small parsers: `_parse_infobox` (existing — name, dates, prize pool, LAN), `_infobox_field` (sibling-walk; handles modern Liquipedia layout where value is the next sibling of `.infobox-description`, not the next `.infobox-cell-2`), `_parse_prize_distribution_by_place` (place-keyed prize table → `{"1st": 250000, "3rd-4th": 35000}`), `_parse_seeded_teams` (canonical team names from `.teamcard center a[title]`), and `_parse_format` (walks siblings of the `<h3>Format</h3>` wrapper, collecting `<p>/<ul>/<ol>/<dl>` text — the heading is wrapped in `<div class="mw-heading">` on modern MediaWiki, so it walks the wrapper's siblings). Returns the spec'd payload: `{slug, name, url, tier, start_date, end_date, prize_pool, is_lan, format, prize_distribution, seeded_teams}`.
+- **Caching:** 6-hour JSON cache at `cache/upcoming_<start>_<end>_<key>.json` so the UI can iterate without re-walking 7+ pages × 2.5s rate limit. Cache filters on `today` at read time (events that just ended drop out without a refresh).
+- **Live validation (2026-04-25, A-Tier+, 2 mo window):** 7 events parsed cleanly — BLAST Rivals Spring, PGL Astana, Asian Champions League, IEM Atlanta, CS Asia Championships, Stake Ranked Episode 2, **IEM Cologne Major** (32 teams, $1.25M, prize_distribution covers 1st through 17th-19th). Format strings are accurate ("16 Team Swiss System Format … Top 8 teams proceed to Playoffs" for PGL Astana, etc.) and seeded_teams arrives in canonical form (`Vitality`, `FaZe`, `G2`, `FURIA`, …) ready for the bracket UI.
+- All 26 regression tests still pass (~14s).
 
-### Task 6.2 — Event picker UI
-- New page: "🏆 Tournament Predictor".
-- Top: dropdown of upcoming events (defaulting to the next major-tier event).
-- Below: event metadata banner — prize pool, dates, format, seeded teams.
-- Show: "If favorites win every match, here's the projected standings impact" as a baseline (Task 6.4).
+### Task 6.2 — Event picker UI [x]
+- **Outcome:** "🏆 Tournament Predictor" replaces "🔮 What-If Predictor" in the sidebar (per architecture decision #14). Old What-If page body deleted (~200 lines); plumbing it relied on (`Store.append_simulation`, `run_vrs`) is unchanged and now serves Tournament Predictor instead. New page in [app.py:945-1123](app.py:945) renders:
+  - **Discovery filter row:** range start/end (default today → +90d), min tier (default A-Tier), 🔄 Refresh button (force-bypasses 6.1's 6h JSON cache + Streamlit memo).
+  - **Event picker** — selectbox sorted by start date asc, default index = next event. Label format: `"S-Tier · IEM Cologne Major  (Jun 02 – Jun 21, 2026, $1.25M)"`.
+  - **Metadata banner** — 4 metrics (prize pool, dates with day count, LAN/online, tier).
+  - **Format details expander** — renders the 6.1 format prose (`<h3>Format</h3>` section). Caption-only fallback when missing.
+  - **Seeded teams chip cloud** — flag + canonical name per chip; 🟡 warning banner when empty.
+  - **Prize distribution expander** — table view of place → USD (`{"1st": $500K, "3rd-4th": $80K, …}`).
+  - **Bracket placeholder** — info banner pointing to 6.3/6.4 work.
+  - **Liquipedia source link** at the bottom.
+- Streamlit memo (`@st.cache_data`, 6h TTL) wrapping `discover_liquipedia_upcoming_events` so per-rerun walks don't re-hit the file cache. Force-refresh token in session state increments on Refresh click → invalidates both layers atomically.
+- Failure modes wired (per architecture #15): 🔴 error banner on loader exception, 🟡 warning when zero events match filters, 🟡 warning when an event has no seeded teams.
+- All 26 regression tests still pass (~14s); `app.py` syntax-clean; `from data_loaders import discover_liquipedia_upcoming_events` resolves via the new package export.
 
-### Task 6.3 — Click-through bracket UI
-- Render the bracket as an interactive tree.
-  - For single-elim: hand-rolled HTML with two-column rows per round.
-  - For Swiss: a series of stages with team list per stage.
-  - For GSL/double-elim: defer to V2; start with single-elim only.
-- Each unresolved match has two clickable buttons (team A / team B).
-- Picks stored in `st.session_state["bracket_picks"][slug] = {match_slot: winner_name}`.
-- "Auto-fill favorites" button: pre-pick the higher-ranked team in every match (great as a baseline).
-- "Reset" button.
+### Task 6.3 — Click-through bracket UI  [in-progress: slice 1 of 4]
 
-### Task 6.4 — Compute placements + distribute prizes
-- Once bracket is filled, compute final placement per team (1st, 2nd, 3rd-4th, etc.).
-- Map to prize amounts via `prize_distribution` from Liquipedia.
-- Emit `extra_matches` (one per played match, with event's `prize_pool` and `is_lan`) and `extra_prizes` (one per placed team).
-- Pipe through unified `Store.append_simulation()` (from Task 2.4) and run engine.
+Rolled out incrementally; format scope is the locked architecture decision #9 (full coverage). Each slice lands a parser + render path for one format family and is regression-checked end-to-end against a real upcoming event.
+
+**Slice 1 — SE / SE_with_bronze [x]**
+- New `data_loaders/bracket_parser.py` (~250 lines):
+  - `BracketMatch` / `Stage` dataclasses carrying lineage path keys (`"s1::R1M0"`, `"s1::B0"`), feeder ids, R1 seeds, played-result fields.
+  - `_detect_stages` walks the page in document order and classifies each `.brkts-bracket` / `.brkts-matchlist` group via the architecture-#11 hybrid algorithm. Heading tiebreaker upgrade: a "Group Stage" heading on a single-bracket container forces `GSL_groups` (avoids miscalling GSL as SE since the markup is structurally identical).
+  - SE parser handles both bare SE and the SE+bronze layout (top round-center carrying a second match = bronze tell). Bronze feeders point to the SFs but with **loser-advances** semantics.
+  - Stage consolidation: consecutive unsupported stages with the same heading merge into one placeholder card so a 10-round Swiss page emits 1 stage entry, not 10.
+  - `Stage.signature()` for the L2 staleness check (architecture #12 part b).
+- Live validation against 5 S-Tier events: BLAST Rivals (SE, 5 matches), PGL Astana (SE+bronze, 8 matches w/ bronze), IEM Atlanta (SE+bronze, 6 matches), CS Asia Champs (SE+bronze, 6 matches), IEM Cologne Major (SE, 7 matches). Group / GSL stages on those pages classify correctly as placeholders.
+- App-side wiring in [app.py](app.py) Tournament Predictor block:
+  - L2-style `@st.cache_data` (6h) wrapping parser; force-refresh token shared with the L1 discovery cache.
+  - Session state per architecture #3: `bracket_state[slug] = {"scenarios": {"current": {"picks": {…}, "created": ts}}, "active_scenario": "current", "seed_signature": h, "include_in_chain": bool, "paused": bool}`.
+  - Resolver `_resolve(stage, m)` walks feeders through `picks` to compute team_a/team_b for any R2+ slot; bronze branch follows feeder *losers*.
+  - Toolbar: ⚡ Auto-fill favorites (Glicko `expected_win`, unranked → SEED_MIN=400, alphabetical tie-break), 🗑️ Clear picks, ⏸️ Pause toggle (architecture #4), 🔗 Include-in-chain toggle (architecture #13), live picks counter.
+  - Render: round-by-round columns; each match = two `st.button`s with primary highlight on the picked team; played slots render as read-only chips with "📜 actual result" caption (architecture #7).
+  - Staleness banner: if the parsed stage signature changes between renders, surface the 🟠 architecture-#12-(b) banner and keep picks intact.
+- Other formats (DE, Swiss, GSL groups, RR groups) emit `🚧 coming in slice N` info cards so multi-stage events still render the SE playoffs end-to-end.
+- All 26 regression tests still pass (~14s).
+
+**Slice 2 — Double-elimination [x]**
+- Refactored slice-1's SE walker into a reusable `_walk_se_subtree` helper; `_parse_se_bracket` and the new `_parse_de_bracket` both call it.
+- Added `feeder_a_kind` / `feeder_b_kind` ∈ {"winner", "loser"} fields to `BracketMatch` so cross-bracket feeds (LB outer-side = UB this-round loser; SE+bronze = SF losers) are encoded structurally rather than via per-format branching. `_resolve` (UI) and `_pair` (engine emitter) now share a generic feeder-kind walker.
+- Added `sub` field on `BracketMatch` ∈ {"", "UB", "LB", "GF", "RST"}; new ID prefixes `s0::UB-R1M0`, `s0::LB-R2M1`, etc.
+- Format detection upgraded: `≥2 top-level round-body direct children` → `DE` (architecture #11 hybrid algorithm, structural-first). The earlier heading-based `GSL_groups` classifier was dropped — DE is DE regardless of context, and the heading distinguishes group vs playoff for placement mapping. Stage-merge tightened to keep DE stages distinct (IEM Atlanta's two "Group Stage" DE groups must each render and pick independently).
+- LB cross-bracket wiring: standard 8-team DE pairing convention. LB-R1 takes UB-R1 losers in pair order; LB-R(k>1) inner = LB-R(k-1) winner; LB-R(k>1) outer = UB-R(k) loser. Compact 8-team group format (no GF, group ends at LB-final + UB-final) handled directly. Full DE-with-GF + bracket-reset extension noted as slice 2b TODO.
+- App-side `_render_de_stage`: UB rendered as columns of clickable matches under a green "⬆️ Upper Bracket" header, LB below under a red "⬇️ Lower Bracket" header. Auto-fill cascade now sorts UB-before-LB-within-round so feeders always resolve before dependants.
+- `_emit_event_simulation_rows` walks DE matches and emits per-pick match rows. Prize-row emission for DE-in-groups deferred (cross-group → tournament placement mapping needs aggregation logic). Engine consequence for current S-Tier events: group-stage matches still feed BC/ON/LAN; group-eliminated teams who would have earned `9th-12th: $5K`-style prizes don't see that BO bump. Acceptable underestimate.
+- **Live engine smoke test** (IEM Atlanta Group A, full auto-fill): 12 picks resolved correctly, cross-bracket loser-feeds traced cleanly (NRG vs NaVi in LB-R1M0; NaVi vs Legacy in LB-R2M0; NaVi vs Astralis in LB-final). Engine output: Astralis (UB-final loser) +16.3 pts and #11→#9; Vitality (group winner) +1 pt; Legacy +4.7 pts. Modest deltas reflect match-only emission.
+- All 26 regression tests still pass (~16s).
+
+**Slice 3 — Swiss [x]**
+- New matchlist parser path in [data_loaders/bracket_parser.py](data_loaders/bracket_parser.py): `_detect_stages` now chunks consecutive `.brkts-matchlist` elements by their title-prefix (`"Round N …"` → Swiss, `"Group X …"` → Groups), so PGL Astana's 9 matchlists (`"Round 1 Matches"`, `"Round 2 High Matches"`, `"Round 2 Low Matches"`, …) collapse into one Swiss stage spanning rounds 1-5.
+- `_parse_swiss_stage` extracts each `.brkts-matchlist-match`, parses `_team_from_aria` for both opponents + winning row's `opponent-win` class, builds `BracketMatch(sub="SW", round_idx=N, slot_idx=…)` per match. Round number derived from a `Round\s*(\d+)` regex on the matchlist title.
+- R1 seed backfill uses standard high-vs-low pairing (1v9, 2v10, …, 8v16 for 16-team Swiss). R2+ seeds remain `None` for upcoming events until Liquipedia populates pairings — the UI renders "TBD" disabled buttons in that case. Full Buchholz cascade pairing (architecture #16) is documented as a follow-up; current MVP works for played rounds + event-mid-flight scenarios where Liquipedia has populated subsequent rounds.
+- App-side `_render_swiss_stage`: per-round columns, matches stacked. Round caption shows match count + played count. Picks counter / auto-fill / pause toggles all extend cleanly via the `_RENDERED_FMTS` set update.
+- Engine emission: Swiss matches feed BC/ON/LAN/H2H. Per-bucket prize emission (W-L → "9th-11th" → prize lookup) deferred — group/Swiss-eliminated teams miss their small Liquipedia-listed BO bumps; playoff prizes (the high-impact chunk) still emit via the SE/SE_with_bronze branch.
+- Live engine smoke (PGL Astana, R1 auto-filled): 8 picks emitted, modest deltas across affected teams (Spirit +67 / #10→#9, MOUZ +50 / #7→#5, FURIA +26, etc.). 33 total matches in DOM but only 8 have populated seeds (R1 only).
+
+**Slice 4 — Round-robin groups [x]**
+- `_parse_groups_stage` reuses the same matchlist match parser; emits one stage per matchlist (BLAST Rivals' Group A and Group B = two distinct stages). `BracketMatch(sub="GR", round_idx=1)` for every match.
+- App-side `_render_groups_stage`: two-column layout — match list on the left (clickable, same as SE/Swiss), live group standings on the right computed from picks + played results (W-L per team, sorted by wins). The standings table updates instantly on each pick — gives the user the round-robin "see who's leading" feedback architecture #16 called for via the matrix design (kept simpler — vertical list + standings panel — because Liquipedia ships ≤ 6 matches per group, so a matrix would be sparser than the list).
+- Engine emission shares the same code path as Swiss/DE (match rows only).
+- Live engine smoke (BLAST Rivals Group A, 2 visible picks): G2 +7.4, modest tail-end shifts.
+
+**Slice 5 — Major-tier sub-page discovery [x]**
+- Liquipedia splits Majors (IEM Cologne) across `/Stage_1`, `/Stage_2`, `/Stage_3` sub-pages with only the SE playoff bracket on the main tournament page. The slice 1-4 parsers walked only the main page → Cologne came out as just 1 SE stage when it actually has 3 Swiss stages + SE playoffs.
+- `parse_tournament_brackets` now takes an optional `slug` parameter. When supplied, `_discover_sub_stage_slugs` regex-matches `/<base_slug>/Stage_(\d+)` anchors on the main page, fetches each sub-page in numeric order (with `_REQ_DELAY` between requests), parses, and *prepends* its stages to the main page's stages so the timeline reads in execution order.
+- L2 cache wrapper in [app.py](app.py) now passes `slug=slug` through; same for the engine-side `_emit_event_simulation_rows` re-parse.
+- **Verification post-fix:** IEM Cologne goes 1 stage → **4 stages** (Swiss × 3 + SE). All 5 S-Tier events parse correctly: BLAST Rivals (2 RR Groups + SE), PGL Astana (Swiss + SE+bronze), IEM Atlanta + CS Asia Champs (2 DE groups + SE+bronze), IEM Cologne Major (3 Swiss + SE).
+- Sub-page fetch latency: 3 extra HTTP calls × 2.5s rate-limit on first parse for Cologne. L2 cache (6h TTL) absorbs repeats.
+
+**Coverage now:** every parsed format is interactive end-to-end including Major-tier multi-page events. SE, SE+bronze, DE (UB+LB with cross-bracket loser-feeders), Swiss, RR Groups all clickable; auto-fill cascades through every stage; engine emits match rows for every pick across every format; Liquipedia sub-pages followed automatically when present.
+
+**Deferred to future work:**
+- Full Buchholz Swiss cascade for pre-event pairing of R2+.
+- DE-with-GF + bracket-reset extension (slice 2b — none of the current S-Tier events use it; BLAST Open does).
+- Per-format prize-row emission for Swiss/DE-in-groups/Groups — needs cross-format placement-bucket → tournament prize-label aggregation.
+
+### Task 6.4 — Compute placements + distribute prizes [x]
+- **Outcome:** sidebar `standings_mode` extended with `"🔮 Predicted"` (architecture decisions #5 + #14) — selecting it rides on the existing Updated-to-Today fetch, then layers bracket picks via `Store.append_simulation()` and re-runs `run_vrs`. Result replaces `base_standings`, propagating to every page (Ranking Dashboard, Team Breakdown, Tournament Predictor itself).
+- **Module-level helpers** added at the top of [app.py](app.py):
+  - `_ordinal(n)` — 1st/2nd/3rd/…/21st/22nd/101st with proper teen-suppression (11th/12th/13th).
+  - `_format_place(lo, hi)` — bucket label like "5th-8th" / "1st".
+  - `_lookup_prize_for_place(label, prize_distribution)` — exact-match first, then subrange resolution (a "5th-6th" derived placement looks up under Liquipedia's coarser "5th-8th" bucket and gets the listed amount per architecture #9 per-team convention).
+  - `_emit_event_simulation_rows(slug, slug_state)` — re-parses the event's bracket on demand (hits L1+L2 caches), walks every SE/SE_with_bronze stage to derive placements, emits `extra_matches` for user-picked unplayed slots only (architecture #7 — played slots stay in `matches_df` to avoid double-count), emits `extra_prizes` from placement → distribution lookup.
+  - `_collect_predicted_simulation_rows(bracket_state)` — concatenates rows from every event with at least one pick, sorted chronologically by event end date (architecture #13).
+- **Predicted layer** wired into the main mode dispatcher: after Updated-to-Today populates the engine state, when mode == Predicted, builds a `Store`, appends sim rows, runs engine, attaches region/flag/color metadata, recomputes `rank_delta` against the Updated-to-Today baseline (so deltas isolate the bracket-pick effect, not engine-vs-Valve drift).
+- **Engine cache** (architecture #4): `st.session_state._predicted_engine_cache` keyed by `(included_slugs, cutoff_date, picks_md5)`. LRU-trimmed at 20 entries. Pause toggle (architecture #4): if any contributing event is paused, the recompute is suppressed and a status banner shows.
+- **Banners**: Predicted mode gets its own gradient banner (orange "🔮 Predicted future · cutoff Mon DD" + queued event count + match/prize counts) on every page, plus matching sidebar status badge.
+- **Live engine smoke test** (PGL Astana, FURIA-wins-all bracket, prizes layered):
+  - Spirit (final loser, +$120k) #10 → #5 (+170.5 pts) — Major-tier final = ~+170 pts, sane.
+  - FURIA (champion, +$256k) #5 → #3 (+146.8 pts).
+  - PARIVISION (bronze winner, +$96k) #4 → #4 (+70.1 pts).
+  - The MongolZ (bronze loser, +$56k) #6 → #7 (+47.9 pts) — small drop in rank from Spirit's bigger jump.
+  - Top teams (Vitality, NaVi) +5-9 pts each from ON-network ripple, no rank change.
+- **Helper unit tests**: AST-extracted `_ordinal`, `_format_place`, `_lookup_prize_for_place` exercised against PGL Astana's prize_distribution; all assertions pass (1st/2nd/3rd/11th/12th/13th/21st/22nd/23rd/101st correct; 5th-6th resolves to 5th-8th's amount via subrange match).
+- All 26 regression tests still pass (~14s); `app.py` syntax clean.
 
 ### Acceptance
-- User picks an upcoming event, fills the bracket via "Auto-fill favorites" + a few overrides, sees updated standings in < 30 seconds.
-- The bracket UI works for at least one upcoming single-elim event in real Liquipedia data.
+- [x] User picks an upcoming event, fills the bracket via "Auto-fill favorites" + a few overrides, sees updated standings — engine wired, ~1s recompute, memoised.
+- [x] The bracket UI works for at least one upcoming single-elim event in real Liquipedia data — PGL Astana + 4 other S-Tier events parse and render correctly.
 
 ---
 
@@ -299,8 +424,8 @@ Engine-driven "what wins would help most?":
 | 2 | Foundation | [x] | Repo clean; simulator unified via `Store.append_simulation` + `run_vrs` — all four factors move on what-ifs |
 | 3 | 🔬 Transparency | [x] | Factor-band count summaries · H2H replay with Opp-Rating/K/E(win) + cumulative Δ sparkline · factor-share donut + rank-without sensitivity table (21/21 regression tests green) |
 | 4 | 🔬 Transparency | [x] | Time-window panel (expiring/recent + 180-day timeline strip) · peer comparator with sentence summary · Match Impact Explorer (engine re-run, session-cached) — 21/21 regression tests green |
-| 5 | 📈 Improvement | [ ] | Bottleneck + target opponents + path-to-rank + expiring alerts |
-| 6 | 🏆 Bracket | [ ] | Event picker + click-through bracket + standings impact |
+| 5 | 📈 Improvement | [x] | Climb Plan section: bottleneck (peer-relative + root-cause diagnosis) · expiring-14d alert with equivalent-wins guidance · engine-gated target-opponents table (10 candidates, session-cached) · greedy path-to-rank checklist — 26/26 tests green |
+| 6 | 🏆 Bracket | [x] | 6.1 ✓ + 6.2 ✓ + 6.3 all 4 slices ✓ (SE+bronze, DE, Swiss, RR groups) + 6.4 ✓ — full Pillar 3 coverage. Predicted standings_mode live; every parsed format is clickable end-to-end and emits to the engine |
 | 7 | 🏆 Bracket | [ ] | Scenario compare + most-likely baseline + multi-event chaining |
 
 **Days 1–2 are blockers for everything else.** Per-match attribution (Task 1.3) is the single most important enabler — without it, Pillar 1 can't exist and Pillar 2's diagnostics fall back to generic suggestions.
@@ -315,12 +440,50 @@ If a day slips, the deferral order is: Day 7 polish → Day 4 polish → Day 5 �
 - Performance pass (vectorize per-team loops in calculator) — deferred until profile says it's needed
 - CI/GitHub Actions wiring
 - Region-specific viewers / data export
-- Mobile-friendly UI
 - Multi-user accounts / saved scenarios persisted to disk
 - Liquipedia data quality alerts (name mismatches) — defer unless it bites Pillar 3
-- Rewriting `app.py` into multi-file structure (it's 3993 lines, but works)
 
 These can become Week-2 candidates once the three pillars are solid.
+
+---
+
+# WEEK 2 CANDIDATES (Days 8–9) — formalized for tracking
+
+Once Days 1–7 are shipped and the three pillars are live, these are the natural next pulls:
+
+## Day 8 — App structure refactor
+
+**Scope:** Rewrite `app.py` (currently 5,237 lines) into a multi-file component structure.
+
+**Why now:** The monolithic file is stable and works, but adding features (Day 7 scenario compare, future features) requires scrolling thousands of lines to find UI sections. Multi-file structure unblocks faster feature iteration + easier testing of individual components.
+
+**Approach (to be grill'd):**
+- Extract CSS/theme into `styles/theme.py`
+- Extract Streamlit helper functions into `ui/components.py` (factor band renderer, metric cards, tables)
+- Extract page sections into `pages/team_breakdown.py`, `pages/tournament_predictor.py`, `pages/explorer.py`
+- Keep `app.py` as a thin router and session-state orchestrator
+- No engine changes; pure presentation refactor
+
+**Acceptance:** Code is organized by feature (not arbitrary file size), IDE navigation is instant, new features don't require scanning >1000 lines to find the right place to add UI.
+
+---
+
+## Day 9 — Mobile-friendly UI
+
+**Scope:** Adapt the UI for tablet and mobile viewports (375–800px widths).
+
+**Why now:** Currently optimized for desktop; mobile users hit horizontal scroll and oversized components. Post-pillar-shipping, supporting mobile opens the simulator to more analysts.
+
+**Approach (to be grill'd):**
+- Use Streamlit's responsive grid system and `st.columns` with dynamic span logic
+- Condense wide tables (factor contributions, comparators) into card-stack layouts for mobile
+- Test at `@media (max-width: 800px)`, `(max-width: 480px)` breakpoints
+- Verify tournament bracket click-through works on touch
+- Keep desktop layout intact; CSS media queries only
+
+**Acceptance:** App is usable and readable on iPad (tablet) and iPhone 13 (mobile). No horizontal scroll. Tables and charts fit viewport. All interactive elements have touch-safe padding (44px+).
+
+---
 
 ---
 

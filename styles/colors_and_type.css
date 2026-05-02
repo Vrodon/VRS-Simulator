@@ -1,0 +1,319 @@
+/*
+ * VRS Simulator — Design Tokens
+ * ================================
+ * Source: Vrodon/VRS-Simulator (app.py custom CSS + utils/team_meta.py)
+ *
+ * Usage:
+ *   @import url('./colors_and_type.css');
+ *   OR link in <head>
+ *
+ * Google Font imports (substitute for system font):
+ *   Inter (UI) + JetBrains Mono (code/formulas)
+ */
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+/* ─────────────────────────────────────────────
+   BASE COLOR TOKENS
+───────────────────────────────────────────── */
+:root {
+  /* Backgrounds */
+  --bg-base:      #0d1117;  /* page / sidebar */
+  --bg-surface:   #161b22;  /* cards, panels, metric containers */
+  --bg-subtle:    #21262d;  /* table alt rows, progress tracks, empty fills */
+  --border:       #30363d;  /* all borders */
+
+  /* Text */
+  --text-primary:   #c9d1d9;  /* body text */
+  --text-secondary: #8b949e;  /* captions, muted labels, table headers */
+  --text-bright:    #e6edf3;  /* headings, active/hover text */
+  --text-inverse:   #0d1117;  /* text on light badge backgrounds */
+
+  /* Brand accent */
+  --blue:           #58a6ff;  /* primary interactive accent, links, step badges */
+  --blue-light:     #79c0ff;  /* ON factor bars, formula text, lighter highlights */
+
+  /* Semantic */
+  --green:          #3fb950;  /* positive delta, BC factor, Updated mode */
+  --green-light:    #56d364;  /* lighter green for success text */
+  --red:            #f85149;  /* negative delta, LAN factor */
+  --yellow:         #f0b429;  /* BO factor, warnings */
+  --yellow-light:   #e3b341;  /* alternate yellow */
+  --pink:           #ff7b72;  /* misc accent / hover */
+  --purple:         #bc8cff;  /* misc chart color */
+  --teal:           #39c5cf;  /* chart cycle */
+
+  /* Factor-specific */
+  --factor-bo:      #f0b429;  /* Bounty Offered */
+  --factor-bc:      #3fb950;  /* Bounty Collected */
+  --factor-on:      #79c0ff;  /* Opponent Network */
+  --factor-lan:     #ff9a8b;  /* LAN Wins */
+  --factor-h2h-pos: #d2a8ff;  /* H2H positive */
+  --factor-h2h-neg: #f85149;  /* H2H negative */
+
+  /* Region pills */
+  --region-eu-bg:   #1565c0;
+  --region-am-bg:   #b71c1c;
+  --region-as-bg:   #1b5e20;
+  --region-text:    #ffffff;
+
+  /* Rank badges */
+  --rank-1-bg:      #FFD700;  /* gold */
+  --rank-1-text:    #000000;
+  --rank-3-bg:      #C0C0C0;  /* silver */
+  --rank-3-text:    #000000;
+  --rank-10-bg:     #CD7F32;  /* bronze */
+  --rank-10-text:   #ffffff;
+  --rank-rest-bg:   #21262d;
+  --rank-rest-text: #8b949e;
+
+  /* Color cycle (team chart palette) */
+  --cycle-1:  #58a6ff;
+  --cycle-2:  #3fb950;
+  --cycle-3:  #f0b429;
+  --cycle-4:  #f85149;
+  --cycle-5:  #79c0ff;
+  --cycle-6:  #56d364;
+  --cycle-7:  #e3b341;
+  --cycle-8:  #ff7b72;
+  --cycle-9:  #bc8cff;
+  --cycle-10: #39c5cf;
+}
+
+/* ─────────────────────────────────────────────
+   TYPOGRAPHY TOKENS
+───────────────────────────────────────────── */
+:root {
+  /* Font families */
+  --font-ui:    'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-mono:  'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+
+  /* Font sizes */
+  --text-xs:    10px;
+  --text-sm:    11px;
+  --text-base:  13px;
+  --text-md:    14px;
+  --text-lg:    16px;
+  --text-xl:    20px;
+  --text-2xl:   24px;
+  --text-3xl:   28px;
+
+  /* Font weights */
+  --weight-regular: 400;
+  --weight-medium:  500;
+  --weight-semibold: 600;
+  --weight-bold:    700;
+
+  /* Line heights */
+  --leading-tight:  1.2;
+  --leading-normal: 1.5;
+  --leading-loose:  1.6;
+
+  /* Letter spacing */
+  --tracking-tight:  -0.01em;
+  --tracking-normal: 0em;
+  --tracking-wide:   0.05em;   /* table headers */
+}
+
+/* ─────────────────────────────────────────────
+   SPACING & LAYOUT TOKENS
+───────────────────────────────────────────── */
+:root {
+  --space-1:  4px;
+  --space-2:  8px;
+  --space-3:  12px;
+  --space-4:  16px;
+  --space-5:  18px;
+  --space-6:  22px;
+  --space-8:  24px;  /* section gap */
+
+  /* Border radius */
+  --radius-sm:   4px;   /* progress bars, formula blocks, small badges */
+  --radius-md:   8px;   /* table containers */
+  --radius-lg:   10px;  /* cards, panels, metric containers */
+  --radius-xl:   12px;  /* region pills */
+  --radius-full: 9999px; /* circular rank badges */
+
+  /* Borders */
+  --border-width: 1px;
+  --border-style: solid;
+  --border-color: var(--border);
+
+  /* Badge sizes */
+  --badge-size:      30px;  /* rank badge circle */
+  --badge-size-sm:   26px;  /* step badge circle */
+}
+
+/* ─────────────────────────────────────────────
+   SEMANTIC ELEMENT STYLES
+───────────────────────────────────────────── */
+
+/* Base */
+body, .vrs-app {
+  background: var(--bg-base);
+  color: var(--text-primary);
+  font-family: var(--font-ui);
+  font-size: var(--text-base);
+  line-height: var(--leading-normal);
+}
+
+/* Headings */
+h1, .vrs-h1 {
+  font-size: var(--text-3xl);
+  font-weight: var(--weight-bold);
+  color: var(--text-bright);
+  line-height: var(--leading-tight);
+  margin-bottom: var(--space-4);
+}
+
+h2, .vrs-h2 {
+  font-size: var(--text-xl);
+  font-weight: var(--weight-bold);
+  color: var(--text-primary);
+  line-height: var(--leading-tight);
+  margin-bottom: var(--space-3);
+}
+
+h3, .vrs-h3 {
+  font-size: var(--text-lg);
+  font-weight: var(--weight-semibold);
+  color: var(--text-primary);
+  margin-bottom: var(--space-2);
+}
+
+/* Body text */
+p, .vrs-body {
+  font-size: var(--text-base);
+  color: var(--text-primary);
+  line-height: var(--leading-normal);
+}
+
+/* Caption / label */
+.vrs-caption, caption {
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  line-height: var(--leading-normal);
+}
+
+/* Table header */
+.vrs-th {
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-wide);
+  font-weight: var(--weight-semibold);
+}
+
+/* Monospace / code / formula */
+code, pre, .vrs-formula, .vrs-mono {
+  font-family: var(--font-mono);
+  font-size: var(--text-md);
+  color: var(--blue-light);
+  background: var(--bg-base);
+  border-left: 3px solid var(--blue);
+  border-radius: var(--radius-sm);
+  padding: var(--space-3) var(--space-4);
+}
+
+/* Links */
+a, .vrs-link {
+  color: var(--text-bright);
+  text-decoration: none;
+  font-weight: var(--weight-bold);
+}
+
+/* ─────────────────────────────────────────────
+   COMPONENT HELPERS
+───────────────────────────────────────────── */
+
+/* Card / panel */
+.vrs-card {
+  background: var(--bg-surface);
+  border: var(--border-width) var(--border-style) var(--border-color);
+  border-radius: var(--radius-lg);
+  padding: var(--space-4);
+}
+
+/* Rank badge */
+.vrs-rank-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--badge-size);
+  height: var(--badge-size);
+  border-radius: var(--radius-full);
+  font-weight: var(--weight-bold);
+  font-size: var(--text-sm);
+}
+.vrs-rank-badge.rank-1  { background: var(--rank-1-bg);   color: var(--rank-1-text); }
+.vrs-rank-badge.rank-3  { background: var(--rank-3-bg);   color: var(--rank-3-text); }
+.vrs-rank-badge.rank-10 { background: var(--rank-10-bg);  color: var(--rank-10-text); }
+.vrs-rank-badge.rank-rest { background: var(--rank-rest-bg); color: var(--rank-rest-text); }
+
+/* Region pill */
+.vrs-pill {
+  display: inline-block;
+  padding: 2px var(--space-2);
+  border-radius: var(--radius-xl);
+  font-size: var(--text-xs);
+  color: var(--region-text);
+  font-weight: var(--weight-medium);
+}
+.vrs-pill-eu { background: var(--region-eu-bg); }
+.vrs-pill-am { background: var(--region-am-bg); }
+.vrs-pill-as { background: var(--region-as-bg); }
+
+/* Change arrows */
+.vrs-change-up   { color: var(--green);          font-weight: var(--weight-semibold); }
+.vrs-change-down { color: var(--red);             font-weight: var(--weight-semibold); }
+.vrs-change-same { color: var(--text-secondary);  }
+
+/* Factor bar track */
+.vrs-factor-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+.vrs-factor-bar-track {
+  width: 60px;
+  height: 7px;
+  background: var(--bg-subtle);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+.vrs-factor-bar-fill {
+  height: 100%;
+  border-radius: var(--radius-sm);
+}
+
+/* Step badge */
+.vrs-step-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--badge-size-sm);
+  height: var(--badge-size-sm);
+  border-radius: var(--radius-full);
+  background: var(--blue);
+  color: var(--text-inverse);
+  font-weight: var(--weight-bold);
+  font-size: var(--text-sm);
+}
+
+/* Explainer box */
+.vrs-explainer {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-5) var(--space-6);
+  margin: 10px 0;
+}
+
+/* Updated mode banner */
+.vrs-banner-updated {
+  background: linear-gradient(135deg, #0d3d1a, #0d1117);
+  border: 1px solid var(--green);
+  border-radius: var(--radius-lg);
+  padding: var(--space-4) 20px;
+  margin-bottom: var(--space-4);
+}

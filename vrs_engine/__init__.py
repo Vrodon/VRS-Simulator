@@ -30,6 +30,7 @@ from .constants import (
 from .math_helpers import (
     curve, event_stakes, age_weight, lerp,
     g_rd, G_FIXED, expected_win, top_n_sum,
+    first_monday_of_month, next_valve_publication, prev_valve_publication,
 )
 
 __all__ = [
@@ -43,4 +44,6 @@ __all__ = [
     # Math helpers
     "curve", "event_stakes", "age_weight", "lerp",
     "g_rd", "G_FIXED", "expected_win", "top_n_sum",
+    # Valve publication schedule helpers
+    "first_monday_of_month", "next_valve_publication", "prev_valve_publication",
 ]

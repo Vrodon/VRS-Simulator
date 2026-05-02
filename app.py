@@ -34,6 +34,7 @@ Eligibility
 import math
 import os
 import requests
+import hashlib
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -132,10 +133,11 @@ div a .vrs-cta-sub,
 # ══════════════════════════════════════════════════════════════════
 from vrs_engine import (
     Store, run_vrs,
-    DECAY_DAYS, FLAT_DAYS, DECAY_RAMP, RD_FIXED, Q_GLICKO,
+    DECAY_DAYS, FLAT_DAYS, RD_FIXED, Q_GLICKO,
     BASE_K, PRIZE_CAP, TOP_N, SEED_MIN, SEED_MAX,
     curve, event_stakes, age_weight, lerp,
-    g_rd, expected_win, top_n_sum, G_FIXED
+    g_rd, expected_win, top_n_sum, G_FIXED,
+    next_valve_publication, prev_valve_publication,
 )
 from data_loaders import load_valve_github_data
 from data_loaders.github_loader import _find_all_dates
@@ -145,7 +147,9 @@ from data_loaders import (
     liquipedia_cache_exists,
     liquipedia_cache_mtime,
     clear_liquipedia_cache,
+    parse_tournament_brackets,
 )
+from data_loaders.liquipedia_loader import _fetch_page as _fetch_liquipedia_page, _bs4 as _liquipedia_bs4
 from utils import get_team_meta, KNOWN_META, COLOR_CYCLE
 TEAM_META = KNOWN_META   # alias used throughout app
 
@@ -154,6 +158,328 @@ TEAM_META = KNOWN_META   # alias used throughout app
 def _cached_find_all_dates() -> list[tuple[str, str]]:
     """Cached wrapper — GitHub file list, refreshed at most once per hour."""
     return _find_all_dates()
+
+
+# ── Predicted-mode helpers (Task 6.4) ───────────────────────────────────────
+# Walk any active bracket-state picks across events, emit engine-ready
+# extra_matches / extra_prizes rows, then run_vrs with them appended. Results
+# replace `base_standings` so every page (Ranking Dashboard, Team Breakdown)
+# auto-reflects the predicted future.
+
+def _ordinal(n: int) -> str:
+    """Convert 1→'1st', 2→'2nd', 3→'3rd', 4→'4th', 21→'21st', etc."""
+    if 11 <= (n % 100) <= 13:
+        return f"{n}th"
+    return f"{n}{('th', 'st', 'nd', 'rd', 'th', 'th', 'th', 'th', 'th', 'th')[n % 10]}"
+
+
+def _format_place(lo: int, hi: int) -> str:
+    """Format a placement bucket; lo==hi → single ('3rd'), else range ('5th-8th')."""
+    if lo == hi:
+        return _ordinal(lo)
+    return f"{_ordinal(lo)}-{_ordinal(hi)}"
+
+
+def _snapshot_standings(date_str: str | None,
+                         year: str | None) -> dict[str, int]:
+    """
+    Load a Valve VRS snapshot and return ``{team_name: rank}``.
+
+    Returns an empty dict when ``date_str`` / ``year`` is missing or the
+    snapshot can't be loaded; callers treat empty as "no snapshot picked
+    → Swiss synth disabled" per spec lock 10.Q5.
+    """
+    if not date_str or not year:
+        return {}
+    try:
+        from data_loaders.github_loader import load_valve_github_data
+        data = load_valve_github_data(date_str=date_str, year=year)
+    except Exception:
+        return {}
+    standings = data.get("standings")
+    if standings is None or len(standings) == 0:
+        return {}
+    return {row["team"]: int(row["rank"]) for _, row in standings.iterrows()}
+
+
+# Phase 5 §5.1 — Swiss override computation lives in stage_graph as a pure
+# function (callable from any thread / non-Streamlit context). The leading-
+# underscore alias keeps the prior call sites (``_resolve``, autofill loop,
+# engine emit) source-stable.
+from data_loaders.stage_graph import compute_swiss_overrides as _compute_swiss_overrides
+
+
+def _lookup_prize_for_place(place_label: str, prize_distribution: dict) -> float:
+    """
+    Resolve a placement label against Liquipedia's prize_distribution.
+
+    First tries an exact label match. Falls back to any published label whose
+    range contains our entire range (Liquipedia sometimes publishes coarser
+    buckets than the bracket can resolve — e.g. ``"5th-8th"`` covers
+    ``"5th-6th"`` derived from a non-bronze SE).
+    """
+    if place_label in prize_distribution:
+        return float(prize_distribution[place_label])
+
+    import re as _re
+    m = _re.match(r"(\d+)(?:st|nd|rd|th)(?:-(\d+)(?:st|nd|rd|th))?", place_label)
+    if not m:
+        return 0.0
+    lo = int(m.group(1)); hi = int(m.group(2)) if m.group(2) else lo
+    for label, amount in prize_distribution.items():
+        m2 = _re.match(r"(\d+)(?:st|nd|rd|th)(?:-(\d+)(?:st|nd|rd|th))?", label)
+        if not m2:
+            continue
+        plo = int(m2.group(1)); phi = int(m2.group(2)) if m2.group(2) else plo
+        if plo <= lo and phi >= hi:
+            return float(amount)
+    return 0.0
+
+
+def _emit_event_simulation_rows(
+    slug: str,
+    slug_state: dict,
+) -> tuple[list[dict], list[dict]]:
+    """
+    Convert one event's bracket picks → engine-ready ``(extra_matches, extra_prizes)``.
+
+    Skips matches Liquipedia has already played (those live in ``matches_df``
+    via the Updated-to-Today fetch — re-emitting would double-count, see
+    architecture decision #7). Walks each parsed SE / SE_with_bronze stage to
+    derive each team's final placement, then maps placements through
+    ``prize_distribution`` (architecture #9).
+
+    Returns ``([], [])`` when the event has no picks and no parseable bracket.
+    """
+    picks = slug_state["scenarios"][slug_state["active_scenario"]]["picks"]
+    ev    = slug_state.get("event_meta") or {}
+
+    if not picks:
+        return [], []
+
+    # Re-parse the bracket on demand. The L2 cache (parse_tournament_brackets
+    # already memoised in the TP page) plus L1 (fetch) keep this cheap.
+    html = _fetch_liquipedia_page(slug)
+    if html is None:
+        return [], []
+    soup    = _liquipedia_bs4(html)
+    seeded  = ev.get("seeded_teams") or []
+    # Phase 3: feed the same prose / invite / sub-page signals into the
+    # parser as the TP UI so seed-driven match emission stays consistent.
+    from data_loaders.liquipedia_loader import (
+        _parse_format as _lp_parse_format,
+        _parse_per_stage_invites as _lp_per_stage_invites,
+    )
+    from data_loaders.stage_graph import collect_sub_page_rosters
+    prose      = _lp_parse_format(soup)
+    per_stage  = _lp_per_stage_invites(soup)
+    sub_rost   = collect_sub_page_rosters(slug, soup)
+    stages  = parse_tournament_brackets(
+        soup, seeded, slug=slug,
+        format_prose=prose,
+        direct_invitees_by_stage=per_stage,
+        sub_page_rosters=sub_rost,
+    )
+
+    # Overlay manual seeds (Phase 3 dropdown + §10 auto-seed-R1 button)
+    # onto match seed slots so engine emit + Swiss synth see user-placed
+    # teams, just like the UI's `_resolve`. Mutates `stages` in place;
+    # safe because parse_tournament_brackets returns a fresh list.
+    _ms = slug_state["scenarios"][slug_state["active_scenario"]].get(
+        "manual_seeds", {}) or {}
+    for _stage in stages:
+        for _m in _stage.matches:
+            _entry = _ms.get(_m.match_id) or {}
+            if _entry.get("a") and not _m.seed_a:
+                _m.seed_a = _entry["a"]
+            if _entry.get("b") and not _m.seed_b:
+                _m.seed_b = _entry["b"]
+
+    extra_matches: list[dict] = []
+    final_placements: dict[str, str] = {}
+
+    pp        = float(ev.get("prize_pool", 0) or 0)
+    is_lan    = bool(ev.get("is_lan", False))
+    ev_name   = ev.get("name", slug)
+    ev_end_dt = ev.get("end_date") or datetime.now()
+
+    for stage in stages:
+        if stage.format not in ("SE", "SE_with_bronze", "DE", "Swiss", "Groups"):
+            continue
+
+        by_id = {m.match_id: m for m in stage.matches}
+        # Swiss cascade pairings — same logic as the UI's `_resolve`.
+        # Reads the per-event snapshot stashed by the TP page; engine
+        # emit honours the same "no snapshot → no synth" gate.
+        _snap = _snapshot_standings(slug_state.get("snapshot_date"),
+                                     slug_state.get("snapshot_year"))
+        _swiss_ov = (_compute_swiss_overrides(stage, picks, _snap)
+                     if stage.format == "Swiss" else {})
+
+        def _pair(m):
+            """Return (a, b) for a match, walking feeders through picks. Generic
+            across SE / SE_with_bronze / DE / Swiss / Groups."""
+            if m.round_idx == 1 and not m.is_bronze and m.sub in ("", "UB"):
+                return m.seed_a, m.seed_b
+            # Swiss: prefer cascade-computed pairings for R2+ when Liquipedia
+            # hasn't populated them; else fall back to whatever seeds exist.
+            if m.sub == "SW":
+                if m.match_id in _swiss_ov:
+                    return _swiss_ov[m.match_id]
+                return m.seed_a, m.seed_b
+            if m.sub == "GR" and m.round_idx == 1:
+                return m.seed_a, m.seed_b
+            def winner_of(mid):
+                if not mid: return None
+                up = by_id.get(mid)
+                if not up: return None
+                return up.played_winner or picks.get(mid)
+            def loser_of(mid):
+                if not mid: return None
+                up = by_id.get(mid)
+                if not up: return None
+                up_a, up_b = _pair(up)
+                w = up.played_winner or picks.get(mid)
+                if w == up_a: return up_b
+                if w == up_b: return up_a
+                return None
+            def team_for(feeder_id, kind):
+                if not feeder_id: return None
+                return loser_of(feeder_id) if kind == "loser" else winner_of(feeder_id)
+            return (team_for(m.feeder_a, m.feeder_a_kind),
+                    team_for(m.feeder_b, m.feeder_b_kind))
+
+        # Emit one match row per *user-picked* slot. Played slots stay in the
+        # baseline matches_df (engine sees real result). Architecture #7.
+        for m in stage.matches:
+            if m.played_winner:
+                continue
+            picked = picks.get(m.match_id)
+            if not picked:
+                continue
+            a, b = _pair(m)
+            loser = b if picked == a else a if picked == b else None
+            if not loser:
+                continue
+            extra_matches.append({
+                "date":         m.played_date or ev_end_dt,
+                "winner":       picked,
+                "loser":        loser,
+                "event":        ev_name,
+                "prize_pool":   pp,
+                "winner_prize": 0.0,
+                "loser_prize":  0.0,
+                "is_lan":       is_lan,
+            })
+
+        # Placement resolution per architecture #9.
+        if stage.format in ("SE", "SE_with_bronze"):
+            rounds_max  = stage.rounds
+            bronze      = next((m for m in stage.matches if m.is_bronze), None)
+            final_match = next((m for m in stage.matches
+                                 if m.round_idx == rounds_max and not m.is_bronze), None)
+
+            if final_match:
+                f_a, f_b = _pair(final_match)
+                f_w = final_match.played_winner or picks.get(final_match.match_id)
+                f_l = f_b if f_w == f_a else f_a if f_w == f_b else None
+                if f_w: final_placements[f_w] = "1st"
+                if f_l: final_placements[f_l] = "2nd"
+
+            if bronze:
+                b_a, b_b = _pair(bronze)
+                b_w = bronze.played_winner or picks.get(bronze.match_id)
+                b_l = b_b if b_w == b_a else b_a if b_w == b_b else None
+                if b_w: final_placements[b_w] = "3rd"
+                if b_l: final_placements[b_l] = "4th"
+
+            # Earlier-round losers — bucket by round, place range
+            # = 2^(N-r)+1 .. 2^(N-r+1). Skip the top round (final) and SF if
+            # there's a bronze (already mapped).
+            skip_round = rounds_max if not bronze else (rounds_max - 1)
+            for r in range(skip_round - 1, 0, -1):
+                losers_so_far = 2 ** (rounds_max - r)
+                place_lo = losers_so_far + 1
+                place_hi = losers_so_far * 2
+                label = _format_place(place_lo, place_hi)
+                for m in stage.matches:
+                    if m.round_idx != r or m.is_bronze:
+                        continue
+                    m_a, m_b = _pair(m)
+                    m_w = m.played_winner or picks.get(m.match_id)
+                    m_l = m_b if m_w == m_a else m_a if m_w == m_b else None
+                    if m_l and m_l not in final_placements:
+                        final_placements[m_l] = label
+
+        elif stage.format in ("DE", "Swiss", "Groups"):
+            # Slices 2-4 — emit MATCH rows only for these formats. Prize-row
+            # emission requires per-format placement → tournament-bucket
+            # aggregation (DE-in-groups: "Nth-in-group" → tournament label;
+            # Swiss: W-L bucket → label; RR groups: within-group rank →
+            # label). All deferred to a follow-up because they need access
+            # to the tournament-wide prize_distribution structure plus the
+            # number of groups / Swiss bracket size to map correctly.
+            #
+            # Engine consequence: matches still feed BC/ON/LAN/H2H factors;
+            # group/Swiss-eliminated teams who would have earned small
+            # Liquipedia-listed prizes ($5K-20K) miss the BO contribution.
+            # Acceptable underestimate; playoff prizes (the big chunk) are
+            # already emitted by the SE/SE_with_bronze branch above.
+            pass
+
+    # Emit prize rows. Liquipedia convention: the listed amount is per-team,
+    # not split across shared placements.
+    extra_prizes: list[dict] = []
+    pd_dist = ev.get("prize_distribution") or {}
+    for team, place in final_placements.items():
+        amount = _lookup_prize_for_place(place, pd_dist)
+        if amount <= 0:
+            continue
+        extra_prizes.append({
+            "team":  team,
+            "prize": amount,
+            "event": ev_name,
+            "date":  ev_end_dt,
+        })
+
+    return extra_matches, extra_prizes
+
+
+def _collect_predicted_simulation_rows(
+    bracket_state: dict,
+) -> tuple[list[dict], list[dict], list[str]]:
+    """
+    Walk every event in ``bracket_state`` that has at least one pick and
+    concatenate their simulation rows in chronological order (by event end
+    date). Returns ``(extra_matches, extra_prizes, included_slugs)``.
+
+    Architecture decision #13: events with picks auto-include; the explicit
+    ``include_in_chain`` toggle is reserved for Day 7.4 multi-event UX.
+    """
+    candidates: list[tuple[datetime, str, dict]] = []
+    for slug, slug_state in bracket_state.items():
+        active = slug_state.get("active_scenario", "current")
+        scen   = slug_state.get("scenarios", {}).get(active, {})
+        picks  = scen.get("picks", {})
+        if not picks:
+            continue
+        ev = slug_state.get("event_meta") or {}
+        end = ev.get("end_date") or datetime.now()
+        candidates.append((end, slug, slug_state))
+
+    candidates.sort(key=lambda x: x[0])
+
+    all_matches: list[dict] = []
+    all_prizes:  list[dict] = []
+    included:    list[str]  = []
+    for _, slug, slug_state in candidates:
+        em, ep = _emit_event_simulation_rows(slug, slug_state)
+        if em or ep:
+            all_matches.extend(em)
+            all_prizes.extend(ep)
+            included.append(slug)
+
+    return all_matches, all_prizes, included
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -208,17 +534,21 @@ with st.sidebar:
         "📖 How VRS Works",
         "📊 Ranking Dashboard",
         "🔍 Team Breakdown",
-        "🔮 What-If Predictor",
+        "🏆 Tournament Predictor",
     ], label_visibility="collapsed", key="main_nav")
     st.markdown("---")
 
     # ── Standings Mode selector ───────────────────────────────────
     standings_mode = st.radio(
         "Standings Mode",
-        ["🏛️ As Published", "📡 Updated to Today"],
+        ["🏛️ As Published", "📡 Updated to Today", "🔮 Predicted"],
         index=0,
         key="standings_mode",
-        help="As Published: Official Valve standings. Updated to Today: includes all results since publication (auto-fetched).",
+        help=(
+            "As Published: Official Valve standings.\n"
+            "Updated to Today: includes all real results since publication (auto-fetched).\n"
+            "Predicted: Updated to Today + your bracket picks from the Tournament Predictor."
+        ),
     )
 
     # ── Historical date selector (only for "As Published" mode) ────
@@ -237,12 +567,12 @@ with st.sidebar:
             "📅 VRS Snapshot",
             _date_labels,
             index=0,
-            disabled=(standings_mode == "📡 Updated to Today"),
-            help=("Latest snapshot is used for Updated to Today mode."
-                  if standings_mode == "📡 Updated to Today" else
+            disabled=(standings_mode in ("📡 Updated to Today", "🔮 Predicted")),
+            help=("Latest snapshot is used for Updated to Today / Predicted modes."
+                  if standings_mode in ("📡 Updated to Today", "🔮 Predicted") else
                   "Valve publishes new standings monthly. Select any historical snapshot."),
         )
-        if standings_mode == "📡 Updated to Today":
+        if standings_mode in ("📡 Updated to Today", "🔮 Predicted"):
             _sel_date, _sel_year = _all_dates[0]
         else:
             _sel_idx   = _date_labels.index(_sel_label)
@@ -531,8 +861,10 @@ def _compute_pub_match_h2h(date_str: str | None,
 
 pub_match_h2h: dict = _compute_pub_match_h2h(_sel_date, _sel_year)
 
-if standings_mode == "📡 Updated to Today":
+if standings_mode in ("📡 Updated to Today", "🔮 Predicted"):
     # Cache key includes the snapshot date so switching snapshots re-fetches.
+    # Predicted mode rides on the same Updated-to-Today fetch (architecture
+    # decision #5 — single baseline) and then layers bracket picks on top.
     _cache_key = f"updated_result_{_sel_date}_{_sel_year}"
 
     if _cache_key not in st.session_state:
@@ -589,6 +921,117 @@ if standings_mode == "📡 Updated to Today":
             lambda r: (int(_orig_rank_map.get(r["team"], r["rank"])) - int(r["rank"])),
             axis=1,
         ).astype(int)
+
+        # ── Predicted layer (Task 6.4) ──────────────────────────────
+        # When `🔮 Predicted` is active, append every event's bracket picks to
+        # the Updated-to-Today engine input and re-run. The result replaces
+        # `base_standings` so every page reflects the simulated future.
+        # Architecture decisions #4 (live recompute, memoised) and #13
+        # (multi-event chaining via picked-anywhere events).
+        predicted_meta = None     # populated when layering succeeds
+        if standings_mode == "🔮 Predicted":
+            _b_state = st.session_state.get("bracket_state", {}) or {}
+            _em, _ep, _included = _collect_predicted_simulation_rows(_b_state)
+
+            if not _em and not _ep:
+                st.info(
+                    "🔮 **Predicted mode is active but no bracket picks have "
+                    "been queued yet.** Open the **🏆 Tournament Predictor** "
+                    "page and fill at least one bracket to see standings shift."
+                )
+                predicted_meta = {"included": [], "matches": 0, "prizes": 0}
+            else:
+                # Memo: keyed by frozenset of pick tuples + cutoff date.
+                # Architecture decision #4 (live recompute + memoise).
+                _pred_key = (
+                    tuple(sorted(_included)),
+                    cutoff_dt.strftime("%Y-%m-%d"),
+                    hashlib.md5(
+                        repr(sorted(
+                            (slug,
+                             tuple(sorted(
+                                 _b_state[slug]["scenarios"][_b_state[slug]["active_scenario"]]["picks"].items()
+                             )))
+                            for slug in _included
+                        )).encode()
+                    ).hexdigest()[:12],
+                )
+                if "_predicted_engine_cache" not in st.session_state:
+                    st.session_state._predicted_engine_cache = {}
+                _pcache = st.session_state._predicted_engine_cache
+
+                if _pred_key in _pcache:
+                    _pred_result = _pcache[_pred_key]
+                else:
+                    # Honour the user's Pause toggle on each contributing event.
+                    # If ANY contributing event is paused, suppress the recompute
+                    # — picks save but standings don't update until unpause.
+                    _any_paused = any(
+                        _b_state[s].get("paused", False) for s in _included
+                    )
+                    if _any_paused:
+                        _pred_result = None
+                        st.info(
+                            "⏸️ Predicted recompute paused on at least one "
+                            "queued event. Untoggle **Pause** in the Tournament "
+                            "Predictor to recompute standings."
+                        )
+                    else:
+                        try:
+                            with st.spinner(f"🔮 Recomputing standings with "
+                                            f"{len(_em)} match{'es' if len(_em)!=1 else ''} + "
+                                            f"{len(_ep)} prize{'s' if len(_ep)!=1 else ''} layered…"):
+                                _sim_store = Store.from_valve(team_match_history, bo_prizes_map)
+                                _sim_store.append_simulation(
+                                    extra_matches=pd.DataFrame(_em) if _em else None,
+                                    extra_prizes=_ep if _ep else None,
+                                )
+                                _pred_result = run_vrs(_sim_store, cutoff=cutoff_dt)
+                                _pcache[_pred_key] = _pred_result
+                                # LRU trim — keep only 20 most recent
+                                if len(_pcache) > 20:
+                                    _pcache.pop(next(iter(_pcache)))
+                        except Exception as exc:
+                            st.error(f"🔴 Predicted recompute failed: {exc}")
+                            _pred_result = None
+
+                if _pred_result is not None:
+                    _pred_standings = _pred_result["standings"]
+                    if not _pred_standings.empty:
+                        # Re-attach region/flag/color metadata for display.
+                        _meta_cols = [c for c in ("team", "region", "flag", "color")
+                                      if c in base_standings.columns]
+                        if len(_meta_cols) > 1:
+                            _meta_df = (base_standings[_meta_cols]
+                                        .drop_duplicates("team", keep="first"))
+                            _pred_standings = _pred_standings.merge(
+                                _meta_df, on="team", how="left",
+                            )
+                            _pred_standings["region"] = _pred_standings["region"].fillna("Global")
+                            _pred_standings["flag"]   = _pred_standings["flag"].fillna("🌍")
+                            _pred_standings["color"]  = _pred_standings["color"].fillna("#58a6ff")
+
+                        # Re-compute rank_delta vs the Updated-to-Today baseline
+                        # (not vs Valve published) so the delta isolates the
+                        # bracket-pick effect.
+                        _upd_rank_map = (base_standings
+                                         .sort_values("rank")
+                                         .drop_duplicates("team", keep="first")
+                                         .set_index("team")["rank"].to_dict())
+                        _pred_standings["rank_delta"] = _pred_standings.apply(
+                            lambda r: (int(_upd_rank_map.get(r["team"], r["rank"])) - int(r["rank"])),
+                            axis=1,
+                        ).astype(int)
+
+                        base_standings = _pred_standings
+                        sim_match_h2h  = _pred_result.get("match_h2h", {})
+                        mode_active    = "predicted"
+                        predicted_meta = {
+                            "included": _included,
+                            "matches":  len(_em),
+                            "prizes":   len(_ep),
+                            "key":      _pred_key,
+                        }
 else:
     # As Published mode: use snapshot as-is
     mode_active = "published"
@@ -614,6 +1057,29 @@ if mode_active == "updated":
       </div>
     </div>""", unsafe_allow_html=True)
 
+elif mode_active == "predicted":
+    _pm = predicted_meta or {}
+    _events_label = (
+        f"{len(_pm.get('included', []))} event{'s' if len(_pm.get('included', [])) != 1 else ''}"
+    )
+    st.markdown(f"""
+    <div style="background:linear-gradient(135deg,#3d2d0d,#0d1117);border:1px solid #f0883e;
+                border-radius:10px;padding:16px 20px;margin-bottom:16px;">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
+        <span style="font-size:22px">🔮</span>
+        <span style="font-size:16px;font-weight:700;color:#f0883e;">
+          Predicted future · cutoff {cutoff_dt.strftime('%B %d, %Y')}</span>
+        <span style="background:#f0883e;color:#000;border-radius:12px;padding:2px 10px;
+                     font-size:11px;font-weight:600">{_events_label} queued</span>
+      </div>
+      <div style="font-size:12px;color:#f0c987;line-height:1.6;">
+        Updated-to-Today baseline + your Tournament Predictor picks
+        ({_pm.get("matches", 0)} match{'es' if _pm.get("matches", 0) != 1 else ''},
+        {_pm.get("prizes", 0)} prize{'s' if _pm.get("prizes", 0) != 1 else ''} layered).
+        Edit picks via <strong>🏆 Tournament Predictor</strong> in the sidebar.
+      </div>
+    </div>""", unsafe_allow_html=True)
+
 elif mode_active == "fallback":
     st.warning(f"⚠️ Using As Published standings (fetch failed: {mode_fetch_error[:80]})")
 
@@ -621,6 +1087,8 @@ elif mode_active == "fallback":
 with st.sidebar:
     if mode_active == "updated":
         st.success(f"📡 Updated  ·  {cutoff_dt.strftime('%Y_%m_%d')}")
+    elif mode_active == "predicted":
+        st.success(f"🔮 Predicted  ·  {cutoff_dt.strftime('%Y_%m_%d')}")
     elif mode_active == "published":
         st.success(f"🏛️ Official  ·  {_gd['cutoff_date']}")
     else:  # fallback
@@ -637,6 +1105,13 @@ if page == "📊 Ranking Dashboard":
     # ── Mode banner ─────────────────────────────────────────────────
     if mode_active == "updated":
         st.info(f"📡 **Updated to {cutoff_dt.strftime('%B %d, %Y')}** — includes {updated_match_count} tournaments since publication")
+    elif mode_active == "predicted":
+        _pm = predicted_meta or {}
+        st.info(
+            f"🔮 **Predicted future** (cutoff {cutoff_dt.strftime('%B %d, %Y')}) — "
+            f"baseline + {_pm.get('matches', 0)} layered matches across "
+            f"{len(_pm.get('included', []))} event(s)"
+        )
     elif mode_active == "published":
         st.info(f"🏛️ **Official Valve standings** — as of {cutoff_dt.strftime('%B %d, %Y')}")
     elif mode_active == "fallback":
@@ -938,223 +1413,1039 @@ if page == "📊 Ranking Dashboard":
 
 
 # ══════════════════════════════════════════════════════════════════
-# PAGE 2  ·  SCENARIO SIMULATOR
+# PAGE 2  ·  TOURNAMENT PREDICTOR  (Pillar 3 — bracket simulator)
 # ══════════════════════════════════════════════════════════════════
+#
+# Architectural decisions live in NEXT_STEPS.md > "Pillar 3 — Architecture
+# Decisions". Implementation rolls out in three steps:
+#   • 6.2 (this block) — event picker + metadata banner.
+#   • 6.3              — click-through bracket UI (SE+bronze, DE, Swiss, groups).
+#   • 6.4              — placement → engine wiring; exposes 🔮 Predicted mode.
+#
+# The What-If Predictor (Mode 3 manual hypotheticals) was retired in favour of
+# this surface — Tournament Predictor uses the same `Store.append_simulation`
+# plumbing under the hood, just with a structured bracket UI instead of free-form
+# match entry.
 
-elif page == "🔮 What-If Predictor":
-    st.title("🔮 What-If Predictor")
+elif page == "🏆 Tournament Predictor":
+    from data_loaders import discover_liquipedia_upcoming_events
+
+    st.title("🏆 Tournament Predictor")
     st.markdown(
-        "Build hypothetical scenarios on top of the current baseline standings. "
-        "Add match results and/or prize earnings to instantly see how standings would shift. "
-        "**Note:** Baseline automatically reflects your current mode selection (As Published or Updated to Today)."
+        "Pick an upcoming tournament, fill the bracket, see how standings would "
+        "shift if results played out the way you predict. Once filled, the prediction "
+        "propagates app-wide via the **🔮 Predicted** standings mode (lands in step 6.4)."
     )
 
-    all_teams = sorted(base_standings["team"].tolist()) if not base_standings.empty else sorted(TEAM_META.keys())
+    # ── Discovery filters ─────────────────────────────────────────
+    _now = datetime.now()
+    # Default end of range = day before predicted next Valve release. Valve
+    # publishes roughly monthly, so we estimate next-release ≈ latest known
+    # snapshot + 30 days. Once a new official snapshot lands the prediction
+    # itself becomes obsolete, so framing the discovery window as "until the
+    # next refresh" matches the user's mental model.
+    if _all_dates:
+        try:
+            _latest_snap = datetime.strptime(_all_dates[0][0], "%Y_%m_%d")
+            _predicted_next_release = _latest_snap + timedelta(days=30)
+            _default_end = (_predicted_next_release - timedelta(days=1)).date()
+        except Exception:
+            _default_end = (_now + timedelta(days=30)).date()
+    else:
+        _default_end = (_now + timedelta(days=30)).date()
 
-    if "hyp_matches" not in st.session_state:
-        st.session_state.hyp_matches = []
-    if "hyp_prizes" not in st.session_state:
-        st.session_state.hyp_prizes = []
+    f_left, f_mid, f_right, f_btn = st.columns([1.2, 1.2, 1.2, 1])
+    discovery_start = f_left.date_input(
+        "🔎 Range start", value=_now.date(),
+        key="tp_disc_start",
+        help="Earliest event date to surface in the picker.",
+    )
+    discovery_end = f_mid.date_input(
+        "🔎 Range end", value=_default_end,
+        key="tp_disc_end",
+        help=(
+            f"Latest event date to surface. Default = day before predicted "
+            f"next Valve release ({_default_end:%b %d, %Y})."
+        ),
+    )
+    min_tier = f_right.selectbox(
+        "Min tier", ["S-Tier", "A-Tier", "B-Tier"],
+        index=1, key="tp_min_tier",
+        help="S = Majors and equivalents · A = top regional · B = mid-tier.",
+    )
+    f_btn.write("")  # vertical spacer to align the button with date inputs
+    refresh = f_btn.button(
+        "🔄 Refresh", use_container_width=True,
+        help="Bypass the 6h discovery cache and re-walk Liquipedia.",
+    )
+
+    # ── Discover events (uses 6.1's 6h JSON cache + Streamlit memo) ───
+    @st.cache_data(ttl=21600, show_spinner=False)
+    def _cached_upcoming_events(start_iso: str, end_iso: str, tier: str, force_token: int):
+        # `force_token` forces a Streamlit cache miss when the user hits Refresh;
+        # 6.1's file cache is bypassed via force_refresh=True on the same trigger.
+        return discover_liquipedia_upcoming_events(
+            start_date=start_iso,
+            end_date=end_iso,
+            min_tier=tier,
+            today=datetime.now(),
+            fetch_details=True,
+            force_refresh=(force_token > 0),
+        )
+
+    if "_tp_force_token" not in st.session_state:
+        st.session_state._tp_force_token = 0
+    if refresh:
+        st.session_state._tp_force_token += 1
+
+    with st.spinner("Loading upcoming events from Liquipedia…"):
+        try:
+            events = _cached_upcoming_events(
+                discovery_start.isoformat(),
+                discovery_end.isoformat(),
+                min_tier,
+                st.session_state._tp_force_token,
+            )
+        except Exception as exc:
+            st.error(f"🔴 Could not load upcoming events: {exc}")
+            events = []
+
+    if not events:
+        st.warning(
+            f"🟡 No upcoming events found between **{discovery_start}** and "
+            f"**{discovery_end}** at **{min_tier}** or higher. Try widening the "
+            f"range or lowering the tier."
+        )
+        st.stop()
+
+    # ── Event picker (sorted by start date asc; default = next event) ─
+    def _label(ev: dict) -> str:
+        sd = ev.get("start_date")
+        ed = ev.get("end_date")
+        sd_s = sd.strftime("%b %d") if sd else "?"
+        ed_s = ed.strftime("%b %d, %Y") if ed else "?"
+        pp   = ev.get("prize_pool", 0) or 0
+        if pp >= 1_000_000:
+            pp_s = f"${pp / 1_000_000:.2f}M"
+        elif pp > 0:
+            pp_s = f"${pp / 1000:.0f}K"
+        else:
+            pp_s = "TBA"
+        return f"{ev['tier']} · {ev['name']}  ({sd_s} – {ed_s}, {pp_s})"
+
+    event_labels = [_label(e) for e in events]
+    sel_idx = st.selectbox(
+        "Choose an event",
+        list(range(len(events))),
+        format_func=lambda i: event_labels[i],
+        key="tp_sel_event",
+    )
+    ev = events[sel_idx]
 
     st.markdown("---")
 
-    # ── Input forms: matches (left) and prizes (right) ────────────
-    _form_left, _form_right = st.columns(2)
-
-    with _form_left:
-        with st.form("add_match"):
-            st.subheader("➕ Add Hypothetical Match")
-            c1, c2 = st.columns(2)
-            winner = c1.selectbox("🏆 Winner", all_teams, index=all_teams.index("G2"))
-            loser  = c2.selectbox("❌ Loser",
-                                  [t for t in all_teams if t != winner],
-                                  index=0)
-            c3, c4 = st.columns(2)
-            event_name = c3.text_input("🏟️ Event", value="Hypothetical Event")
-            prize_pool = c4.number_input("💵 Prize Pool (USD)", 10_000, 2_000_000, 250_000, 10_000)
-            c5, c6 = st.columns(2)
-            is_lan     = c5.toggle("🖥️ LAN?", value=True)
-            match_date = c6.date_input("📅 Match Date", value=datetime(2026, 3, 20))
-
-            if st.form_submit_button("➕ Queue Match", use_container_width=True, type="primary"):
-                st.session_state.hyp_matches.append({
-                    "date":         datetime.combine(match_date, datetime.min.time()),
-                    "winner":       winner,
-                    "loser":        loser,
-                    "event":        event_name,
-                    "prize_pool":   float(prize_pool),
-                    "winner_prize": 0.0,
-                    "loser_prize":  0.0,
-                    "is_lan":       is_lan,
-                })
-                st.success(f"✅ Queued: **{winner}** def. **{loser}**")
-
-    with _form_right:
-        with st.form("add_prize"):
-            st.subheader("🏅 Add Hypothetical Prize Earning")
-            p1, p2 = st.columns(2)
-            prize_team   = p1.selectbox("🏆 Team", all_teams, index=0)
-            prize_amount = p2.number_input("💵 Prize (USD)", 1_000, 2_000_000, 50_000, 1_000)
-            p3, p4 = st.columns(2)
-            prize_event  = p3.text_input("🏟️ Event", value="Hypothetical Event")
-            prize_date   = p4.date_input("📅 Tournament End Date", value=datetime(2026, 3, 20))
-
-            if st.form_submit_button("➕ Queue Prize", use_container_width=True, type="primary"):
-                st.session_state.hyp_prizes.append({
-                    "team":  prize_team,
-                    "prize": float(prize_amount),
-                    "event": prize_event,
-                    "date":  datetime.combine(prize_date, datetime.min.time()),
-                })
-                st.success(f"✅ Queued: **{prize_team}** earns **${prize_amount:,.0f}**")
-
-    # ── Queue display: matches (left) and prizes (right) ──────────
-    _has_matches = bool(st.session_state.hyp_matches)
-    _has_prizes  = bool(st.session_state.hyp_prizes)
-
-    if _has_matches or _has_prizes:
-        _ql, _qr = st.columns(2)
-
-        with _ql:
-            st.caption(f"Match queue — {len(st.session_state.hyp_matches)} series")
-            if _has_matches:
-                _qm = pd.DataFrame(st.session_state.hyp_matches)[
-                    ["winner", "loser", "event", "is_lan", "date"]]
-                _qm["date"] = pd.to_datetime(_qm["date"]).dt.strftime("%Y-%m-%d")
-                _qm.columns = ["Winner", "Loser", "Event", "LAN", "Date"]
-                st.dataframe(_qm, use_container_width=True, hide_index=True, height=200)
-
-        with _qr:
-            st.caption(f"Prize queue — {len(st.session_state.hyp_prizes)} entries")
-            if _has_prizes:
-                _qp = pd.DataFrame(st.session_state.hyp_prizes)[["team", "prize", "event", "date"]]
-                _qp["date"]  = pd.to_datetime(_qp["date"]).dt.strftime("%Y-%m-%d")
-                _qp["prize"] = _qp["prize"].apply(lambda x: f"${x:,.0f}")
-                _qp.columns = ["Team", "Prize", "Event", "Date"]
-                st.dataframe(_qp, use_container_width=True, hide_index=True, height=200)
-
-        _btn_row_l, _btn_row_r = st.columns([3, 1])
-        if _btn_row_r.button("🗑️ Clear All Queues", use_container_width=True):
-            st.session_state.hyp_matches = []
-            st.session_state.hyp_prizes  = []
-            st.rerun()
-
-        if _btn_row_l.button("🚀 Simulate & Compare", use_container_width=True, type="primary"):
-            with st.spinner("Recalculating full VRS…"):
-                hyp_df     = pd.DataFrame(st.session_state.hyp_matches) if _has_matches else pd.DataFrame()
-                hyp_prizes = st.session_state.hyp_prizes
-
-                # Extend cutoff forward if any sim rows are in the future,
-                # so every hypothetical match/prize falls inside the 180-day window.
-                _sim_cutoff = sim_cutoff_dt
-                if _has_matches:
-                    _sim_cutoff = max(_sim_cutoff, max(m["date"] for m in st.session_state.hyp_matches))
-                if _has_prizes:
-                    _sim_cutoff = max(_sim_cutoff, max(p["date"] for p in st.session_state.hyp_prizes))
-
-                # Run engine twice against the same cutoff — once for the
-                # unmodified baseline, once with sim rows appended — so the
-                # delta reflects only the what-if impact (not engine-vs-Valve
-                # rounding drift, which would otherwise nudge every team).
-                base_store    = Store.from_valve(team_match_history, bo_prizes_map)
-                base_result   = run_vrs(base_store, cutoff=_sim_cutoff)
-                base_sim_std  = base_result["standings"]
-
-                sim_store = Store.from_valve(team_match_history, bo_prizes_map)
-                sim_store.append_simulation(
-                    extra_matches=hyp_df if _has_matches else None,
-                    extra_prizes=hyp_prizes if _has_prizes else None,
-                )
-                sim_result    = run_vrs(sim_store, cutoff=_sim_cutoff)
-                new_standings = sim_result["standings"]
-
-                # Attach region/flag/color from Valve's metadata for display.
-                meta_cols = [c for c in ["team", "region", "flag", "color"]
-                             if c in base_standings.columns]
-                if len(meta_cols) > 1 and not new_standings.empty:
-                    meta_df = (base_standings[meta_cols]
-                               .drop_duplicates("team", keep="first"))
-                    new_standings = new_standings.merge(meta_df, on="team", how="left")
-                    new_standings["region"] = new_standings["region"].fillna("Global")
-                    new_standings["flag"]   = new_standings["flag"].fillna("🌍")
-                    new_standings["color"]  = new_standings["color"].fillna("#58a6ff")
-
-            if new_standings.empty:
-                st.warning("Not enough data to compute standings with the queued matches.")
-                st.stop()
-
-            st.markdown("---")
-            st.subheader("📊 Impact: New Standings vs Baseline")
-
-            old = base_sim_std[["team", "rank", "total_points", "seed", "h2h_delta"]].copy()
-            new = new_standings[["team", "rank", "total_points", "seed",
-                                  "h2h_delta", "region", "flag"]].copy()
-            merged = old.merge(new, on="team", suffixes=("_old", "_new"))
-            merged["rank_delta"]   = merged["rank_old"]  - merged["rank_new"]
-            merged["points_delta"] = merged["total_points_new"] - merged["total_points_old"]
-            merged = merged.sort_values("rank_new")
-
-            affected = set(hyp_df["winner"].tolist() + hyp_df["loser"].tolist()) if not hyp_df.empty else set()
-
-            rows = []
-            for _, row in merged.iterrows():
-                hl    = "background:#1c2128;" if row["team"] in affected else ""
-                star  = "⭐ " if row["team"] in affected else ""
-                d_pts = row["points_delta"]
-                pts_s = (f'<span class="change-up">+{d_pts:.1f}</span>'   if d_pts > 0 else
-                         f'<span class="change-down">{d_pts:.1f}</span>'   if d_pts < 0 else
-                         '<span class="change-same">—</span>')
-                rows.append(f"""
-                <tr style="{hl}">
-                  <td style="text-align:center">{rank_badge(int(row["rank_new"]))}</td>
-                  <td>{row["flag"]} {star}<strong>{row["team"]}</strong></td>
-                  <td style="text-align:right; color:#58a6ff; font-weight:700">
-                      {row["total_points_new"]:,.1f}</td>
-                  <td style="text-align:center">{change_arrow(int(row["rank_delta"]))}</td>
-                  <td style="text-align:center; color:#8b949e">{int(row["rank_old"])}</td>
-                  <td style="text-align:right">{pts_s}</td>
-                </tr>""")
-
-            st.markdown(f"""
-            <table style="width:100%; border-collapse:collapse; font-size:13px;">
-              <thead>
-                <tr style="background:#21262d; color:#8b949e; font-size:11px; text-transform:uppercase;">
-                  <th style="padding:10px 5px; text-align:center">New Rank</th>
-                  <th style="padding:10px 5px; text-align:left">Team</th>
-                  <th style="padding:10px 5px; text-align:right">New Points</th>
-                  <th style="padding:10px 5px; text-align:center">Rank Δ</th>
-                  <th style="padding:10px 5px; text-align:center">Old Rank</th>
-                  <th style="padding:10px 5px; text-align:right">Points Δ</th>
-                </tr>
-              </thead>
-              <tbody>{"".join(rows)}</tbody>
-            </table>
-            <p style="color:#8b949e;font-size:12px;margin-top:6px">⭐ = directly involved</p>
-            """, unsafe_allow_html=True)
-
-            # Points delta chart
-            st.markdown("---")
-            plot_df = merged[merged["points_delta"].abs() > 0.01].sort_values("points_delta")
-            if not plot_df.empty:
-                fig = go.Figure(go.Bar(
-                    x=plot_df["points_delta"], y=plot_df["team"], orientation="h",
-                    marker_color=["#3fb950" if v > 0 else "#f85149"
-                                  for v in plot_df["points_delta"]],
-                    text=[f"{v:+.1f}" for v in plot_df["points_delta"]],
-                    textposition="outside",
-                ))
-                fig.update_layout(
-                    title="Points Change by Team",
-                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                    font=dict(color="#c9d1d9"),
-                    xaxis=dict(gridcolor="#21262d", title="Δ Points"),
-                    yaxis=dict(gridcolor="#21262d"),
-                    margin=dict(l=10, r=80, t=40, b=10),
-                    height=max(300, len(plot_df) * 28),
-                )
-                st.plotly_chart(fig, use_container_width=True, config={"staticPlot": True})
+    # ── Metadata banner ───────────────────────────────────────────
+    m1, m2, m3, m4 = st.columns(4)
+    pp = ev.get("prize_pool", 0) or 0
+    m1.metric("💰 Prize Pool", f"${pp:,.0f}" if pp else "TBA")
+    sd, ed = ev.get("start_date"), ev.get("end_date")
+    if sd and ed:
+        days = (ed - sd).days + 1
+        m2.metric("📅 Dates", f"{sd:%b %d} – {ed:%b %d}",
+                  delta=f"{days} day{'s' if days != 1 else ''}",
+                  delta_color="off")
     else:
-        st.info("👆 Add at least one match, then click **Simulate & Compare**.")
+        m2.metric("📅 Dates", "TBA")
+    m3.metric("🌐 Format", "🖥️ LAN" if ev.get("is_lan") else "🌍 Online")
+    m4.metric("🏅 Tier", ev["tier"])
+
+    # ── Format prose (from <h3>Format</h3>) ───────────────────────
+    fmt_text = (ev.get("format") or "").strip()
+    if fmt_text:
+        with st.expander("📋 Format details", expanded=False):
+            st.markdown(fmt_text)
+    else:
+        st.caption("Format details not yet published on Liquipedia.")
+
+    # ── Seeded teams chip cloud ───────────────────────────────────
+    seeded = ev.get("seeded_teams", []) or []
+    if seeded:
+        st.markdown(f"**🎟️ Seeded teams ({len(seeded)})**")
+        chips_html = " ".join(
+            f"<span style='display:inline-block; padding:4px 10px; margin:3px; "
+            f"background:#1f2937; border:1px solid #374151; border-radius:14px; "
+            f"font-size:13px; color:#e5e7eb;'>"
+            f"{TEAM_META.get(t, {}).get('flag', '')} {t}</span>"
+            for t in seeded
+        )
+        st.markdown(chips_html, unsafe_allow_html=True)
+    else:
+        st.warning(
+            "🟡 No seeded teams listed yet. Bracket fill will be unavailable "
+            "until seeding is announced on Liquipedia."
+        )
+
+    # ── Prize distribution table ──────────────────────────────────
+    pd_dist = ev.get("prize_distribution", {}) or {}
+    if pd_dist:
+        with st.expander(f"💰 Prize distribution ({len(pd_dist)} placements)", expanded=False):
+            pd_rows = [
+                {"Placement": place, "Prize (USD)": f"${amt:,.0f}"}
+                for place, amt in pd_dist.items()
+            ]
+            st.dataframe(
+                pd.DataFrame(pd_rows),
+                hide_index=True,
+                use_container_width=True,
+            )
+    else:
+        st.caption("Prize breakdown not yet published.")
+
+    # ── Bracket parsing + render ──────────────────────────────────
+    # Slice 1 of Task 6.3: SE / SE_with_bronze interactive bracket. Other
+    # formats (DE, Swiss, GSL groups, RR groups) surface as 🚧 placeholder
+    # cards until later slices land their parsers.
+    _fetch_page = _fetch_liquipedia_page  # local alias to keep slice-1 code stable
+    _bs4        = _liquipedia_bs4
+
+    st.markdown("---")
+    st.markdown("### 🧱 Bracket")
+
+    # Bump this when the parser logic changes — every existing memoised
+    # Stage from a prior session is then invalidated automatically without
+    # requiring users to hit the Refresh button.
+    #   v1 = slice 1 (SE+bronze)
+    #   v2 = + slice 2 (DE) and slice 3 (Swiss)
+    #   v3 = + slice 4 (RR Groups, with cascade RR completion)
+    #   v4 = + Major sub-page traversal (Stage_N)
+    #   v5 = + GSL-lite / Full-GSL group format detection (sub-section headers)
+    #   v6 = + bye-slot backfill for non-power-of-two SE brackets (bronze fix)
+    #   v7 = + Phase 3 stage-graph hard-cut: per-stage roster drives R1 seeds
+    #   v8 = + Phase 3 fix: no auto pair-order R1 (Liquipedia DOM or manual only)
+    #   v9 = + h4 sub-stage heading (Group A/B distinct labels in DE groups)
+    #   v10 = + Phase 4 cross-stage cascade (advance_from / direct_invitees
+    #          drive downstream rosters at render time)
+    #   v11 = + §10 Swiss rework: VRS-snapshot picker, auto-seed R1 button,
+    #          Buchholz pairer with rematch swap (vrs_engine/swiss_pairer.py)
+    _PARSER_VERSION = "v11"
+
+    @st.cache_data(ttl=21600, show_spinner=False)
+    def _cached_parsed_stages(slug: str, seed_tuple: tuple, force_token: int, parser_version: str):
+        # L2 cache (architecture decision #12). Re-fetches the tournament
+        # page and parses brackets; 6h TTL aligns with L1 discovery cache.
+        # `force_token` lets the user invalidate via the page-level Refresh.
+        # `parser_version` invalidates ALL prior memoised stages whenever the
+        # parser logic ships a new behaviour (RR cascade, sub-page traversal,
+        # …) — users no longer need to know about the Refresh button to get
+        # the latest improvements.
+        html = _fetch_page(slug)
+        if html is None:
+            return None
+        soup = _bs4(html)
+        # Phase 3 wiring: pull the format prose, per-stage invitee partition
+        # and (for Major-tier events) sub-page teamcard rosters off the same
+        # soup so parse_tournament_brackets can build the cross-stage graph
+        # and drive R1 seeds from each stage's resolved roster.
+        from data_loaders.liquipedia_loader import (
+            _parse_format as _lp_parse_format,
+            _parse_per_stage_invites as _lp_per_stage_invites,
+        )
+        from data_loaders.stage_graph import collect_sub_page_rosters
+        prose       = _lp_parse_format(soup)
+        per_stage   = _lp_per_stage_invites(soup)
+        sub_rosters = collect_sub_page_rosters(slug, soup)
+        stages = parse_tournament_brackets(
+            soup, list(seed_tuple), slug=slug,
+            format_prose=prose,
+            direct_invitees_by_stage=per_stage,
+            sub_page_rosters=sub_rosters,
+        )
+        return stages
+
+    with st.spinner("Parsing brackets…"):
+        parsed_stages = _cached_parsed_stages(
+            ev["slug"], tuple(seeded),
+            st.session_state._tp_force_token,
+            _PARSER_VERSION,
+        )
+
+    if parsed_stages is None:
+        st.error("🔴 Could not fetch the tournament page from Liquipedia.")
+        st.stop()
+    if not parsed_stages:
+        st.warning(
+            "🟡 No bracket structure found on the Liquipedia page yet. "
+            "Bracket fill becomes available once seeding is published."
+        )
+        st.stop()
+
+    # ── Build a quick rank lookup for Glicko E(win) (architecture #6) ─
+    # Auto-fill favorites uses `expected_win(seed_a, seed_b)`; teams not in
+    # `base_standings` fall back to SEED_MIN (=400) per architecture #6.
+    if not base_standings.empty and "seed" in base_standings.columns:
+        _seed_lookup = dict(zip(base_standings["team"], base_standings["seed"]))
+    else:
+        _seed_lookup = {}
+
+    def _team_seed(team: str | None) -> float:
+        if not team:
+            return float(SEED_MIN)
+        return float(_seed_lookup.get(team, SEED_MIN))
+
+    # ── Session state init (architecture #3 — scenario-aware shape) ───
+    if "bracket_state" not in st.session_state:
+        st.session_state.bracket_state = {}
+    bs_root = st.session_state.bracket_state
+    if ev["slug"] not in bs_root:
+        bs_root[ev["slug"]] = {
+            "scenarios":         {"current": {
+                "picks":         {},
+                "manual_seeds":  {},   # {match_id: {"a": team, "b": team}}
+                "created":       datetime.now(),
+            }},
+            "active_scenario":   "current",
+            "seed_signature":    hashlib.md5(",".join(seeded).encode()).hexdigest()[:12]
+                                  if seeded else "",
+            "include_in_chain":  False,
+            "event_meta":        ev,   # stashed for Predicted-mode lookup from other pages
+        }
+    else:
+        # Refresh event metadata in case Liquipedia data changed (prize pool
+        # announcement, seeds finalised, end-date adjusted).
+        bs_root[ev["slug"]]["event_meta"] = ev
+        # Backfill `manual_seeds` for scenarios created before Phase 3.
+        for scen in bs_root[ev["slug"]]["scenarios"].values():
+            scen.setdefault("manual_seeds", {})
+    slug_state    = bs_root[ev["slug"]]
+    active_name   = slug_state["active_scenario"]
+    picks: dict   = slug_state["scenarios"][active_name]["picks"]
+    manual_seeds: dict = slug_state["scenarios"][active_name]["manual_seeds"]
+
+    # ── VRS-snapshot picker (Swiss seeding authority — §10 spec) ──────
+    # User must pick a snapshot before Swiss synth fires. No default
+    # (10.Q5). State persists in slug_state["snapshot_date"] +
+    # slug_state["snapshot_year"]. Snapshot scope = Swiss seed-tiebreak
+    # only; engine factors and auto-fill E(win) keep using the global
+    # mode (10.Q9).
+    #
+    # Date discovery: try the live GitHub API first, fall back to the
+    # local pickle cache directory when the API is unreachable / rate-
+    # limited (60 reqs/h unauthenticated). Without this fallback the
+    # selectbox shows only the placeholder option in offline / capped
+    # sessions and the user can't pick at all.
+    from data_loaders.github_loader import (
+        _find_all_dates as _gh_dates, GH_CACHE_DIR as _GH_CACHE_DIR,
+    )
+    import os as _os, re as _re_dates
+    _snap_dates = _gh_dates()
+    if not _snap_dates and _os.path.isdir(_GH_CACHE_DIR):
+        seen: set[tuple[str, str]] = set()
+        for fn in _os.listdir(_GH_CACHE_DIR):
+            m = _re_dates.match(r"vrs_(\d{4})_(\d{4}_\d{2}_\d{2})\.pkl$", fn)
+            if m:
+                year, date_str = m.group(1), m.group(2)
+                seen.add((date_str, year))
+        _snap_dates = sorted(seen, key=lambda x: x[0], reverse=True)
+    _snap_options = ["— Pick a VRS snapshot —"] + [
+        f"{d} ({y})" for (d, y) in _snap_dates
+    ]
+    _cur_date = slug_state.get("snapshot_date")
+    _cur_year = slug_state.get("snapshot_year")
+    _cur_label = (f"{_cur_date} ({_cur_year})"
+                  if _cur_date and _cur_year else _snap_options[0])
+    _idx = _snap_options.index(_cur_label) if _cur_label in _snap_options else 0
+    _picked = st.selectbox(
+        "VRS snapshot for Swiss seeding",
+        options=_snap_options,
+        index=_idx,
+        key=f"tp_snapshot_{ev['slug']}",
+        help="Drives seed numbers used for Buchholz tiebreak and the "
+             "🌱 auto-seed R1 button on Swiss stages. Affects Swiss "
+             "seeding only — engine factors / E(win) come from the "
+             "global mode.",
+    )
+    if _picked == _snap_options[0]:
+        slug_state["snapshot_date"] = None
+        slug_state["snapshot_year"] = None
+    else:
+        # "YYYY_MM_DD (YYYY)" → split date + year out
+        _d, _y = _picked.rsplit(" (", 1)
+        slug_state["snapshot_date"] = _d
+        slug_state["snapshot_year"] = _y.rstrip(")")
+
+    snapshot_standings = _snapshot_standings(
+        slug_state.get("snapshot_date"),
+        slug_state.get("snapshot_year"),
+    )
+    if not snapshot_standings:
+        st.warning(
+            "🟠 Pick a VRS snapshot to enable Swiss seeding "
+            "(🌱 auto-seed R1 button + R>1 cascade)."
+        )
+    else:
+        # Identify participants missing from the snapshot — they'll get
+        # bottom-rank tail seeds (10.Q6) so the user knows.
+        all_participants: set[str] = set(seeded)
+        for s in parsed_stages:
+            all_participants.update(s.roster or [])
+            all_participants.update(s.direct_invitees or [])
+        _missing = sorted(t for t in all_participants
+                          if t and t not in snapshot_standings)
+        if _missing:
+            st.info(
+                f"ℹ️ {len(_missing)} team(s) not in snapshot — "
+                f"placed at bottom-rank tail alphabetically: "
+                f"{', '.join(_missing[:6])}"
+                + (f" + {len(_missing) - 6} more" if len(_missing) > 6 else "")
+            )
+
+    # ── Phase 4 fragment wrapper ──────────────────────────────────
+    # Wrap cascade + render + toolbar in @st.fragment so per-pick
+    # button clicks rerun ONLY this panel, not the whole predictor
+    # page (event discovery, metadata banner, format expander, …).
+    # Massively cuts per-click latency on Cologne-sized brackets.
+    @st.fragment
+    def _bracket_panel(parsed_stages=parsed_stages):
+        # ── Phase 4 cross-stage cascade (render-time roster propagation) ──
+        # Cached `parsed_stages` is shared across reruns and across sessions
+        # via the L2 cache, so it must stay immutable. Deep-copy before
+        # mutating per-stage `roster` / R1 bye seeds so each render's cascade
+        # output doesn't leak into the next user's view.
+        #
+        # Steps per render:
+        #   1. Overlay `manual_seeds` onto match seed slots (so the cascade's
+        #      ``compute_stage_advancers`` sees user-placed teams as if
+        #      Liquipedia had them).
+        #   2. Walk the stage graph topologically — each stage with
+        #      ``advance_from`` entrants computes its roster from upstream
+        #      picks + concrete `direct_invitees`.
+        #   3. Write the computed roster back to each stage and re-fill any
+        #      non-power-of-two bracket bye slots so SF byes resolve.
+        # Phase 5 §5.1 — single seam. resolve_for_render does the deep-copy +
+        # manual_seeds overlay + Swiss-synth bake + cross-stage cascade +
+        # downstream R1 seat + bye fill. Same call site that engine emission
+        # uses, guaranteeing identical state across UI and prize emission.
+        from data_loaders.stage_graph import (
+            apply_cross_stage_cascade,
+            seat_cross_stage_r1,
+            resolve_for_render,
+        )
+        from data_loaders.bracket_parser import _apply_roster_seeds
+        parsed_stages = resolve_for_render(
+            parsed_stages, picks,
+            manual_seeds=manual_seeds,
+            snapshot_standings=snapshot_standings,
+        )
+
+        # ── Compact bracket styles (Phase 3 polish) ───────────────────────
+        # Shrink the manual-seed selectbox, tighten button typography, pull
+        # within-match teams together, and breathe between rounds / matches.
+        # Lines must be dedented — Streamlit's markdown parser treats
+        # leading-whitespace multi-line content as a code block, which would
+        # leak the raw <style> block onto the page as visible text.
+        st.markdown(
+            "<style>"
+            "div[data-testid=\"stSelectbox\"]{min-height:0;}"
+            "div[data-testid=\"stSelectbox\"]>div{min-height:1.6rem;font-size:0.78rem;padding:1px 6px;}"
+            "div[data-testid=\"stSelectbox\"] svg{height:12px;width:12px;}"
+            "div[data-testid=\"stButton\"]>button{padding:2px 8px;font-size:0.78rem;min-height:1.7rem;line-height:1.2;}"
+            ".tp-match-pair-anchor+div [data-testid=\"stHorizontalBlock\"]{gap:0.15rem !important;}"
+            ".tp-match-pair-anchor{margin-bottom:14px;}"
+            "</style>",
+            unsafe_allow_html=True,
+        )
+
+        # Stage-signature staleness banner (architecture #12 part b).
+        sig_now = ":".join(s.signature() for s in parsed_stages)
+        sig_key = "_bracket_sig_" + ev["slug"]
+        if sig_key in st.session_state and st.session_state[sig_key] != sig_now:
+            st.warning(
+                "🟠 Liquipedia's bracket structure has changed since you last "
+                "edited this prediction. Picks for altered slots are kept but "
+                "may now reference different match-ups. Review highlighted slots."
+            )
+        st.session_state[sig_key] = sig_now
+
+        # ── Resolve teams in any match given current picks ────────────────
+        # Pre-compute Swiss cascade pairings once per render — keyed by stage_id.
+        _swiss_overrides_cache: dict[str, dict[str, tuple[str, str]]] = {}
+
+        def _resolve(stage: "Stage", m: "BracketMatch") -> tuple[str | None, str | None]:
+            """Return (team_a, team_b). For R2+ slots, follow feeders through picks."""
+            by_id = {x.match_id: x for x in stage.matches}
+
+            # Swiss cascade: synthesised R2+ pairings for empty matchlist seeds.
+            if m.sub == "SW":
+                ov = _swiss_overrides_cache.get(stage.stage_id)
+                if ov is None:
+                    ov = _compute_swiss_overrides(stage, picks, snapshot_standings)
+                    _swiss_overrides_cache[stage.stage_id] = ov
+                if m.match_id in ov:
+                    return ov[m.match_id]
+
+            def _winner_of(mid: str) -> str | None:
+                if mid is None:
+                    return None
+                up = by_id.get(mid)
+                if up is None:
+                    return None
+                if up.played_winner:
+                    return up.played_winner
+                return picks.get(mid)
+
+            def _loser_of(mid: str) -> str | None:
+                if mid is None:
+                    return None
+                up = by_id.get(mid)
+                if up is None:
+                    return None
+                up_a, up_b = _resolve(stage, up)
+                up_winner = _winner_of(mid)
+                if up_winner == up_a:
+                    return up_b
+                if up_winner == up_b:
+                    return up_a
+                return None
+
+            # R1 slots in SE / UB carry seeds; LB R1 has no seeds — always feeders.
+            if m.round_idx == 1 and not m.is_bronze and m.sub in ("", "UB"):
+                return m.seed_a, m.seed_b
+
+            # Matchlist-based formats: R1 (and Swiss in general) carry pairings
+            # in ``seed_a/b``. GSL-lite / Full-GSL groups encode R2+ Winners' /
+            # Elimination / Decider matches as feeder-driven rows just like
+            # SE+bronze / DE LB; we let those fall through to the generic
+            # feeder-kind walker below.
+            if m.sub == "SW":
+                return m.seed_a, m.seed_b
+            if m.sub == "GR" and m.round_idx == 1:
+                return m.seed_a, m.seed_b
+
+            # Generic resolution by feeder kind. SE+bronze, DE LB and DE UB-vs-LB
+            # cross-feeders all flow through here.
+            def _team(feeder_id: str | None, kind: str) -> str | None:
+                if not feeder_id:
+                    return None
+                return _loser_of(feeder_id) if kind == "loser" else _winner_of(feeder_id)
+
+            # Fall back to direct seed when no feeder (R2+ bye slot for non-
+            # power-of-two SE / SE+bronze brackets). The cross-stage cascade
+            # `seat_cross_stage_r1` writes top-of-roster teams into SF byes
+            # for fan-in 6-team layouts (Atlanta) — the resolver must honour
+            # them, otherwise byes render as TBD even when seeded.
+            return (
+                _team(m.feeder_a, m.feeder_a_kind) or m.seed_a,
+                _team(m.feeder_b, m.feeder_b_kind) or m.seed_b,
+            )
+
+        # Wrap `_resolve` with the manual-seed overlay (Phase 3 Q5). Manual seeds
+        # take priority over upstream-derived teams so the user can override any
+        # slot when Liquipedia / cascade hasn't placed one.
+        _resolve_inner = _resolve
+        def _resolve(stage: "Stage", m: "BracketMatch") -> tuple[str | None, str | None]:
+            a, b = _resolve_inner(stage, m)
+            ms = manual_seeds.get(m.match_id) or {}
+            return ms.get("a") or a, ms.get("b") or b
+
+        # ── Top toolbar: auto-fill / clear / pause / chain flag ───────────
+        tb1, tb2, tb3, tb4, tb5 = st.columns([1, 1, 1, 1.4, 1.2])
+
+        def _autofill_stage(stage: "Stage") -> int:
+            """Greedy auto-fill in round order. Returns count of picks set."""
+            n = 0
+            # Sort so dependencies resolve first:
+            #   1. UB before LB (LB R1 feeds from UB R1 losers).
+            #   2. Round asc within sub-bracket.
+            #   3. Slot asc, bronze/GF last.
+            _sub_order = {"UB": 0, "": 0, "LB": 1, "GF": 2, "RST": 3}
+            ordered = sorted(stage.matches,
+                             key=lambda x: (
+                                 x.round_idx if x.sub != "LB" else x.round_idx + 0.5,
+                                 _sub_order.get(x.sub, 9),
+                                 x.is_bronze,
+                                 x.slot_idx,
+                             ))
+            for m in ordered:
+                if m.played_winner:
+                    continue
+                a, b = _resolve(stage, m)
+                if a is None and b is None:
+                    continue
+                if a is None:
+                    picks[m.match_id] = b; n += 1; continue
+                if b is None:
+                    picks[m.match_id] = a; n += 1; continue
+                ew = expected_win(_team_seed(a), _team_seed(b))
+                if ew == 0.5:
+                    picks[m.match_id] = a if a < b else b   # alphabetical tie-break
+                else:
+                    picks[m.match_id] = a if ew >= 0.5 else b
+                n += 1
+            return n
+
+        if tb1.button("⚡ Auto-fill favorites", use_container_width=True,
+                      help="Fill every empty slot with the higher-rated team (Glicko E(win))."):
+            total = 0
+            for s in parsed_stages:
+                if s.format in ("SE", "SE_with_bronze", "DE", "Swiss", "Groups"):
+                    total += _autofill_stage(s)
+                    # After this stage's picks land:
+                    #   1. Re-bake Swiss synth pairings into seed slots (the
+                    #      Buchholz pairer derives R2-R5 from the just-set
+                    #      R1 picks; cascade's top_by_wins tally needs them
+                    #      to count wins from later rounds).
+                    #   2. Re-run cascade so downstream R1 slots seat from
+                    #      the new advancer list BEFORE autofill reaches the
+                    #      next stage. Without (1)+(2) the Playoffs stays
+                    #      TBD even after a fully-picked Swiss.
+                    for _stg in parsed_stages:
+                        if _stg.format == "Swiss":
+                            _ov = _compute_swiss_overrides(
+                                _stg, picks, snapshot_standings,
+                            )
+                            for _m in _stg.matches:
+                                if _m.match_id in _ov and not _m.seed_a:
+                                    _m.seed_a, _m.seed_b = _ov[_m.match_id]
+                    _re = apply_cross_stage_cascade(parsed_stages, picks)
+                    for _stg in parsed_stages:
+                        _r = _re.get(_stg.def_name)
+                        if not _r:
+                            continue
+                        # Partial-roster guard: when a downstream stage
+                        # has multiple upstream sources (Atlanta fan-in:
+                        # 2 groups × 3 advancers), a single group's
+                        # autofill produces a partial roster. Seating a
+                        # partial roster bakes wrong teams into byes
+                        # (e.g. SF1.seed_b = top of Group A roster) that
+                        # the next pass's fan-in seeding can't overwrite.
+                        # Skip until cascade returns the full expected
+                        # team count.
+                        _expected = sum(en.count for en in _stg.entrants
+                                        if en.source in ("advance_from",
+                                                         "direct_invite"))
+                        if _expected and len(_r) < _expected:
+                            continue
+                        _stg.roster = _r
+                        seat_cross_stage_r1(_stg, _r)
+                        _apply_roster_seeds(_stg.matches, _r)
+            st.toast(f"⚡ Auto-filled {total} pick{'s' if total != 1 else ''}.")
+            st.rerun(scope="fragment")
+
+        if tb2.button("🗑️ Clear picks", use_container_width=True):
+            picks.clear()
+            manual_seeds.clear()
+            st.rerun(scope="fragment")
+
+        paused = tb3.toggle(
+            "⏸️ Pause", value=slug_state.get("paused", False),
+            key=f"tp_pause_{ev['slug']}",
+            help="When on, picks save but the engine doesn't auto-recompute on every click. (6.4)",
+        )
+        slug_state["paused"] = paused
+
+        chain_flag = tb4.toggle(
+            "🔗 Include in multi-event chain",
+            value=slug_state.get("include_in_chain", False),
+            key=f"tp_chain_{ev['slug']}",
+            help="(7.4) Stack this event's picks with other chain-flagged events when computing standings.",
+        )
+        slug_state["include_in_chain"] = chain_flag
+
+        _RENDERED_FMTS = ("SE", "SE_with_bronze", "DE", "Swiss", "Groups")
+        n_total  = sum(len(s.matches) for s in parsed_stages if s.format in _RENDERED_FMTS)
+        n_picked = sum(1 for s in parsed_stages
+                       if s.format in _RENDERED_FMTS
+                       for m in s.matches if (m.played_winner or picks.get(m.match_id)))
+        tb5.metric("Picks", f"{n_picked} / {n_total}", label_visibility="visible")
+
+        # ── Render each stage ─────────────────────────────────────────────
+        def _render_se_stage(stage: "Stage"):
+            st.markdown(f"#### {stage.display_heading or 'Bracket'} "
+                        f"<span style='color:#8b949e; font-size:13px'>"
+                        f"({stage.format.replace('_', ' ').replace('SE with bronze', 'SE + bronze')}, "
+                        f"{stage.rounds} rounds, {len(stage.matches)} matches)</span>",
+                        unsafe_allow_html=True)
+
+            rounds_max = stage.rounds
+            round_titles = {
+                1: "Round 1", rounds_max: "Final",
+                rounds_max - 1: "Semifinals", rounds_max - 2: "Quarterfinals",
+            }
+            # Re-label edge cases
+            if rounds_max == 2:
+                round_titles = {1: "Semifinals", 2: "Final"}
+            elif rounds_max == 1:
+                round_titles = {1: "Final"}
+
+            col_count = rounds_max + (1 if any(m.is_bronze for m in stage.matches) else 0)
+            cols = st.columns(col_count, gap="large")
+
+            # Group matches by render column
+            for r in range(1, rounds_max + 1):
+                with cols[r - 1]:
+                    st.caption(round_titles.get(r, f"Round {r}"))
+                    round_matches = sorted(
+                        [m for m in stage.matches if m.round_idx == r and not m.is_bronze],
+                        key=lambda x: x.slot_idx,
+                    )
+                    for m in round_matches:
+                        _render_match(stage, m)
+
+            bronze = [m for m in stage.matches if m.is_bronze]
+            if bronze:
+                with cols[-1]:
+                    st.caption("🥉 Bronze")
+                    # Bronze sits visually below the final — pad with a spacer
+                    st.markdown("<div style='height: 36px'></div>", unsafe_allow_html=True)
+                    for m in bronze:
+                        _render_match(stage, m)
+
+        # Pool of teams a user can manually drop into a TBD slot. Phase 3 Q5
+        # says "available teams = upstream advancers not yet placed + direct
+        # invitees + 'Other…' escape hatch". Until the cascade lands (Phase 4)
+        # we don't know advancers — so we offer the union of every stage's
+        # roster + direct_invitees + the event-level seeded list. Teams already
+        # placed (via played_winner / picks / manual_seeds) are still allowed
+        # so the user can correct mistakes; sorting is alphabetic for findability.
+        def _manual_seed_pool(stage: "Stage | None" = None) -> list[str]:
+            """Available teams for a manual-seed dropdown.
+
+            Per-stage when ``stage`` given: cascade-resolved roster + concrete
+            direct invitees. This is what Phase 3 Q5 actually meant — for a
+            cross-stage Playoffs R1 TBD, the dropdown should show the 8
+            upstream advancers, not every team in the tournament.
+
+            Falls back to the global union when the per-stage pool is empty
+            (e.g. snapshot not yet picked, upstream not yet decided), so the
+            user is never locked out of placing a team manually.
+            """
+            if stage is not None:
+                local: set[str] = set()
+                local.update(stage.roster or [])
+                local.update(stage.direct_invitees or [])
+                if local:
+                    return sorted(local)
+            pool: set[str] = set(seeded)
+            for s in parsed_stages:
+                pool.update(s.roster)
+                pool.update(s.direct_invitees)
+            return sorted(pool)
+
+        def _is_manual_seedable(m: "BracketMatch", side: str = "a") -> bool:
+            """Per-side check: should the dropdown render for THIS side of m?
+            Yes when:
+              * R1 leaf in a single-tree bracket (whole match is seedable).
+              * R2+ bye slot — *this* side has no upstream feeder (the other
+                side typically does in non-power-of-two SE brackets).
+            Bronze and feeder-driven slots stay disabled."""
+            if m.is_bronze:
+                return False
+            if m.sub not in ("", "UB", "SW", "GR"):
+                return False
+            if m.round_idx == 1:
+                return True
+            # R2+: only seedable if THIS side has no feeder (true bye).
+            return not (m.feeder_a if side == "a" else m.feeder_b)
+
+        def _render_manual_seed_box(stage: "Stage", m: "BracketMatch", side: str) -> None:
+            """Render a tiny selectbox letting the user place a team into a
+            TBD slot. Selection persists in `manual_seeds[match_id][side]`."""
+            pool = _manual_seed_pool(stage)
+            if not pool:
+                st.caption("TBD")
+                return
+            cur = (manual_seeds.get(m.match_id) or {}).get(side, "")
+            opts = ["— TBD —"] + pool
+            idx = opts.index(cur) if cur in opts else 0
+            sel = st.selectbox(
+                label="seed",
+                options=opts,
+                index=idx,
+                key=f"tp_seed_{ev['slug']}_{m.match_id}_{side}",
+                label_visibility="collapsed",
+            )
+            new_val = "" if sel == "— TBD —" else sel
+            if new_val != cur:
+                manual_seeds.setdefault(m.match_id, {})[side] = new_val
+                if not new_val:
+                    manual_seeds[m.match_id].pop(side, None)
+                    if not manual_seeds[m.match_id]:
+                        manual_seeds.pop(m.match_id, None)
+                st.rerun(scope="fragment")
+
+        def _render_match(stage: "Stage", m: "BracketMatch"):
+            a, b = _resolve(stage, m)
+            played = m.played_winner is not None
+            chosen = m.played_winner if played else picks.get(m.match_id)
+
+            def _btn_label(team: str | None, is_winner: bool) -> str:
+                # Phase 3 polish: country flag dropped from in-bracket labels —
+                # the bracket grid is already dense and the flag adds noise
+                # without information (region is usually obvious from the team).
+                if team is None:
+                    return "TBD"
+                return team + (" ✓" if is_winner else "")
+
+            # Played: read-only side-by-side chips with "actual result" badge.
+            if played:
+                st.markdown(
+                    f"<div style='border:1px solid #374151; border-radius:6px; "
+                    f"padding:6px 8px; margin-bottom:14px; background:#161b22; "
+                    f"display:flex; gap:8px; align-items:center;'>"
+                    f"<div style='flex:1; color:{'#3fb950' if chosen == a else '#8b949e'}; "
+                    f"font-size:12px;'>{_btn_label(a, chosen == a)}</div>"
+                    f"<div style='color:#6b7280; font-size:11px;'>vs</div>"
+                    f"<div style='flex:1; color:{'#3fb950' if chosen == b else '#8b949e'}; "
+                    f"font-size:12px; text-align:right;'>"
+                    f"{_btn_label(b, chosen == b)}</div>"
+                    f"<div style='color:#6b7280; font-size:10px;'>📜</div></div>",
+                    unsafe_allow_html=True,
+                )
+                return
+
+            # Unplayed: two clickable buttons side-by-side via st.columns. When
+            # a side is TBD AND that side accepts a manual seed (R1 leaf or R2+
+            # bye), render a dropdown instead so the user can place a team
+            # directly (Phase 3 Q5). Feeder-driven sides stay disabled — fix
+            # the upstream pick.
+            # Anchor div lets the bracket CSS target this pair's column gap +
+            # add breathing room below the match.
+            st.markdown(
+                "<div class='tp-match-pair-anchor'></div>",
+                unsafe_allow_html=True,
+            )
+            col_a, col_b = st.columns(2, gap="small")
+
+            with col_a:
+                if a is None and _is_manual_seedable(m, "a"):
+                    _render_manual_seed_box(stage, m, "a")
+                    b_a = False
+                else:
+                    b_a = st.button(
+                        _btn_label(a, chosen == a),
+                        key=f"tp_btn_a_{ev['slug']}_{m.match_id}",
+                        use_container_width=True,
+                        disabled=(a is None),
+                        type="primary" if chosen == a else "secondary",
+                    )
+            with col_b:
+                if b is None and _is_manual_seedable(m, "b"):
+                    _render_manual_seed_box(stage, m, "b")
+                    b_b = False
+                else:
+                    b_b = st.button(
+                        _btn_label(b, chosen == b),
+                        key=f"tp_btn_b_{ev['slug']}_{m.match_id}",
+                        use_container_width=True,
+                        disabled=(b is None),
+                        type="primary" if chosen == b else "secondary",
+                    )
+
+            if b_a and a:
+                picks[m.match_id] = a
+                st.rerun(scope="fragment")
+            if b_b and b:
+                picks[m.match_id] = b
+                st.rerun(scope="fragment")
+
+        def _render_swiss_stage(stage: "Stage"):
+            """
+            Swiss stage render: one column per round, matches stacked vertically.
+            Pool labels (High/Low/Mid) are implicit in match ordering — Liquipedia
+            groups by record bucket within each round automatically.
+            """
+            rounds = sorted({m.round_idx for m in stage.matches})
+            n_rounds = max(rounds) if rounds else 0
+            st.markdown(f"#### {stage.display_heading or 'Swiss Stage'} "
+                        f"<span style='color:#8b949e; font-size:13px'>"
+                        f"(Swiss, {len(stage.matches)} matches across {n_rounds} rounds)</span>",
+                        unsafe_allow_html=True)
+
+            # 🌱 auto-seed R1 button (spec lock 10.Q1). Greyed when:
+            #   * no snapshot picked, OR
+            #   * Liquipedia has already placed any R1 seed (DOM truth wins).
+            r1_matches = sorted(
+                [m for m in stage.matches if m.round_idx == 1 and m.sub == "SW"],
+                key=lambda x: x.slot_idx,
+            )
+            liqui_has_r1 = any(m.seed_a or m.seed_b for m in r1_matches)
+            roster = list(stage.roster) if stage.roster else []
+            can_seed = (bool(snapshot_standings) and not liqui_has_r1
+                        and len(roster) >= 2)
+            seed_help = (
+                "Synthesizes R1 pairings as #1v#9, #2v#10, …, #N/2v#N using the "
+                "picked VRS snapshot rank. Disabled when Liquipedia has already "
+                "placed R1 or when no snapshot is selected."
+            )
+            if st.button("🌱 auto-seed R1", key=f"tp_seed_r1_{stage.stage_id}",
+                         disabled=not can_seed, help=seed_help):
+                from vrs_engine.swiss_pairer import seed_table, r1_split_bracket
+                seeds = seed_table(roster, snapshot_standings)
+                r1_pairs = r1_split_bracket(seeds)
+                for m, (a, b) in zip(r1_matches, r1_pairs):
+                    manual_seeds[m.match_id] = {"a": a, "b": b}
+                st.toast(f"🌱 Auto-seeded {len(r1_pairs)} R1 pairings for "
+                         f"{stage.display_heading or 'Swiss stage'}.")
+                st.rerun(scope="fragment")
+
+            cols = st.columns(max(n_rounds, 1), gap="large")
+            for r in rounds:
+                with cols[r - 1]:
+                    round_matches = sorted(
+                        [m for m in stage.matches if m.round_idx == r],
+                        key=lambda x: x.slot_idx,
+                    )
+                    played = sum(1 for m in round_matches if m.played_winner)
+                    st.caption(f"Round {r}  ·  {len(round_matches)} match"
+                               f"{'es' if len(round_matches) != 1 else ''}"
+                               f"{f' ({played} played)' if played else ''}")
+                    for m in round_matches:
+                        _render_match(stage, m)
+
+        def _render_groups_stage(stage: "Stage"):
+            """
+            Round-robin group stage render: vertical match list per group. Stage
+            already represents one group (display_heading carries the label like
+            "Group A"). Multiple groups produce multiple Stage objects.
+            """
+            st.markdown(f"#### {stage.display_heading or 'Group'} "
+                        f"<span style='color:#8b949e; font-size:13px'>"
+                        f"(Round-robin, {len(stage.matches)} matches)</span>",
+                        unsafe_allow_html=True)
+
+            if not stage.matches:
+                st.caption("Schedule not yet published.")
+                return
+
+            # Compute current standings within this group from picks + played.
+            wins:   dict[str, int] = {}
+            played: dict[str, int] = {}
+            for m in stage.matches:
+                chosen = m.played_winner or picks.get(m.match_id)
+                a, b   = m.seed_a, m.seed_b
+                if not chosen or not a or not b:
+                    continue
+                wins[chosen] = wins.get(chosen, 0) + 1
+                played[a]    = played.get(a, 0) + 1
+                played[b]    = played.get(b, 0) + 1
+                loser = b if chosen == a else a
+                wins.setdefault(loser, 0)
+
+            # Two-column layout: matches on the left, current standings on the right.
+            col_m, col_s = st.columns([2, 1])
+            with col_m:
+                for m in stage.matches:
+                    _render_match(stage, m)
+
+            with col_s:
+                if wins:
+                    st.caption("Group standings")
+                    ranks = sorted(wins.items(), key=lambda kv: (-kv[1], kv[0]))
+                    std_html = "<table style='width:100%; font-size:12px;'>"
+                    for i, (team, w) in enumerate(ranks, start=1):
+                        pl = played.get(team, 0)
+                        flag = TEAM_META.get(team, {}).get("flag", "")
+                        std_html += (
+                            f"<tr><td style='padding:2px 4px; color:#8b949e;'>{i}</td>"
+                            f"<td style='padding:2px 4px;'>{flag} {team}</td>"
+                            f"<td style='padding:2px 4px; text-align:right; "
+                            f"color:#3fb950;'>{w}-{pl - w}</td></tr>"
+                        )
+                    std_html += "</table>"
+                    st.markdown(std_html, unsafe_allow_html=True)
+                else:
+                    st.caption("(Pick matches to see standings)")
+
+        def _render_de_stage(stage: "Stage"):
+            """
+            Render a double-elimination bracket. Compact 8-team group format
+            (used by IEM Atlanta / CS Asia Champs group stage) renders as two
+            stacked rows: UB tree on top, LB tree below. Full DE-with-GF +
+            bracket-reset extension lives in slice 2b.
+            """
+            st.markdown(f"#### {stage.display_heading or 'Bracket'} "
+                        f"<span style='color:#8b949e; font-size:13px'>"
+                        f"(Double-elim, {len(stage.matches)} matches "
+                        f"— UB {sum(1 for m in stage.matches if m.sub == 'UB')}, "
+                        f"LB {sum(1 for m in stage.matches if m.sub == 'LB')})</span>",
+                        unsafe_allow_html=True)
+
+            ub_matches = [m for m in stage.matches if m.sub == "UB"]
+            lb_matches = [m for m in stage.matches if m.sub == "LB"]
+
+            # Upper bracket
+            if ub_matches:
+                ub_max = max(m.round_idx for m in ub_matches)
+                st.markdown(
+                    "<div style='color:#3fb950; font-size:12px; font-weight:600; "
+                    "margin:6px 0;'>⬆️ Upper Bracket</div>",
+                    unsafe_allow_html=True,
+                )
+                cols_ub = st.columns(ub_max, gap="large")
+                for r in range(1, ub_max + 1):
+                    with cols_ub[r - 1]:
+                        title = "UB Final" if r == ub_max else (
+                            "UB Semifinals" if r == ub_max - 1 else f"UB R{r}"
+                        )
+                        st.caption(title)
+                        rms = sorted([m for m in ub_matches if m.round_idx == r],
+                                     key=lambda x: x.slot_idx)
+                        for m in rms:
+                            _render_match(stage, m)
+
+            # Lower bracket
+            if lb_matches:
+                lb_max = max(m.round_idx for m in lb_matches)
+                st.markdown(
+                    "<div style='color:#f85149; font-size:12px; font-weight:600; "
+                    "margin:12px 0 6px 0;'>⬇️ Lower Bracket</div>",
+                    unsafe_allow_html=True,
+                )
+                cols_lb = st.columns(lb_max, gap="large")
+                for r in range(1, lb_max + 1):
+                    with cols_lb[r - 1]:
+                        title = "LB Final" if r == lb_max else (
+                            "LB Semifinals" if r == lb_max - 1 else f"LB R{r}"
+                        )
+                        st.caption(title)
+                        rms = sorted([m for m in lb_matches if m.round_idx == r],
+                                     key=lambda x: x.slot_idx)
+                        for m in rms:
+                            _render_match(stage, m)
+
+        # ── Iterate stages in document order ──────────────────────────────
+        rendered_any = False
+        for stage in parsed_stages:
+            st.markdown("---")
+            if stage.format in ("SE", "SE_with_bronze"):
+                _render_se_stage(stage)
+                rendered_any = True
+            elif stage.format == "DE":
+                _render_de_stage(stage)
+                rendered_any = True
+            elif stage.format == "Swiss":
+                _render_swiss_stage(stage)
+                rendered_any = True
+            elif stage.format == "Groups":
+                _render_groups_stage(stage)
+                rendered_any = True
+            else:
+                st.info(
+                    f"**{stage.display_heading or stage.format}** — "
+                    f"🚧 Format `{stage.format}` not yet supported. "
+                    f"This event's other stages still contribute picks normally."
+                )
+
+        if not rendered_any:
+            st.warning(
+                "🟡 This event has only unsupported stages. Bracket support for "
+                "this format lands in a future slice."
+            )
+
+        # Liquipedia source link (kept at the bottom of the page).
+        st.caption(f"📡 Source: [Liquipedia / {ev['slug']}]({ev['url']})")
+
+    _bracket_panel()
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -3236,21 +4527,25 @@ elif page == "🔍 Team Breakdown":
         )
 
     # ═══════════════════════════════════════════════════════════════
-    # TWO MAIN TABS
+    # THREE MAIN VIEWS
     # ═══════════════════════════════════════════════════════════════
+    # Insights        — KPIs, donut, time window, why X above Y, climb plan
+    # Score Breakdown — Score Change Breakdown, Phase 1 factors, Phase 2 H2H
+    # Historical      — Long-running rank/score chart across snapshots
+    #
     # Use a radio (not st.tabs) so only the active section's Python runs.
     # st.tabs executes ALL tab bodies every rerun, causing heavy renders
     # (history spinner, chart builds) to appear appended below the page.
     _bd_tab_sel = st.radio(
         "View",
-        ["📊 Current Snapshot", "📈 Historical Development"],
+        ["📊 Insights", "🔬 Score Breakdown", "📈 Historical Development"],
         horizontal=True,
         label_visibility="collapsed",
-        key="bd_inner_tab",
+        key="bd_outer_tab",
     )
 
     # ═══════════════════════════════════════════════════════════════
-    if _bd_tab_sel == "📊 Current Snapshot":
+    if _bd_tab_sel == "📊 Insights":
     # ═══════════════════════════════════════════════════════════════
 
         # ── KPI header ────────────────────────────────────────────
@@ -3408,20 +4703,62 @@ elif page == "🔍 Team Breakdown":
         # ════════════════════════════════════════════════════════
         # 4.1 — TIME WINDOW: what's expiring & what just landed
         # ════════════════════════════════════════════════════════
-        # Bucket every counting item by age weight so the user can
-        # see which matches/prizes are about to roll out of the
-        # 180-day window — and which recent results are still at
-        # full weight.  "Pts" estimates each item's contribution to
-        # the final seed using the same `entry/10 × _pts_per_factor`
-        # rule the per-factor tables show below.
+        # Both modes are forward-looking from a fixed anchor:
+        #
+        #   Today mode      → anchor = today (sim_cutoff_dt)
+        #   As-published    → anchor = the snapshot's published date
+        #
+        # The reference R is always the next Valve publication after the
+        # anchor (first Monday of next calendar month — empirically
+        # verified Dec 2024 → present, see cache/github_vrs).
+        #
+        # "At risk" = points lost between anchor and R:
+        #   loss = pts × (1 − age_w_at_R / age_w_at_anchor)
+        #
+        # Today mode is RED (the next pub is imminent, so the red band
+        # is narrow — only the days that will fully drop in the few
+        # days remaining); As-published is YELLOW (a full cycle out, so
+        # a wider band of items is at risk but it's not yet urgent).
+        #
+        # X-axis = days before anchor.  Day 0 = "now" from the user's
+        # perspective.  The green flat-zone band straddles day 0 — the
+        # right half is the past portion (data points exist there) and
+        # the left half is the future portion (where data will appear
+        # as time passes — the green zone "grows day by day" toward R).
         st.markdown("---")
         st.markdown("### ⏳ Time Window — what's expiring, what's fresh")
 
+        # ── anchor / reference / mode-specific framing ─────────
+        if mode_active == "updated":
+            _anchor_dt   = sim_cutoff_dt
+            _exp_color   = "#f85149"           # red — urgent
+            _exp_emoji   = "⏳"
+            _exp_title   = "At risk by next update"
+            _at_risk_label = "at risk"
+        else:
+            _anchor_dt   = cutoff_dt
+            _exp_color   = "#e3b341"           # amber / yellow — at risk next cycle
+            _exp_emoji   = "📉"
+            _exp_title   = "At risk next cycle"
+            _at_risk_label = "at risk"
+
+        _ref_pub      = next_valve_publication(_anchor_dt)
+        _other_anchor = prev_valve_publication(_anchor_dt)
+        _gap_days     = max(0, (_ref_pub - _anchor_dt).days)
+        _cycle_days   = max(0, (_anchor_dt - _other_anchor).days)
+
         _ref_cutoff = sim_cutoff_dt if mode_active == "updated" else cutoff_dt
+
+        def _aw_anchor(d):
+            return age_weight(d, _anchor_dt)
+        def _aw_ref(d):
+            return age_weight(d, _ref_pub)
 
         _window_items: list[dict] = []
 
         # ── BO: each top-10 prize's share of bo_factor ─────────
+        # Sort by the contribution at the *viewing* cutoff (matches the
+        # per-factor table below).  The expiring math then re-projects.
         _bo_local = []
         for bp in bo_prizes:
             try:
@@ -3444,6 +4781,8 @@ elif page == "🔍 Team Breakdown":
             _pts   = _share * float(ex["bo_factor"]) * _pts_per_factor
             _window_items.append({
                 "date": b["date"], "age_w": b["age_w"], "pts": _pts,
+                "age_w_anchor": _aw_anchor(b["date"]),
+                "age_w_ref":    _aw_ref(b["date"]),
                 "kind": "BO", "color": "#f0b429",
                 "label": f"${b['amount']:,.0f} prize",
                 "match_id": None,
@@ -3463,6 +4802,8 @@ elif page == "🔍 Team Breakdown":
             _window_items.append({
                 "date": m["date"], "age_w": _eff_age(m),
                 "pts": e / 10 * _pts_per_factor,
+                "age_w_anchor": _aw_anchor(m["date"]),
+                "age_w_ref":    _aw_ref(m["date"]),
                 "kind": "BC", "color": "#3fb950",
                 "label": f"vs {m['opponent']}",
                 "match_id": m.get("match_id"),
@@ -3481,6 +4822,8 @@ elif page == "🔍 Team Breakdown":
             _window_items.append({
                 "date": m["date"], "age_w": _eff_age(m),
                 "pts": e / 10 * _pts_per_factor,
+                "age_w_anchor": _aw_anchor(m["date"]),
+                "age_w_ref":    _aw_ref(m["date"]),
                 "kind": "ON", "color": "#79c0ff",
                 "label": f"vs {m['opponent']}",
                 "match_id": m.get("match_id"),
@@ -3496,45 +4839,120 @@ elif page == "🔍 Team Breakdown":
             _window_items.append({
                 "date": m["date"], "age_w": _aw,
                 "pts": _aw / 10 * _pts_per_factor,
+                "age_w_anchor": _aw_anchor(m["date"]),
+                "age_w_ref":    _aw_ref(m["date"]),
                 "kind": "LAN", "color": "#f85149",
                 "label": f"vs {m['opponent']}",
                 "match_id": m.get("match_id"),
             })
 
-        # Buckets — "expiring" = on the ramp's tail (≤ 0.20),
-        # "fresh" = still inside the 30-day flat zone (≈ 1.0).
-        _expiring = [it for it in _window_items if it["age_w"] <= 0.20]
-        _fresh    = [it for it in _window_items if it["age_w"] >= 1.0 - 1e-6]
-        _pts_at_risk = sum(it["pts"] for it in _expiring)
-        _pts_recent  = sum(it["pts"] for it in _fresh)
+        # ── Per-item loss between anchor and R ──────────────────
+        # `pts` is the contribution at the viewing cutoff which now
+        # equals the anchor in BOTH modes (sim_cutoff_dt for updated,
+        # cutoff_dt for published), so pts_anchor = pts.
+        # loss = pts × (1 − age_w_at_R / age_w_at_anchor)
+        for it in _window_items:
+            awa, awr = it["age_w_anchor"], it["age_w_ref"]
+            it["pts_anchor"] = it["pts"]
+            if awa <= 0:
+                it["loss"] = 0.0
+                continue
+            ratio = (awr / awa) if awa > 0 else 0.0
+            it["loss"] = max(0.0, it["pts"] * (1.0 - ratio))
+
+        # Split loss into "fully drops out" vs "decays but stays in window"
+        # so the card can spell out both halves clearly.
+        _full_drops = [it for it in _window_items
+                       if it["age_w_anchor"] > 0 and it["age_w_ref"] <= 1e-9]
+        _decay_only = [it for it in _window_items
+                       if it["age_w_anchor"] > 0 and it["age_w_ref"] > 1e-9
+                       and it["loss"] > 0]
+        _pts_full   = sum(it["loss"] for it in _full_drops)
+        _pts_decay  = sum(it["loss"] for it in _decay_only)
+        _pts_at_risk = _pts_full + _pts_decay
+
+        # ── Newly gained: matches/prizes dated since the previous
+        # publication (i.e. landed inside this most recent cycle).  No
+        # green-at-R filter — in the published view almost nothing
+        # would survive that filter (R is a full cycle out), and the
+        # user-facing question is "what landed since we last looked?".
+        _green = [it for it in _window_items
+                  if it["date"] >= _other_anchor]
+        _pts_recent = sum(it["pts"] for it in _green)
+
+        # Pre-format date strings for the cards.
+        _anchor_str  = _anchor_dt.strftime("%b %d")
+        _ref_str     = _ref_pub.strftime("%b %d, %Y")
+        _ref_short   = _ref_pub.strftime("%b %d")
+        _other_str   = _other_anchor.strftime("%b %d")
+
+        # Expiring subtitle — concise, both halves spelled out.
+        if _full_drops or _decay_only:
+            _parts = []
+            if _full_drops:
+                _parts.append(
+                    f"<strong>{len(_full_drops)}</strong> "
+                    f"{'item' if len(_full_drops) == 1 else 'items'} "
+                    f"fully drop out (~{_pts_full:.1f} pts)"
+                )
+            if _decay_only:
+                _parts.append(
+                    f"<strong>{len(_decay_only)}</strong> more decay "
+                    f"(~{_pts_decay:.1f} pts)"
+                )
+            _gap_phrase = (
+                f"in {_gap_days} day{'s' if _gap_days != 1 else ''}"
+                if _gap_days > 0 else "today"
+            )
+            _exp_subtitle = (
+                f"By <strong>{_ref_short}</strong> ({_gap_phrase}): "
+                + " · ".join(_parts) + "."
+            )
+        else:
+            _exp_subtitle = (
+                f"Nothing in the top-10 buckets is set to drop or decay "
+                f"meaningfully before <strong>{_ref_short}</strong>."
+            )
+
+        # Newly-gained subtitle.
+        if _green:
+            _boost_subtitle = (
+                f"<strong>{len(_green)}</strong> "
+                f"{'match/prize' if len(_green) == 1 else 'matches/prizes'} "
+                f"landed since <strong>{_other_str}</strong> "
+                f"(last publication, {_cycle_days} day"
+                f"{'s' if _cycle_days != 1 else ''} ago)."
+            )
+        else:
+            _boost_subtitle = (
+                f"No new top-10 contributors since <strong>{_other_str}</strong>."
+            )
 
         _tw_l, _tw_r = st.columns([2, 3])
         with _tw_l:
             st.markdown(
-                f'<div style="background:#161b22;border:1px solid #f85149;'
-                f'border-left:4px solid #f85149;border-radius:8px;'
+                f'<div style="background:#161b22;border:1px solid {_exp_color};'
+                f'border-left:4px solid {_exp_color};border-radius:8px;'
                 f'padding:12px 14px;margin-bottom:8px;">'
                 f'<div style="font-size:11px;color:#8b949e;text-transform:uppercase;'
-                f'letter-spacing:0.5px;margin-bottom:4px;">⏳ Expiring soon</div>'
-                f'<div style="font-size:22px;font-weight:700;color:#f85149;">'
-                f'~{_pts_at_risk:,.0f} pts'
+                f'letter-spacing:0.5px;margin-bottom:4px;">{_exp_emoji} {_exp_title}</div>'
+                f'<div style="font-size:22px;font-weight:700;color:{_exp_color};">'
+                f'~{_pts_at_risk:,.1f} pts'
                 f'<span style="font-size:12px;color:#8b949e;font-weight:400;'
-                f'margin-left:6px;">at risk</span></div>'
-                f'<div style="font-size:11px;color:#8b949e;margin-top:2px;">'
-                f'<strong style="color:#c9d1d9">{len(_expiring)}</strong> item(s) at age '
-                f'weight ≤ 0.20 — about to roll out of the 180-day window.</div></div>'
+                f'margin-left:6px;">{_at_risk_label}</span></div>'
+                f'<div style="font-size:11px;color:#8b949e;margin-top:4px;'
+                f'line-height:1.5;">{_exp_subtitle}</div></div>'
                 f'<div style="background:#161b22;border:1px solid #3fb950;'
                 f'border-left:4px solid #3fb950;border-radius:8px;'
                 f'padding:12px 14px;">'
                 f'<div style="font-size:11px;color:#8b949e;text-transform:uppercase;'
-                f'letter-spacing:0.5px;margin-bottom:4px;">✨ Recent boost</div>'
+                f'letter-spacing:0.5px;margin-bottom:4px;">✨ Newly gained</div>'
                 f'<div style="font-size:22px;font-weight:700;color:#3fb950;">'
-                f'~{_pts_recent:,.0f} pts'
+                f'~{_pts_recent:,.1f} pts'
                 f'<span style="font-size:12px;color:#8b949e;font-weight:400;'
-                f'margin-left:6px;">at full weight</span></div>'
-                f'<div style="font-size:11px;color:#8b949e;margin-top:2px;">'
-                f'<strong style="color:#c9d1d9">{len(_fresh)}</strong> item(s) inside the '
-                f'30-day flat zone (age weight = 1.0).</div></div>',
+                f'margin-left:6px;">newly gained</span></div>'
+                f'<div style="font-size:11px;color:#8b949e;margin-top:4px;'
+                f'line-height:1.5;">{_boost_subtitle}</div></div>',
                 unsafe_allow_html=True,
             )
 
@@ -3545,49 +4963,101 @@ elif page == "🔍 Team Breakdown":
                 _kind_y = {"BO": 4, "BC": 3, "ON": 2, "LAN": 1}
                 _kind_color = {"BO": "#f0b429", "BC": "#3fb950",
                                "ON": "#79c0ff", "LAN": "#f85149"}
+
+                # x-axis = days before anchor (today / snapshot date).
+                # Day 0 = anchor.  All actual data points have x ≥ 0
+                # (no future matches in the snapshot).  Bands extend
+                # into negative x to visualise the future portion of
+                # the green flat-zone-at-R that hasn't been "filled" yet.
                 for kind in ["BO", "BC", "ON", "LAN"]:
                     items = [it for it in _window_items if it["kind"] == kind]
                     if not items:
                         continue
                     fig_tl.add_trace(_go.Scatter(
-                        x=[(_ref_cutoff - it["date"]).days for it in items],
+                        x=[(_anchor_dt - it["date"]).days for it in items],
                         y=[_kind_y[kind]] * len(items),
                         mode="markers",
                         marker=dict(
                             color=_kind_color[kind],
-                            size=[max(7, min(28, 7 + abs(it["pts"]) / 4)) for it in items],
-                            opacity=[max(0.35, min(1.0, it["age_w"])) for it in items],
+                            size=[max(7, min(28, 7 + abs(it["pts"]) / 4))
+                                  for it in items],
+                            opacity=[max(0.35, min(1.0, it["age_w_anchor"]))
+                                     for it in items],
                             line=dict(color="#0d1117", width=1),
                         ),
                         name=kind,
                         customdata=[
-                            (it["label"], it["age_w"], it["pts"],
+                            (it["label"], it["age_w_anchor"], it["age_w_ref"],
+                             it["pts"], it["loss"],
                              it["date"].strftime("%Y-%m-%d"))
                             for it in items
                         ],
                         hovertemplate=(
-                            f"<b>{kind}</b> · %{{customdata[3]}}<br>"
+                            f"<b>{kind}</b> · %{{customdata[5]}}<br>"
                             "%{customdata[0]}<br>"
-                            "age weight: %{customdata[1]:.2f}<br>"
-                            "≈ %{customdata[2]:+,.1f} pts"
+                            "age weight: %{customdata[1]:.2f} → %{customdata[2]:.2f}<br>"
+                            "≈ %{customdata[3]:+,.1f} pts · "
+                            "loss %{customdata[4]:+,.1f}"
                             "<extra></extra>"
                         ),
                         showlegend=False,
                     ))
-                fig_tl.add_vrect(x0=0,   x1=30,  fillcolor="#3fb950",
-                                 opacity=0.06, line_width=0)
-                fig_tl.add_vrect(x0=150, x1=180, fillcolor="#f85149",
+
+                # Bands in days-before-anchor coordinates.
+                #
+                # TODAY mode (forward-looking from today):
+                #   GREEN  [-gap, 30 - gap]   = items that are (or will be)
+                #                               in the 30-day flat zone at R.
+                #                               Right edge sits on day 0
+                #                               only when anchor == R.
+                #   RED    [180 - gap, 180]   = items currently in window
+                #                               that will fully drop by R.
+                #
+                # PUBLISHED mode (chart starts at the snapshot, no future):
+                #   GREEN  [0, 30]            = items dated in the 30 days
+                #                               before the snapshot — the
+                #                               snapshot's own flat zone
+                #                               (i.e. "newly added").
+                #   YELLOW [180 - gap, 180]   = items currently in window
+                #                               that are at risk of fully
+                #                               dropping by next pub R.
+                if mode_active == "updated":
+                    _green_left  = -_gap_days
+                    _green_right = 30 - _gap_days
+                    _x_min       = min(-5, _green_left - 3)
+                else:
+                    _green_left  = 0
+                    _green_right = 30
+                    _x_min       = -3
+                _risk_left   = 180 - _gap_days
+                _risk_right  = 180
+                _x_max = 185
+
+                fig_tl.add_vrect(x0=_green_left, x1=_green_right,
+                                 fillcolor="#3fb950",
                                  opacity=0.10, line_width=0)
-                fig_tl.add_vline(x=30,  line_color="#30363d",
-                                 line_dash="dot", line_width=1)
-                fig_tl.add_vline(x=150, line_color="#f85149",
+                if _gap_days > 0 and _risk_right > _risk_left:
+                    fig_tl.add_vrect(x0=_risk_left, x1=_risk_right,
+                                     fillcolor=_exp_color,
+                                     opacity=0.20, line_width=0)
+                # Solid line at day 0 = "now" from the user's view.
+                fig_tl.add_vline(x=0, line_color="#8b949e",
+                                 line_dash="solid", line_width=1)
+                # Dotted line at the 180-day window edge.
+                fig_tl.add_vline(x=180, line_color="#30363d",
                                  line_dash="dot", line_width=1)
                 fig_tl.update_layout(
                     paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                     font=dict(color="#8b949e", size=10),
                     xaxis=dict(
-                        title=dict(text="Days before cutoff", font=dict(size=10)),
-                        range=[-5, 185], gridcolor="#21262d",
+                        title=dict(
+                            text=f"Days before {_anchor_str} "
+                                 f"(0 = "
+                                 f"{'today' if mode_active == 'updated' else 'snapshot'}, "
+                                 f"next pub {_ref_short})",
+                            font=dict(size=10),
+                        ),
+                        range=[_x_min, _x_max], gridcolor="#21262d",
                         tickvals=[0, 30, 60, 90, 120, 150, 180],
                     ),
                     yaxis=dict(
@@ -3602,11 +5072,24 @@ elif page == "🔍 Team Breakdown":
             else:
                 st.caption("No counting items in window.")
 
-        st.caption(
-            "Marker size ≈ point contribution · opacity ≈ age weight. "
-            "Items in the red zone (≥ 150 days) are decaying fastest — "
-            "replace them or watch your seed slip."
-        )
+        if mode_active == "updated":
+            st.caption(
+                f"Day 0 = **{_anchor_str}** (today). "
+                f"Green band = items that are (or will be) in the 30-day "
+                f"flat zone at the next publication on **{_ref_str}** "
+                f"(first Monday of {_ref_pub.strftime('%B')}). "
+                f"Red band = items currently in window that will fully "
+                f"drop by then ({_gap_days}-day sliver)."
+            )
+        else:
+            st.caption(
+                f"Day 0 = **{_anchor_str}** (this snapshot). "
+                f"Green band = items added in the last 30 days "
+                f"(currently in the flat zone). "
+                f"Yellow band = items at risk of fully dropping by the "
+                f"next publication on **{_ref_str}** "
+                f"({_gap_days}-day window after the snapshot)."
+            )
 
         # ════════════════════════════════════════════════════════
         # 4.2 — WHY IS X ABOVE Y?  Side-by-side comparator
@@ -3740,179 +5223,463 @@ elif page == "🔍 Team Breakdown":
             )
 
         # ════════════════════════════════════════════════════════
-        # 4.3 — MATCH IMPACT EXPLORER
+        # DAY 5 — CLIMB PLAN  (🧗 Pillar 2: Improvement Path)
         # ════════════════════════════════════════════════════════
-        # Pick any of the team's top-contributing matches and re-run
-        # the engine with that match removed.  Cached per match-id in
-        # session state so repeat picks are instant.
+        # Four stacked panels:
+        #   5.1  Bottleneck detector  — weakest factor vs ±10-rank peers
+        #   5.4  Expiring-points alert — quantified 14-day decay risk
+        #   5.2  Target-opponent sim   — engine run per candidate (button)
+        #   5.3  Path-to-rank checklist — greedy combo from 5.2 results
+        # 5.1 and 5.4 are cheap and always visible; 5.2 is gated behind a
+        # button (≈ 10× engine runs); 5.3 only renders once 5.2 is cached.
         st.markdown("---")
-        with st.expander(
-            "🔬 Match Impact Explorer — what if a match never happened?",
-            expanded=False,
-        ):
-            st.caption(
-                "Removes the chosen match from the entire dataset and re-runs "
-                "the full engine. First click takes ~1 s; later picks of the "
-                "same match are instant for this session."
+        st.markdown("### 🧗 Climb Plan — what holds this team back, and how to move up")
+
+        # ── 5.1 Bottleneck detector ────────────────────────────
+        _cp_rank = int(ex["rank"])
+        _cp_peers = base_standings[
+            base_standings["rank"].between(max(1, _cp_rank - 10), _cp_rank + 10) &
+            (base_standings["team"] != sel_team)
+        ]
+        _cp_specs = [
+            ("🏆 BO",  "bo_factor",  "#f0b429", "BO"),
+            ("💰 BC",  "bc_factor",  "#3fb950", "BC"),
+            ("🕸️ ON",  "on_factor",  "#79c0ff", "ON"),
+            ("🖥️ LAN", "lan_factor", "#f85149", "LAN"),
+        ]
+        _cp_rows_data: list[tuple] = []
+        _cp_worst = None       # (label, key, color, short, self, peer_mean, gap_pts)
+        for lbl, key, color, short in _cp_specs:
+            sv = float(ex[key])
+            pm = float(_cp_peers[key].mean()) if not _cp_peers.empty else sv
+            gap_pts = (sv - pm) * _pts_per_factor
+            _cp_rows_data.append((lbl, key, color, short, sv, pm, gap_pts))
+            if _cp_worst is None or gap_pts < _cp_worst[6]:
+                _cp_worst = (lbl, key, color, short, sv, pm, gap_pts)
+
+        # Root-cause diagnosis for the weakest factor.
+        _cp_diag = ""
+        if _cp_worst is not None and _cp_worst[6] < -0.5:
+            lbl, key, color, short, sv, pm, gap_pts = _cp_worst
+            if short == "ON":
+                _my_opps  = len({m["opponent"] for m in raw_ms
+                                  if m["result"] == "W" and _eff_age(m) > 0})
+                _peer_opp_counts: list[int] = []
+                for _pt in _cp_peers["team"].tolist():
+                    _pms = team_match_history.get(_pt, [])
+                    _peer_opp_counts.append(
+                        len({m["opponent"] for m in _pms
+                             if m["result"] == "W" and _eff_age(m) > 0})
+                    )
+                _peer_opp_mean = (sum(_peer_opp_counts) / len(_peer_opp_counts)
+                                   if _peer_opp_counts else float(_my_opps))
+                _cp_diag = (
+                    f"<strong>{_my_opps}</strong> distinct opponents beaten vs "
+                    f"peer average <strong>{_peer_opp_mean:.0f}</strong>. "
+                    "Face new teams — repeat wins over the same opponent don't compound "
+                    "in ownNetwork."
+                )
+            elif short == "BC":
+                _opp_bos = [bo_ratio_map.get(m["opponent"], 0.0)
+                            for m in raw_ms
+                            if m["result"] == "W" and _eff_age(m) > 0]
+                _avg_obo = (sum(_opp_bos) / len(_opp_bos)) if _opp_bos else 0.0
+                _cp_diag = (
+                    f"Average opponent BO ratio is <strong>{_avg_obo:.3f}</strong>. "
+                    "BC rewards wins over teams with large prize earnings — "
+                    "target opponents near the top of the rankings."
+                )
+            elif short == "LAN":
+                _my_lan = int(ex["lan_wins"])
+                _peer_lan = (float(_cp_peers["lan_wins"].mean())
+                              if not _cp_peers.empty else 0.0)
+                _cp_diag = (
+                    f"<strong>{_my_lan}</strong> LAN win(s) in the 180-day window — "
+                    f"peers average <strong>{_peer_lan:.1f}</strong>. "
+                    "Only wins at LAN events count; online results don't move this factor."
+                )
+            else:  # BO
+                _top_prize = max((float(bp["prize_won"]) for bp in bo_prizes),
+                                  default=0.0)
+                _cp_diag = (
+                    f"Top prize in window: <strong>${_top_prize:,.0f}</strong>. "
+                    "BO is driven by prize money — deep runs at large events compound "
+                    "over the top-10 bucket."
+                )
+
+        _bn_l, _bn_r = st.columns([2, 3])
+        with _bn_l:
+            if _cp_worst is not None and _cp_worst[6] < -0.5:
+                _wl = _cp_worst
+                st.markdown(
+                    f'<div style="background:#161b22;border:1px solid {_wl[2]};'
+                    f'border-left:4px solid {_wl[2]};border-radius:8px;'
+                    f'padding:12px 14px;">'
+                    f'<div style="font-size:11px;color:#8b949e;'
+                    f'text-transform:uppercase;letter-spacing:0.5px;">'
+                    f'Weakest factor vs peers</div>'
+                    f'<div style="font-size:22px;font-weight:700;color:{_wl[2]};'
+                    f'margin-top:4px;">{_wl[0]}</div>'
+                    f'<div style="font-size:12px;color:#c9d1d9;margin-top:6px;">'
+                    f'{_wl[4]:.3f} vs peer avg {_wl[5]:.3f} · '
+                    f'<strong style="color:#f85149">{_wl[6]:+,.1f} pts</strong>'
+                    f'</div>'
+                    f'<div style="font-size:11px;color:#8b949e;margin-top:10px;'
+                    f'line-height:1.55;">{_cp_diag}</div></div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    '<div style="background:#161b22;border:1px solid #3fb950;'
+                    'border-left:4px solid #3fb950;border-radius:8px;'
+                    'padding:12px 14px;">'
+                    '<div style="font-size:11px;color:#8b949e;'
+                    'text-transform:uppercase;letter-spacing:0.5px;">Bottleneck</div>'
+                    '<div style="font-size:18px;font-weight:700;color:#3fb950;'
+                    'margin-top:4px;">No factor lags its peer group</div>'
+                    '<div style="font-size:11px;color:#8b949e;margin-top:6px;'
+                    'line-height:1.55;">'
+                    "This team matches or exceeds the ±10-rank peer group on every "
+                    "factor — climb will require lifting the whole bracket, "
+                    "not fixing one weak spot.</div></div>",
+                    unsafe_allow_html=True,
+                )
+        with _bn_r:
+            _br_html = []
+            for lbl, key, color, short, sv, pm, gap_pts in _cp_rows_data:
+                _ar = (
+                    f'<span style="color:#3fb950;font-weight:700">▲ {gap_pts:+,.1f}</span>'
+                    if gap_pts > 0.5 else
+                    f'<span style="color:#f85149;font-weight:700">▼ {gap_pts:+,.1f}</span>'
+                    if gap_pts < -0.5 else
+                    '<span style="color:#8b949e">—</span>'
+                )
+                _br_html.append(
+                    f'<tr style="border-bottom:1px solid #21262d;">'
+                    f'<td style="padding:6px 8px;color:{color};font-weight:600;'
+                    f'font-size:12px">{lbl}</td>'
+                    f'<td style="padding:6px 8px;text-align:right;color:#c9d1d9;'
+                    f'font-size:11px">{sv:.4f}</td>'
+                    f'<td style="padding:6px 8px;text-align:right;color:#8b949e;'
+                    f'font-size:11px">{pm:.4f}</td>'
+                    f'<td style="padding:6px 8px;text-align:right;font-size:11px">'
+                    f'{_ar}</td></tr>'
+                )
+            st.markdown(
+                '<div style="border:1px solid #30363d;border-radius:8px;overflow:hidden;">'
+                '<table style="width:100%;border-collapse:collapse;">'
+                '<thead style="background:#161b22;color:#8b949e;font-size:10px;'
+                'text-transform:uppercase;">'
+                '<tr><th style="padding:7px 8px;text-align:left">Factor</th>'
+                '<th style="padding:7px 8px;text-align:right">Self</th>'
+                f'<th style="padding:7px 8px;text-align:right">'
+                f'Peer avg (±10 ranks, n={len(_cp_peers)})</th>'
+                '<th style="padding:7px 8px;text-align:right">Gap (pts)</th></tr>'
+                '</thead><tbody>' + "".join(_br_html) + '</tbody></table></div>',
+                unsafe_allow_html=True,
             )
 
-            # Build candidate list: top-5 from BC, ON and LAN buckets,
-            # plus this team's recent wins (last 60 days). Dedup by mid.
-            _cand: dict[int, dict] = {}
+        # ── 5.4 Expiring-points alert ────────────────────────────
+        # Mirrors the Time Window section's "at risk" math: every counting
+        # item loses pts × (1 − age_w_at_R / age_w_at_anchor) by the next
+        # reference cutoff R (next Valve publication).  This captures BOTH
+        # items that fully drop out of the 180-day window AND items that
+        # merely decay further (still in window, lower age weight).
+        # _full_drops / _decay_only / _pts_full / _pts_decay / _pts_at_risk
+        # / _ref_pub / _gap_days are computed in the Time Window section.
+        _cp_n_full   = len(_full_drops)
+        _cp_n_decay  = len(_decay_only)
+        _cp_pts_risk = _pts_at_risk
+        # Rough "wins worth +X pts" estimate: a single top-tier LAN win lifts
+        # BC by ≈ opp_bo_ratio/10, ON by ≈ opp_ownNetwork/10, plus a LAN slot
+        # (1/10 of lan_factor) at ev_w ≈ curve(0.25)=0.602. This is a guidance
+        # number — the Target Opponents panel below gives the actual engine delta.
+        _cp_lan_boost_est = (
+            (1.0 * 0.602 / 10.0) +   # BC max contribution (opp_bo=1.0, ev_w=0.602)
+            (1.0 * 0.602 / 10.0) +   # ON max contribution (opp_on≈1.0, ev_w=0.602)
+            (1.0 / 10.0)             # LAN slot (age_w=1.0)
+        ) / 4.0 * (SEED_MAX - SEED_MIN) / max(max_avg - min_avg, 1e-9)
+        _cp_mid_boost_est = _cp_lan_boost_est * 0.55  # mid-tier ≈ 55% of a top-LAN win
 
-            def _add_cand(m, kind, e=None):
-                mid = m.get("match_id")
-                if mid is None:
-                    return
-                _cand.setdefault(int(mid), {
-                    "match_id": int(mid),
-                    "date":     m["date"],
-                    "opponent": m["opponent"],
-                    "result":   m["result"],
-                    "kinds":    [],
-                    "is_lan":   bool(m.get("is_lan", False)),
-                })
-                _cand[int(mid)]["kinds"].append(kind if e is None else f"{kind} #{e}")
+        _cp_when_phrase = (
+            f"by <strong>{_ref_short}</strong> "
+            f"({'in ' + str(_gap_days) + ' day' + ('s' if _gap_days != 1 else '') if _gap_days > 0 else 'today'})"
+        )
 
-            for i, (_, m) in enumerate(_bc_e[:5], start=1):
-                _add_cand(m, "BC", i)
-            for i, (_, m) in enumerate(_on_e[:5], start=1):
-                _add_cand(m, "ON", i)
-            for i, m in enumerate(_lan_l[:5], start=1):
-                _add_cand(m, "LAN", i)
-            # Also the team's 5 most recent matches in window
-            _recent = sorted(
-                [m for m in raw_ms if m.get("match_id") is not None],
-                key=lambda mm: mm["date"], reverse=True,
-            )[:5]
-            for m in _recent:
-                _add_cand(m, "recent")
-
-            if not _cand:
-                st.caption("No matches with engine match-IDs available for this team.")
-            else:
-                _cand_list = sorted(_cand.values(),
-                                    key=lambda c: c["date"], reverse=True)
-
-                def _label(c):
-                    tag = "·".join(sorted(set(c["kinds"])))
-                    lan = " 🖥" if c["is_lan"] else ""
-                    return (f"{c['date'].strftime('%Y-%m-%d')} · "
-                            f"{c['result']} vs {c['opponent']}{lan} — {tag}")
-
-                _label_to_id = {_label(c): c["match_id"] for c in _cand_list}
-                _picked_label = st.selectbox(
-                    "Pick a match to remove",
-                    list(_label_to_id.keys()),
-                    key=f"impact_pick_{sel_team}",
+        st.markdown("#### ⚠️ Expiring alert — hold your rank")
+        _ex_color = "#f85149" if _cp_pts_risk > 5.0 else "#d2a8ff"
+        if _cp_pts_risk > 0:
+            _n_top = max(1, int(round(_cp_pts_risk / max(_cp_lan_boost_est, 1e-9))))
+            _n_mid = max(1, int(round(_cp_pts_risk / max(_cp_mid_boost_est, 1e-9))))
+            _breakdown_parts = []
+            if _cp_n_full:
+                _breakdown_parts.append(
+                    f'<strong style="color:{_ex_color}">{_cp_n_full}</strong> '
+                    f'{"item" if _cp_n_full == 1 else "items"} fully drop out '
+                    f'(~<strong>−{_pts_full:,.1f} pts</strong>)'
                 )
-                _remove_id = _label_to_id[_picked_label]
-                _picked = next(c for c in _cand_list if c["match_id"] == _remove_id)
-
-                _btn_l, _btn_r = st.columns([1, 4])
-                _go_clicked = _btn_l.button(
-                    "▶ Compute impact", key=f"impact_btn_{sel_team}_{_remove_id}",
-                    type="primary",
+            if _cp_n_decay:
+                _breakdown_parts.append(
+                    f'<strong style="color:{_ex_color}">{_cp_n_decay}</strong> more '
+                    f'decay further (~<strong>−{_pts_decay:,.1f} pts</strong>)'
                 )
+            _breakdown_html = " · ".join(_breakdown_parts)
+            st.markdown(
+                f'<div style="background:#161b22;border:1px solid {_ex_color};'
+                f'border-left:4px solid {_ex_color};border-radius:8px;'
+                f'padding:12px 14px;">'
+                f'<div style="font-size:13px;color:#c9d1d9;line-height:1.55;">'
+                f'⏳ {_cp_when_phrase.capitalize()}: {_breakdown_html} — '
+                f'about <strong style="color:{_ex_color}">−{_cp_pts_risk:,.1f} pts</strong> '
+                f'total to the Factor Score.<br>'
+                f'To <strong>hold rank</strong> you need wins worth '
+                f'<strong>+{_cp_pts_risk:,.1f} pts</strong>. Rough equivalents: '
+                f'≈ <strong>{_n_top}</strong> top-tier LAN win(s) at $250K+, or '
+                f'≈ <strong>{_n_mid}</strong> mid-tier win(s). '
+                f'<span style="color:#8b949e;font-size:11px">'
+                f'(Aggregates age-weight decay across all top-10 BO/BC/ON/LAN '
+                f'items between now and {_ref_short}. '
+                f'Use the Target Opponents panel below for exact engine deltas.)'
+                f'</span></div></div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                f'<div style="background:#161b22;border:1px solid #3fb950;'
+                f'border-left:4px solid #3fb950;border-radius:8px;'
+                f'padding:12px 14px;font-size:13px;color:#c9d1d9;">'
+                f"✅ No meaningful age-weight decay {_cp_when_phrase} — "
+                f"this team's top-10 buckets are stable through the next reference cutoff.</div>",
+                unsafe_allow_html=True,
+            )
 
-                # Session-scoped cache: avoids re-running the engine for the
-                # same match more than once per session.
-                if "_match_impact_cache" not in st.session_state:
-                    st.session_state._match_impact_cache = {}
-                _cache = st.session_state._match_impact_cache
-                _cache_key = (mode_active,
-                              _ref_cutoff.strftime("%Y%m%d"),
-                              int(_remove_id))
+        # ── 5.2 Target opponents — engine sim per candidate ────
+        st.markdown("#### 🎯 Target opponents — which wins move the needle?")
+        # Candidates = the 10 teams immediately above this team by rank.
+        # "Immediately above" maximises achievable Δrank per win; including
+        # the very top teams adds compute for little marginal insight because
+        # opp_bo_ratio already caps at 1.0 for any top-5 opponent.
+        _cp_above = (base_standings[base_standings["rank"] < _cp_rank]
+                     .sort_values("rank", ascending=False)
+                     .head(10))
 
-                if _go_clicked and _cache_key not in _cache:
-                    with st.spinner("Re-running engine without this match…"):
-                        _store2 = Store.from_valve(team_match_history, bo_prizes_map)
-                        _store2.matches_df = (
-                            _store2.matches_df[_store2.matches_df["match_id"]
-                                               != _remove_id]
-                            .reset_index(drop=True)
-                        )
-                        _res2 = run_vrs(_store2, cutoff=_ref_cutoff)
-                        _cache[_cache_key] = _res2
+        if _cp_above.empty:
+            st.info("This team is already rank #1 — no teams above to target.")
+        else:
+            if "_climb_targets_cache" not in st.session_state:
+                st.session_state._climb_targets_cache = {}
+            _cp_cache = st.session_state._climb_targets_cache
+            _cp_ref_cut = _ref_cutoff  # defined earlier in Time Window section
+            _cp_key = (mode_active, _cp_ref_cut.strftime("%Y%m%d"), sel_team)
 
-                if _cache_key in _cache:
-                    _res2 = _cache[_cache_key]
-                    _std2 = _res2.get("standings", pd.DataFrame())
-                    if _std2.empty or sel_team not in _std2["team"].values:
-                        st.warning(
-                            "After removing this match, this team is no longer "
-                            "eligible (≥ 5 matches required)."
-                        )
-                    else:
-                        _row2 = _std2[_std2["team"] == sel_team].iloc[0]
-                        _drank   = int(_row2["rank"]) - int(ex["rank"])
-                        _dpts    = float(_row2["total_points"]) - float(ex["total_points"])
-                        _dseed   = float(_row2["seed"])         - float(ex["seed"])
-                        _dh2h    = float(_row2["h2h_delta"])    - float(ex["h2h_delta"])
-                        _dbo     = float(_row2["bo_factor"])    - float(ex["bo_factor"])
-                        _dbc     = float(_row2["bc_factor"])    - float(ex["bc_factor"])
-                        _don     = float(_row2["on_factor"])    - float(ex["on_factor"])
-                        _dlan    = float(_row2["lan_factor"])   - float(ex["lan_factor"])
+            _btn_l, _btn_r = st.columns([1, 3])
+            _run_clicked = _btn_l.button(
+                "▶ Simulate climb plan",
+                key=f"climb_btn_{sel_team}_{_cp_rank}",
+                type="primary",
+                help=(
+                    f"Runs the engine {len(_cp_above)}× — once per candidate — with "
+                    "a hypothetical BO3 win at a $250K LAN event on the cutoff date. "
+                    "Takes ~10s; cached for the session."
+                ),
+            )
+            _btn_r.caption(
+                f"Evaluates {len(_cp_above)} candidate opponent(s) "
+                f"(closest ranked above {sel_team})."
+            )
 
-                        _rk_arrow = (
-                            f'<span style="color:#3fb950;font-weight:700">▲ {-_drank}</span>'
-                            if _drank < 0 else
-                            f'<span style="color:#f85149;font-weight:700">▼ {_drank}</span>'
-                            if _drank > 0 else
+            if _run_clicked and _cp_key not in _cp_cache:
+                _cp_results: list[dict] = []
+                _cp_sim_date = _cp_ref_cut  # same-day sim → no age-weight drift
+                _cp_pool = 250_000.0
+                # NOTE: named `_cp_prog` (not `_bar`) — the `_bar(...)` helper
+                # defined above renders inline factor bars, reusing that name
+                # would shadow it for the rest of the page.
+                _cp_prog = st.progress(0.0, text="Simulating hypothetical LAN wins…")
+                for i, opp_row in enumerate(
+                    _cp_above.itertuples(index=False), start=1
+                ):
+                    _opp = str(opp_row.team)
+                    _store_c = Store.from_valve(team_match_history, bo_prizes_map)
+                    _store_c.append_simulation(
+                        extra_matches=[{
+                            "date":       _cp_sim_date,
+                            "winner":     sel_team,
+                            "loser":      _opp,
+                            "prize_pool": _cp_pool,
+                            "is_lan":     True,
+                        }],
+                        extra_prizes=None,
+                    )
+                    _res_c = run_vrs(_store_c, cutoff=_cp_sim_date)
+                    _std_c = _res_c.get("standings", pd.DataFrame())
+                    if (not _std_c.empty
+                            and sel_team in _std_c["team"].values):
+                        _row_c = _std_c[_std_c["team"] == sel_team].iloc[0]
+                        _d_rank = int(_row_c["rank"]) - _cp_rank
+                        _d_pts  = (float(_row_c["total_points"])
+                                    - float(ex["total_points"]))
+                        _ew = expected_win(float(ex["seed"]),
+                                            float(opp_row.seed))
+                        _cp_results.append({
+                            "opponent":   _opp,
+                            "opp_rank":   int(opp_row.rank),
+                            "opp_points": float(opp_row.total_points),
+                            "d_rank":     _d_rank,
+                            "d_pts":      _d_pts,
+                            "ew":         _ew,
+                            "new_rank":   int(_row_c["rank"]),
+                        })
+                    _cp_prog.progress(i / len(_cp_above),
+                                      text=f"Simulating {i}/{len(_cp_above)}…")
+                _cp_prog.empty()
+                _cp_cache[_cp_key] = _cp_results
+
+            if _cp_key in _cp_cache:
+                _cp_results = _cp_cache[_cp_key]
+                if not _cp_results:
+                    st.caption("No simulation results — engine returned no standings.")
+                else:
+                    # Sort: most negative Δrank first (biggest climb), then Δpts.
+                    _cp_sorted = sorted(
+                        _cp_results,
+                        key=lambda r: (r["d_rank"], -r["d_pts"]),
+                    )
+                    _tg_rows = []
+                    for r in _cp_sorted:
+                        _rgain = -r["d_rank"]
+                        _arrow = (
+                            f'<span style="color:#3fb950;font-weight:700">'
+                            f'▲ {_rgain}</span>'
+                            if _rgain > 0 else
                             '<span style="color:#8b949e">—</span>'
                         )
+                        _ewc = ("#3fb950" if r["ew"] >= 0.50 else
+                                "#d2a8ff" if r["ew"] >= 0.30 else "#f85149")
+                        _pts_c = "#3fb950" if r["d_pts"] > 0 else "#8b949e"
+                        _tg_rows.append(
+                            f'<tr style="border-bottom:1px solid #21262d;">'
+                            f'<td style="padding:5px 8px;color:#c9d1d9;'
+                            f'font-size:12px">'
+                            f'<span style="color:#8b949e">#{r["opp_rank"]}</span> '
+                            f'<strong>{r["opponent"]}</strong></td>'
+                            f'<td style="padding:5px 8px;text-align:right;'
+                            f'color:{_ewc};font-size:11px;font-weight:600">'
+                            f'{r["ew"]*100:.0f}%</td>'
+                            f'<td style="padding:5px 8px;text-align:right;'
+                            f'color:{_pts_c};font-size:11px">'
+                            f'{r["d_pts"]:+,.1f}</td>'
+                            f'<td style="padding:5px 8px;text-align:right;'
+                            f'color:#8b949e;font-size:11px">'
+                            f'#{_cp_rank} → #{r["new_rank"]}</td>'
+                            f'<td style="padding:5px 8px;text-align:right;'
+                            f'font-size:11px">{_arrow}</td></tr>'
+                        )
+                    st.markdown(
+                        '<div style="border:1px solid #30363d;border-radius:8px;'
+                        'overflow:hidden;">'
+                        '<table style="width:100%;border-collapse:collapse;">'
+                        '<thead style="background:#161b22;color:#8b949e;'
+                        'font-size:10px;text-transform:uppercase;">'
+                        '<tr><th style="padding:7px 8px;text-align:left">Opponent</th>'
+                        '<th style="padding:7px 8px;text-align:right">E(win)</th>'
+                        '<th style="padding:7px 8px;text-align:right">Δ pts</th>'
+                        '<th style="padding:7px 8px;text-align:right">Rank change</th>'
+                        '<th style="padding:7px 8px;text-align:right">Δ rank</th></tr>'
+                        '</thead><tbody>' + "".join(_tg_rows) + '</tbody></table></div>',
+                        unsafe_allow_html=True,
+                    )
+                    st.caption(
+                        "Each row simulates a single BO3 win at a $250K LAN event "
+                        f"on {_cp_ref_cut.strftime('%b %d, %Y')}. E(win) is the "
+                        "Glicko expected score from current seeds — "
+                        "<span style='color:#3fb950'>green ≥ 50%</span>, "
+                        "<span style='color:#d2a8ff'>purple ≥ 30%</span>, "
+                        "<span style='color:#f85149'>red &lt; 30%</span>.",
+                        unsafe_allow_html=True,
+                    )
 
-                        _mi_l, _mi_r = st.columns([2, 3])
-                        with _mi_l:
-                            st.markdown(
-                                f'<div style="background:#161b22;border:1px solid #30363d;'
-                                f'border-radius:8px;padding:12px 14px;">'
-                                f'<div style="font-size:11px;color:#8b949e;text-transform:uppercase;">'
-                                f'Without this match</div>'
-                                f'<div style="font-size:22px;font-weight:700;color:#c9d1d9;'
-                                f'margin-top:4px;">'
-                                f'#{int(_row2["rank"])} '
-                                f'<span style="font-size:13px;color:#8b949e;font-weight:400">'
-                                f'(was #{int(ex["rank"])} · {_rk_arrow})</span></div>'
-                                f'<div style="font-size:13px;color:#c9d1d9;margin-top:6px;">'
-                                f'{float(_row2["total_points"]):,.1f} pts '
-                                f'<span style="color:#8b949e;font-size:11px">'
-                                f'({_dpts:+,.1f})</span></div>'
-                                f'</div>',
-                                unsafe_allow_html=True,
+                    # ── 5.3 Path-to-rank checklist ────────────
+                    if _cp_rank > 1:
+                        _above_team_row = base_standings[
+                            base_standings["rank"] == _cp_rank - 1
+                        ]
+                        if not _above_team_row.empty:
+                            _above_name = str(_above_team_row.iloc[0]["team"])
+                            _gap_pts = (
+                                float(_above_team_row.iloc[0]["total_points"])
+                                - float(ex["total_points"])
+                                + 0.5  # tiny margin so we actually pass, not tie
                             )
-                        with _mi_r:
-                            def _row(label, color, dval, fmt="+.4f"):
-                                col = ("#3fb950" if dval > 0 else
-                                       "#f85149" if dval < 0 else "#8b949e")
-                                return (
-                                    f'<tr style="border-bottom:1px solid #21262d;">'
-                                    f'<td style="padding:5px 8px;color:{color};'
-                                    f'font-weight:600;font-size:12px">{label}</td>'
-                                    f'<td style="padding:5px 8px;text-align:right;'
-                                    f'color:{col};font-size:11px">{dval:{fmt}}</td>'
-                                    f'</tr>'
+                            st.markdown(
+                                f"#### 🧗 Path to rank #{_cp_rank - 1} "
+                                f"({_above_name})"
+                            )
+                            if _gap_pts <= 0:
+                                st.success(
+                                    f"Already level with rank #{_cp_rank - 1} — "
+                                    "next simulation tick should promote this team."
                                 )
-                            _mi_html = (
-                                _row("🏆 BO",  "#f0b429", _dbo)  +
-                                _row("💰 BC",  "#3fb950", _dbc)  +
-                                _row("🕸️ ON",  "#79c0ff", _don)  +
-                                _row("🖥️ LAN", "#f85149", _dlan) +
-                                _row("🌱 Seed", "#58a6ff", _dseed, "+.1f") +
-                                _row("⚔️ H2H Δ", "#d2a8ff", _dh2h, "+.1f")
-                            )
-                            st.markdown(
-                                f'<div style="border:1px solid #30363d;border-radius:8px;'
-                                f'overflow:hidden;">'
-                                f'<table style="width:100%;border-collapse:collapse;">'
-                                f'<thead style="background:#161b22;color:#8b949e;'
-                                f'font-size:10px;text-transform:uppercase;">'
-                                f'<tr><th style="padding:7px 8px;text-align:left">Factor</th>'
-                                f'<th style="padding:7px 8px;text-align:right">'
-                                f'Δ (without match)</th></tr></thead>'
-                                f'<tbody>{_mi_html}</tbody></table></div>',
-                                unsafe_allow_html=True,
-                            )
+                            else:
+                                # Plausible = E(win) ≥ 30% AND Δpts > 0.
+                                _plaus = sorted(
+                                    [r for r in _cp_sorted
+                                     if r["ew"] >= 0.30 and r["d_pts"] > 0],
+                                    key=lambda r: r["d_pts"], reverse=True,
+                                )
+                                # Greedy: pick highest-yielding until sum ≥ gap.
+                                _acc, _path = 0.0, []
+                                for r in _plaus:
+                                    _path.append(r)
+                                    _acc += r["d_pts"]
+                                    if _acc >= _gap_pts:
+                                        break
+                                if _acc >= _gap_pts and _path:
+                                    _chk = "".join(
+                                        f'<li style="margin-bottom:5px;color:#c9d1d9;">'
+                                        f'Beat <strong>{r["opponent"]}</strong> '
+                                        f'<span style="color:#8b949e">(#{r["opp_rank"]}, '
+                                        f'E(win) {r["ew"]*100:.0f}%)</span> '
+                                        f'→ <strong style="color:#3fb950">'
+                                        f'+{r["d_pts"]:.1f} pts</strong></li>'
+                                        for r in _path
+                                    )
+                                    st.markdown(
+                                        f'<div style="background:#0d3d1a;'
+                                        f'border:1px solid #3fb950;'
+                                        f'border-radius:8px;padding:12px 16px;">'
+                                        f'<div style="font-size:12px;color:#56d364;'
+                                        f'margin-bottom:8px;">'
+                                        f'✅ Minimum plausible path — '
+                                        f'<strong>{len(_path)} win(s)</strong>, '
+                                        f'total <strong>+{_acc:,.1f} pts</strong> '
+                                        f'(need +{_gap_pts:,.1f}):</div>'
+                                        f'<ul style="font-size:13px;margin:0;'
+                                        f'padding-left:22px;line-height:1.6;">'
+                                        f'{_chk}</ul></div>',
+                                        unsafe_allow_html=True,
+                                    )
+                                else:
+                                    _best_sum = sum(r["d_pts"] for r in _plaus)
+                                    st.markdown(
+                                        f'<div style="background:#161b22;'
+                                        f'border:1px solid #f0b429;'
+                                        f'border-left:4px solid #f0b429;'
+                                        f'border-radius:8px;padding:12px 16px;'
+                                        f'font-size:12px;color:#c9d1d9;line-height:1.55;">'
+                                        f'⚠️ No single-LAN plausible path closes the '
+                                        f'<strong>{_gap_pts:,.1f}-pt</strong> gap. '
+                                        f'Best case from the candidate pool '
+                                        f'(≥30% E(win)): <strong>+{_best_sum:,.1f} pts</strong>. '
+                                        f'A bigger event ($1M LAN), running the table '
+                                        f'at a major, or multiple-event stacking would '
+                                        f'be needed.</div>',
+                                        unsafe_allow_html=True,
+                                    )
+
+    # ═══════════════════════════════════════════════════════════════
+    if _bd_tab_sel == "🔬 Score Breakdown":
+    # ═══════════════════════════════════════════════════════════════
 
         # ════════════════════════════════════════════════════════
         # SIMULATION WATERFALL — "Why did the score change?"
