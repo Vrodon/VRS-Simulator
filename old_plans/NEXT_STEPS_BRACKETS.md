@@ -26,7 +26,7 @@
 - [x] **Phase 3** — Cross-stage R1 seed population *(hard-cut applied)*
 - [x] **Phase 4** — Cross-stage advancement cascade + manual TBD dropdowns *(user-validated 2026-05-02 across PGL Astana / Atlanta / Cologne; all 3 scenarios green end-to-end)*
 - [x] **Swiss Rework** — Buchholz pairer + VRS-snapshot seeding (§10) — user-confirmed working on Cologne S1
-- [ ] **Phase 5** — Per-format prize emission
+- [~] **Phase 5** — Per-format prize emission *(5.1–5.4 code-complete; awaiting user-validation in 5.6 and fixture tests in 5.5)*
 - [ ] **Phase 6** — UI: cross-stage visibility + manual seed override
 - [ ] **Phase 7** — Final validation pass across all 5 S-Tier events
 
@@ -1109,25 +1109,46 @@ the engine emission path (`_emit_event_simulation_rows`) still:
 
 ### 11.3 Phase 5 work plan (skeleton, refine after grill)
 
-- [ ] **5.1** — Hoist cascade + bake + seat into a shared helper
-      (`stage_graph.resolve_for_render(parsed_stages, picks,
-      manual_seeds, snapshot_standings)` returning realised
-      `parsed_stages`). Call from fragment render + engine emit.
-- [ ] **5.2** — Per-format placement labellers in
-      `vrs_engine/placement_labels.py` (new module). Pure functions:
-      `swiss_label(record, team_count, advance_count) -> "9th-11th"`,
-      `de_compact_label(stage, picks, team) -> "5th-6th-in-group"`,
-      `gsl_label(stage, picks, team) -> "1st-in-group"`,
-      `groups_rr_label(...)`, `se_label(...)` (already implicit in
-      current emission).
-- [ ] **5.3** — Engine emit rewrite: walk realised stages, for each
-      eliminated team look up placement label, emit
-      `(team, place_label, prize_amount)` row only if every upstream
-      stage on team's path is fully resolved (Q6 partial-fill).
-- [ ] **5.4** — Cross-stage chain: a team's prize comes from the
-      stage where it *exited*. Track exit via the placement walkers
-      from §11.3.2 — if team appears in stage N's roster but not
-      stage N+1's, exit was at stage N.
+- [x] **5.1** — Hoist cascade + bake + seat into a shared helper.
+      `stage_graph.resolve_for_render(parsed_stages, picks,
+      manual_seeds, snapshot_standings)` returns realised stages.
+      Fragment render already wired in §10. **2026-05-02 close-out:**
+      `vrs_engine/event_simulation.emit_simulation_rows` extracted as
+      pure post-realised body; `_emit_event_simulation_rows` in app.py
+      now: fetch → parse → `resolve_for_render` → `emit_simulation_rows`.
+      Both call sites share identical seed-resolution path. New test
+      `tests/test_event_simulation.py` locks downstream-R1-after-cascade
+      behaviour (74/74 green).
+- [x] **5.2** — Per-format placement labellers in
+      `vrs_engine/placement_labels.py`. Pure functions emitting
+      `list[tuple[bucket_label, list[teams]]]` best-first:
+      `compute_swiss_exit_buckets`, `compute_gsl_exit_buckets`
+      (covers GSL-lite + full GSL via Decider detection),
+      `compute_de_compact_exit_buckets`, `compute_rr_exit_buckets`,
+      `compute_se_exit_buckets`. Walkers emit dropouts only for
+      mid-chain stages (Swiss/DE/GSL/RR); SE walker emits all teams
+      (terminal-stage convention). 6 unit tests.
+- [x] **5.3** — Engine emit rewrite. New
+      `compute_place_offsets(stages)` (linear chain + fan-in siblings)
+      and `compute_absolute_placements(stages, picks)` (per-format
+      walker dispatch + cross-sibling aggregation by bucket label +
+      offset composition + exit-stage filter so advancers take their
+      downstream prize, not their upstream one). Wired into
+      `vrs_engine/event_simulation.emit_simulation_rows` —
+      replaced the old SE-only inline placement loop. **3 new tests**
+      (`tests/test_place_offsets.py`) plus **1 integration test**
+      (`tests/test_event_simulation.py::…upstream_group_dropouts`)
+      locking RR-group dropouts emit prizes through the new path.
+      83/83 green. `_PARSER_VERSION` bumped to `v12`.
+- [x] **5.4** — Cross-stage exit tracking — landed inside
+      `compute_absolute_placements`: ``team_exit_def`` map captures the
+      deepest stage whose ``roster`` contains each team (last-write-wins
+      across parsed-stage order which is upstream→downstream); buckets
+      drop teams whose exit-stage isn't this stage's def_name, so
+      advancers' prizes come from downstream only. Q6 strict
+      partial-fill enforced naturally — RR walker returns ``[]`` when
+      any group match is unpicked; Swiss/DE/GSL walkers gate on the
+      decisive match (LB final / WM / loss-threshold).
 - [ ] **5.5** — Smoke + integration tests (fixture-based per Q8).
 - [ ] **5.6** — User validation across all 5 S-Tier events: predicted
       standings must show non-zero deltas for every team appearing in
@@ -1137,7 +1158,8 @@ the engine emission path (`_emit_event_simulation_rows`) still:
 
 > **continue the next steps brackets md file**
 
-Reads §11. Runs `pytest tests/` (must show 68/68 green from Phase 4
-end-state). Invokes the **grill-me skill** on §11.2 — no coding
-until each question has a locked answer. Then begins TDD on the
-first unchecked **5.x** item.
+Reads §11. Runs `pytest tests/` (must show **83/83** green from
+end-of-5.4). Picks up at the first unchecked **5.x** item — currently
+**5.5** fixture-based integration tests per Q8 (one HTML snapshot per
+format under `tests/fixtures/` exercising end-to-end engine emission)
+followed by **5.6** user validation across all 5 S-Tier events.

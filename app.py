@@ -243,13 +243,16 @@ def _emit_event_simulation_rows(
     """
     Convert one event's bracket picks → engine-ready ``(extra_matches, extra_prizes)``.
 
-    Skips matches Liquipedia has already played (those live in ``matches_df``
-    via the Updated-to-Today fetch — re-emitting would double-count, see
-    architecture decision #7). Walks each parsed SE / SE_with_bronze stage to
-    derive each team's final placement, then maps placements through
-    ``prize_distribution`` (architecture #9).
+    Phase 5 §5.1: shares its post-realised body with the fragment render
+    via ``stage_graph.resolve_for_render`` + ``vrs_engine.event_simulation
+    .emit_simulation_rows``. Same input → same output across both call
+    sites; cascade-resolved downstream R1 seeds + Swiss synth bake reach
+    the engine identically to the UI.
 
-    Returns ``([], [])`` when the event has no picks and no parseable bracket.
+    Skips played matches (those live in ``matches_df`` via the
+    Updated-to-Today fetch — re-emitting would double-count, see
+    architecture decision #7). Returns ``([], [])`` when the event has
+    no picks and no parseable bracket.
     """
     picks = slug_state["scenarios"][slug_state["active_scenario"]]["picks"]
     ev    = slug_state.get("event_meta") or {}
@@ -257,192 +260,47 @@ def _emit_event_simulation_rows(
     if not picks:
         return [], []
 
-    # Re-parse the bracket on demand. The L2 cache (parse_tournament_brackets
-    # already memoised in the TP page) plus L1 (fetch) keep this cheap.
     html = _fetch_liquipedia_page(slug)
     if html is None:
         return [], []
     soup    = _liquipedia_bs4(html)
     seeded  = ev.get("seeded_teams") or []
-    # Phase 3: feed the same prose / invite / sub-page signals into the
-    # parser as the TP UI so seed-driven match emission stays consistent.
     from data_loaders.liquipedia_loader import (
         _parse_format as _lp_parse_format,
         _parse_per_stage_invites as _lp_per_stage_invites,
     )
-    from data_loaders.stage_graph import collect_sub_page_rosters
+    from data_loaders.stage_graph import (
+        collect_sub_page_rosters,
+        resolve_for_render,
+    )
+    from vrs_engine.event_simulation import emit_simulation_rows
     prose      = _lp_parse_format(soup)
     per_stage  = _lp_per_stage_invites(soup)
     sub_rost   = collect_sub_page_rosters(slug, soup)
-    stages  = parse_tournament_brackets(
+    parsed_stages = parse_tournament_brackets(
         soup, seeded, slug=slug,
         format_prose=prose,
         direct_invitees_by_stage=per_stage,
         sub_page_rosters=sub_rost,
     )
 
-    # Overlay manual seeds (Phase 3 dropdown + §10 auto-seed-R1 button)
-    # onto match seed slots so engine emit + Swiss synth see user-placed
-    # teams, just like the UI's `_resolve`. Mutates `stages` in place;
-    # safe because parse_tournament_brackets returns a fresh list.
-    _ms = slug_state["scenarios"][slug_state["active_scenario"]].get(
+    manual_seeds = slug_state["scenarios"][slug_state["active_scenario"]].get(
         "manual_seeds", {}) or {}
-    for _stage in stages:
-        for _m in _stage.matches:
-            _entry = _ms.get(_m.match_id) or {}
-            if _entry.get("a") and not _m.seed_a:
-                _m.seed_a = _entry["a"]
-            if _entry.get("b") and not _m.seed_b:
-                _m.seed_b = _entry["b"]
+    snapshot = _snapshot_standings(slug_state.get("snapshot_date"),
+                                    slug_state.get("snapshot_year"))
 
-    extra_matches: list[dict] = []
-    final_placements: dict[str, str] = {}
+    realised = resolve_for_render(parsed_stages, picks,
+                                   manual_seeds=manual_seeds,
+                                   snapshot_standings=snapshot)
 
-    pp        = float(ev.get("prize_pool", 0) or 0)
-    is_lan    = bool(ev.get("is_lan", False))
-    ev_name   = ev.get("name", slug)
-    ev_end_dt = ev.get("end_date") or datetime.now()
-
-    for stage in stages:
-        if stage.format not in ("SE", "SE_with_bronze", "DE", "Swiss", "Groups"):
-            continue
-
-        by_id = {m.match_id: m for m in stage.matches}
-        # Swiss cascade pairings — same logic as the UI's `_resolve`.
-        # Reads the per-event snapshot stashed by the TP page; engine
-        # emit honours the same "no snapshot → no synth" gate.
-        _snap = _snapshot_standings(slug_state.get("snapshot_date"),
-                                     slug_state.get("snapshot_year"))
-        _swiss_ov = (_compute_swiss_overrides(stage, picks, _snap)
-                     if stage.format == "Swiss" else {})
-
-        def _pair(m):
-            """Return (a, b) for a match, walking feeders through picks. Generic
-            across SE / SE_with_bronze / DE / Swiss / Groups."""
-            if m.round_idx == 1 and not m.is_bronze and m.sub in ("", "UB"):
-                return m.seed_a, m.seed_b
-            # Swiss: prefer cascade-computed pairings for R2+ when Liquipedia
-            # hasn't populated them; else fall back to whatever seeds exist.
-            if m.sub == "SW":
-                if m.match_id in _swiss_ov:
-                    return _swiss_ov[m.match_id]
-                return m.seed_a, m.seed_b
-            if m.sub == "GR" and m.round_idx == 1:
-                return m.seed_a, m.seed_b
-            def winner_of(mid):
-                if not mid: return None
-                up = by_id.get(mid)
-                if not up: return None
-                return up.played_winner or picks.get(mid)
-            def loser_of(mid):
-                if not mid: return None
-                up = by_id.get(mid)
-                if not up: return None
-                up_a, up_b = _pair(up)
-                w = up.played_winner or picks.get(mid)
-                if w == up_a: return up_b
-                if w == up_b: return up_a
-                return None
-            def team_for(feeder_id, kind):
-                if not feeder_id: return None
-                return loser_of(feeder_id) if kind == "loser" else winner_of(feeder_id)
-            return (team_for(m.feeder_a, m.feeder_a_kind),
-                    team_for(m.feeder_b, m.feeder_b_kind))
-
-        # Emit one match row per *user-picked* slot. Played slots stay in the
-        # baseline matches_df (engine sees real result). Architecture #7.
-        for m in stage.matches:
-            if m.played_winner:
-                continue
-            picked = picks.get(m.match_id)
-            if not picked:
-                continue
-            a, b = _pair(m)
-            loser = b if picked == a else a if picked == b else None
-            if not loser:
-                continue
-            extra_matches.append({
-                "date":         m.played_date or ev_end_dt,
-                "winner":       picked,
-                "loser":        loser,
-                "event":        ev_name,
-                "prize_pool":   pp,
-                "winner_prize": 0.0,
-                "loser_prize":  0.0,
-                "is_lan":       is_lan,
-            })
-
-        # Placement resolution per architecture #9.
-        if stage.format in ("SE", "SE_with_bronze"):
-            rounds_max  = stage.rounds
-            bronze      = next((m for m in stage.matches if m.is_bronze), None)
-            final_match = next((m for m in stage.matches
-                                 if m.round_idx == rounds_max and not m.is_bronze), None)
-
-            if final_match:
-                f_a, f_b = _pair(final_match)
-                f_w = final_match.played_winner or picks.get(final_match.match_id)
-                f_l = f_b if f_w == f_a else f_a if f_w == f_b else None
-                if f_w: final_placements[f_w] = "1st"
-                if f_l: final_placements[f_l] = "2nd"
-
-            if bronze:
-                b_a, b_b = _pair(bronze)
-                b_w = bronze.played_winner or picks.get(bronze.match_id)
-                b_l = b_b if b_w == b_a else b_a if b_w == b_b else None
-                if b_w: final_placements[b_w] = "3rd"
-                if b_l: final_placements[b_l] = "4th"
-
-            # Earlier-round losers — bucket by round, place range
-            # = 2^(N-r)+1 .. 2^(N-r+1). Skip the top round (final) and SF if
-            # there's a bronze (already mapped).
-            skip_round = rounds_max if not bronze else (rounds_max - 1)
-            for r in range(skip_round - 1, 0, -1):
-                losers_so_far = 2 ** (rounds_max - r)
-                place_lo = losers_so_far + 1
-                place_hi = losers_so_far * 2
-                label = _format_place(place_lo, place_hi)
-                for m in stage.matches:
-                    if m.round_idx != r or m.is_bronze:
-                        continue
-                    m_a, m_b = _pair(m)
-                    m_w = m.played_winner or picks.get(m.match_id)
-                    m_l = m_b if m_w == m_a else m_a if m_w == m_b else None
-                    if m_l and m_l not in final_placements:
-                        final_placements[m_l] = label
-
-        elif stage.format in ("DE", "Swiss", "Groups"):
-            # Slices 2-4 — emit MATCH rows only for these formats. Prize-row
-            # emission requires per-format placement → tournament-bucket
-            # aggregation (DE-in-groups: "Nth-in-group" → tournament label;
-            # Swiss: W-L bucket → label; RR groups: within-group rank →
-            # label). All deferred to a follow-up because they need access
-            # to the tournament-wide prize_distribution structure plus the
-            # number of groups / Swiss bracket size to map correctly.
-            #
-            # Engine consequence: matches still feed BC/ON/LAN/H2H factors;
-            # group/Swiss-eliminated teams who would have earned small
-            # Liquipedia-listed prizes ($5K-20K) miss the BO contribution.
-            # Acceptable underestimate; playoff prizes (the big chunk) are
-            # already emitted by the SE/SE_with_bronze branch above.
-            pass
-
-    # Emit prize rows. Liquipedia convention: the listed amount is per-team,
-    # not split across shared placements.
-    extra_prizes: list[dict] = []
-    pd_dist = ev.get("prize_distribution") or {}
-    for team, place in final_placements.items():
-        amount = _lookup_prize_for_place(place, pd_dist)
-        if amount <= 0:
-            continue
-        extra_prizes.append({
-            "team":  team,
-            "prize": amount,
-            "event": ev_name,
-            "date":  ev_end_dt,
-        })
-
-    return extra_matches, extra_prizes
+    return emit_simulation_rows(
+        realised, picks,
+        event_name=ev.get("name", slug),
+        prize_pool=float(ev.get("prize_pool", 0) or 0),
+        is_lan=bool(ev.get("is_lan", False)),
+        event_end=ev.get("end_date") or datetime.now(),
+        prize_distribution=ev.get("prize_distribution") or {},
+    )
 
 
 def _collect_predicted_simulation_rows(
@@ -1627,7 +1485,10 @@ elif page == "🏆 Tournament Predictor":
     #          drive downstream rosters at render time)
     #   v11 = + §10 Swiss rework: VRS-snapshot picker, auto-seed R1 button,
     #          Buchholz pairer with rematch swap (vrs_engine/swiss_pairer.py)
-    _PARSER_VERSION = "v11"
+    #   v12 = + Phase 5.3 per-format prize emission: vrs_engine/placement_labels.py
+    #          dispatches Swiss/DE/GSL/RR/SE bucket walkers, compute_place_offsets
+    #          composes chain offsets, exit-stage tracking for partial-fill
+    _PARSER_VERSION = "v12"
 
     @st.cache_data(ttl=21600, show_spinner=False)
     def _cached_parsed_stages(slug: str, seed_tuple: tuple, force_token: int, parser_version: str):
@@ -5092,36 +4953,41 @@ elif page == "🔍 Team Breakdown":
             )
 
         # ════════════════════════════════════════════════════════
-        # 4.2 — WHY IS X ABOVE Y?  Side-by-side comparator
+        # 4.2 + 4.3 — PEER COMPARATOR + MATCH IMPACT EXPLORER
         # ════════════════════════════════════════════════════════
-        # Pick a peer (defaults to one rank above) and break the
-        # gap down into per-factor contributions.  Helps answer
-        # "what would this team need to overtake the next team up?"
+        # Side-by-side panels: peer comparator (left) breaks the gap
+        # to a chosen peer down into per-factor contributions; match
+        # impact explorer (right) re-runs the engine without a chosen
+        # match to surface that match's own contribution. Within each
+        # half-width panel everything stacks vertically to avoid
+        # cramped nested columns.
         st.markdown("---")
-        st.markdown("### 🆚 Why is X above Y? — Peer comparator")
+        _peer_panel, _impact_panel = st.columns(2)
 
-        _team_rank = int(ex["rank"])
-        _peer_options: list[tuple[str, str]] = []
-        if _team_rank > 1:
-            _above = base_standings[base_standings["rank"] == _team_rank - 1]
-            if not _above.empty:
-                _peer_options.append(
-                    (f"⬆️ Rank above (#{_team_rank - 1})", str(_above.iloc[0]["team"]))
-                )
-        if _team_rank > 2:
-            _top = base_standings[base_standings["rank"] == 1]
-            if not _top.empty:
-                _peer_options.append(("🥇 Rank #1", str(_top.iloc[0]["team"])))
-        if _team_rank != 10 and 10 in base_standings["rank"].values:
-            _bot10 = base_standings[base_standings["rank"] == 10]
-            if not _bot10.empty:
-                _peer_options.append(
-                    ("🔟 Bottom of top-10 (#10)", str(_bot10.iloc[0]["team"]))
-                )
-        _other_teams = [t for t in base_standings["team"].tolist() if t != sel_team]
+        # ── LEFT: 🆚 Why is X above Y? ─────────────────────────
+        with _peer_panel:
+            st.markdown("### 🆚 Why is X above Y? — Peer comparator")
 
-        _cmp_l, _cmp_r = st.columns([2, 3])
-        with _cmp_l:
+            _team_rank = int(ex["rank"])
+            _peer_options: list[tuple[str, str]] = []
+            if _team_rank > 1:
+                _above = base_standings[base_standings["rank"] == _team_rank - 1]
+                if not _above.empty:
+                    _peer_options.append(
+                        (f"⬆️ Rank above (#{_team_rank - 1})", str(_above.iloc[0]["team"]))
+                    )
+            if _team_rank > 2:
+                _top = base_standings[base_standings["rank"] == 1]
+                if not _top.empty:
+                    _peer_options.append(("🥇 Rank #1", str(_top.iloc[0]["team"])))
+            if _team_rank != 10 and 10 in base_standings["rank"].values:
+                _bot10 = base_standings[base_standings["rank"] == 10]
+                if not _bot10.empty:
+                    _peer_options.append(
+                        ("🔟 Bottom of top-10 (#10)", str(_bot10.iloc[0]["team"]))
+                    )
+            _other_teams = [t for t in base_standings["team"].tolist() if t != sel_team]
+
             _peer_choices = [opt[0] for opt in _peer_options] + ["✏️ Pick a team…"]
             _peer_mode = st.radio(
                 "Compare against",
@@ -5140,77 +5006,76 @@ elif page == "🔍 Team Breakdown":
             else:
                 _peer_team = next(t for label, t in _peer_options if label == _peer_mode)
 
-        _peer_row = base_standings[base_standings["team"] == _peer_team].iloc[0]
-        _gap = float(ex["total_points"]) - float(_peer_row["total_points"])
-        _ahead = _gap > 0
+            _peer_row = base_standings[base_standings["team"] == _peer_team].iloc[0]
+            _gap = float(ex["total_points"]) - float(_peer_row["total_points"])
+            _ahead = _gap > 0
 
-        _factor_specs = [
-            ("🏆 BO",  "bo_factor",  "#f0b429"),
-            ("💰 BC",  "bc_factor",  "#3fb950"),
-            ("🕸️ ON",  "on_factor",  "#79c0ff"),
-            ("🖥️ LAN", "lan_factor", "#f85149"),
-        ]
-        _gap_rows: list[str] = []
-        _factor_drivers: list[tuple[str, float]] = []
-        for label, key, color in _factor_specs:
-            _df  = float(ex[key]) - float(_peer_row[key])
-            _dpt = _df * _pts_per_factor
-            _factor_drivers.append((label, _dpt))
-            _arrow = (
-                f'<span style="color:#3fb950;font-weight:700">▲ {_dpt:+,.1f}</span>'
-                if _dpt > 0 else
-                f'<span style="color:#f85149;font-weight:700">▼ {_dpt:+,.1f}</span>'
-                if _dpt < 0 else
+            _factor_specs = [
+                ("🏆 BO",  "bo_factor",  "#f0b429"),
+                ("💰 BC",  "bc_factor",  "#3fb950"),
+                ("🕸️ ON",  "on_factor",  "#79c0ff"),
+                ("🖥️ LAN", "lan_factor", "#f85149"),
+            ]
+            _gap_rows: list[str] = []
+            _factor_drivers: list[tuple[str, float]] = []
+            for label, key, color in _factor_specs:
+                _df  = float(ex[key]) - float(_peer_row[key])
+                _dpt = _df * _pts_per_factor
+                _factor_drivers.append((label, _dpt))
+                _arrow = (
+                    f'<span style="color:#3fb950;font-weight:700">▲ {_dpt:+,.1f}</span>'
+                    if _dpt > 0 else
+                    f'<span style="color:#f85149;font-weight:700">▼ {_dpt:+,.1f}</span>'
+                    if _dpt < 0 else
+                    '<span style="color:#8b949e">—</span>'
+                )
+                _gap_rows.append(
+                    f'<tr style="border-bottom:1px solid #21262d;">'
+                    f'<td style="padding:6px 8px;color:{color};font-weight:600;font-size:12px">{label}</td>'
+                    f'<td style="padding:6px 8px;text-align:right;color:#c9d1d9;font-size:11px">'
+                    f'{float(ex[key]):.4f}</td>'
+                    f'<td style="padding:6px 8px;text-align:right;color:#8b949e;font-size:11px">'
+                    f'{float(_peer_row[key]):.4f}</td>'
+                    f'<td style="padding:6px 8px;text-align:right;font-size:11px">{_arrow}</td>'
+                    f'</tr>'
+                )
+
+            _h2h_dpt = float(ex["h2h_delta"]) - float(_peer_row["h2h_delta"])
+            _factor_drivers.append(("⚔️ H2H", _h2h_dpt))
+            _h2h_arrow = (
+                f'<span style="color:#3fb950;font-weight:700">▲ {_h2h_dpt:+,.1f}</span>'
+                if _h2h_dpt > 0 else
+                f'<span style="color:#f85149;font-weight:700">▼ {_h2h_dpt:+,.1f}</span>'
+                if _h2h_dpt < 0 else
                 '<span style="color:#8b949e">—</span>'
             )
             _gap_rows.append(
                 f'<tr style="border-bottom:1px solid #21262d;">'
-                f'<td style="padding:6px 8px;color:{color};font-weight:600;font-size:12px">{label}</td>'
+                f'<td style="padding:6px 8px;color:#d2a8ff;font-weight:600;font-size:12px">⚔️ H2H</td>'
                 f'<td style="padding:6px 8px;text-align:right;color:#c9d1d9;font-size:11px">'
-                f'{float(ex[key]):.4f}</td>'
+                f'{float(ex["h2h_delta"]):+.1f}</td>'
                 f'<td style="padding:6px 8px;text-align:right;color:#8b949e;font-size:11px">'
-                f'{float(_peer_row[key]):.4f}</td>'
-                f'<td style="padding:6px 8px;text-align:right;font-size:11px">{_arrow}</td>'
+                f'{float(_peer_row["h2h_delta"]):+.1f}</td>'
+                f'<td style="padding:6px 8px;text-align:right;font-size:11px">{_h2h_arrow}</td>'
                 f'</tr>'
             )
 
-        _h2h_dpt = float(ex["h2h_delta"]) - float(_peer_row["h2h_delta"])
-        _factor_drivers.append(("⚔️ H2H", _h2h_dpt))
-        _h2h_arrow = (
-            f'<span style="color:#3fb950;font-weight:700">▲ {_h2h_dpt:+,.1f}</span>'
-            if _h2h_dpt > 0 else
-            f'<span style="color:#f85149;font-weight:700">▼ {_h2h_dpt:+,.1f}</span>'
-            if _h2h_dpt < 0 else
-            '<span style="color:#8b949e">—</span>'
-        )
-        _gap_rows.append(
-            f'<tr style="border-bottom:1px solid #21262d;">'
-            f'<td style="padding:6px 8px;color:#d2a8ff;font-weight:600;font-size:12px">⚔️ H2H</td>'
-            f'<td style="padding:6px 8px;text-align:right;color:#c9d1d9;font-size:11px">'
-            f'{float(ex["h2h_delta"]):+.1f}</td>'
-            f'<td style="padding:6px 8px;text-align:right;color:#8b949e;font-size:11px">'
-            f'{float(_peer_row["h2h_delta"]):+.1f}</td>'
-            f'<td style="padding:6px 8px;text-align:right;font-size:11px">{_h2h_arrow}</td>'
-            f'</tr>'
-        )
+            _drivers_sorted = sorted(_factor_drivers, key=lambda x: abs(x[1]), reverse=True)[:2]
+            _verb = "leads" if _ahead else "trails"
+            _driver_phrase = " and ".join(
+                f"<strong>{lbl}</strong> ({pts:+,.1f} pts)" for lbl, pts in _drivers_sorted
+            )
+            _summary = (
+                f"<strong>{sel_team}</strong> {_verb} <strong>{_peer_team}</strong> by "
+                f"<strong>{abs(_gap):,.1f} pts</strong>. "
+                f"Biggest contributors to the gap: {_driver_phrase}."
+            )
 
-        _drivers_sorted = sorted(_factor_drivers, key=lambda x: abs(x[1]), reverse=True)[:2]
-        _verb = "leads" if _ahead else "trails"
-        _driver_phrase = " and ".join(
-            f"<strong>{lbl}</strong> ({pts:+,.1f} pts)" for lbl, pts in _drivers_sorted
-        )
-        _summary = (
-            f"<strong>{sel_team}</strong> {_verb} <strong>{_peer_team}</strong> by "
-            f"<strong>{abs(_gap):,.1f} pts</strong>. "
-            f"Biggest contributors to the gap: {_driver_phrase}."
-        )
-
-        with _cmp_r:
             _gap_color = "#3fb950" if _ahead else "#f85149"
             st.markdown(
                 f'<div style="background:#161b22;border:1px solid {_gap_color};'
                 f'border-radius:8px;padding:10px 14px;font-size:13px;color:#c9d1d9;'
-                f'line-height:1.5;margin-bottom:8px;">{_summary}</div>'
+                f'line-height:1.5;margin:8px 0;">{_summary}</div>'
                 f'<div style="border:1px solid #30363d;border-radius:8px;overflow:hidden;">'
                 f'<table style="width:100%;border-collapse:collapse;">'
                 f'<thead style="background:#161b22;color:#8b949e;font-size:10px;text-transform:uppercase;">'
@@ -5221,6 +5086,177 @@ elif page == "🔍 Team Breakdown":
                 f'</thead><tbody>' + "".join(_gap_rows) + '</tbody></table></div>',
                 unsafe_allow_html=True,
             )
+
+        # ── RIGHT: 🔬 Match Impact Explorer ────────────────────
+        with _impact_panel:
+            st.markdown("### 🔬 Match Impact Explorer — what if a match never happened?")
+            st.caption(
+                "Removes the chosen match from the entire dataset and re-runs "
+                "the full engine. First click takes ~1 s; later picks of the "
+                "same match are instant for this session."
+            )
+
+            # Build candidate list: top-5 from BC, ON and LAN buckets,
+            # plus this team's recent wins. Dedup by mid.
+            _mi_cand: dict[int, dict] = {}
+
+            def _mi_add(m, kind, e=None):
+                mid = m.get("match_id")
+                if mid is None:
+                    return
+                _mi_cand.setdefault(int(mid), {
+                    "match_id": int(mid),
+                    "date":     m["date"],
+                    "opponent": m["opponent"],
+                    "result":   m["result"],
+                    "kinds":    [],
+                    "is_lan":   bool(m.get("is_lan", False)),
+                })
+                _mi_cand[int(mid)]["kinds"].append(kind if e is None else f"{kind} #{e}")
+
+            for _i, (_, _m) in enumerate(_bc_e[:5], start=1):
+                _mi_add(_m, "BC", _i)
+            for _i, (_, _m) in enumerate(_on_e[:5], start=1):
+                _mi_add(_m, "ON", _i)
+            for _i, _m in enumerate(_lan_l[:5], start=1):
+                _mi_add(_m, "LAN", _i)
+            _mi_recent = sorted(
+                [m for m in raw_ms if m.get("match_id") is not None],
+                key=lambda mm: mm["date"], reverse=True,
+            )[:5]
+            for _m in _mi_recent:
+                _mi_add(_m, "recent")
+
+            if not _mi_cand:
+                st.caption("No matches with engine match-IDs available for this team.")
+            else:
+                _mi_list = sorted(_mi_cand.values(),
+                                  key=lambda c: c["date"], reverse=True)
+
+                def _mi_label(c):
+                    tag = "·".join(sorted(set(c["kinds"])))
+                    lan = " 🖥" if c["is_lan"] else ""
+                    return (f"{c['date'].strftime('%Y-%m-%d')} · "
+                            f"{c['result']} vs {c['opponent']}{lan} — {tag}")
+
+                _mi_label_to_id = {_mi_label(c): c["match_id"] for c in _mi_list}
+                _mi_picked_label = st.selectbox(
+                    "Pick a match to remove",
+                    list(_mi_label_to_id.keys()),
+                    key=f"impact_pick_{sel_team}",
+                )
+                _mi_remove_id = _mi_label_to_id[_mi_picked_label]
+
+                _mi_go = st.button(
+                    "▶ Compute impact",
+                    key=f"impact_btn_{sel_team}_{_mi_remove_id}",
+                    type="primary",
+                )
+
+                # Session-scoped cache: avoids re-running the engine for the
+                # same match more than once per session.
+                if "_match_impact_cache" not in st.session_state:
+                    st.session_state._match_impact_cache = {}
+                _mi_cache = st.session_state._match_impact_cache
+                _mi_key = (mode_active,
+                           _ref_cutoff.strftime("%Y%m%d"),
+                           int(_mi_remove_id))
+
+                if _mi_go and _mi_key not in _mi_cache:
+                    with st.spinner("Re-running engine without this match…"):
+                        _mi_store = Store.from_valve(team_match_history, bo_prizes_map)
+                        _mi_store.matches_df = (
+                            _mi_store.matches_df[
+                                _mi_store.matches_df["match_id"] != _mi_remove_id
+                            ].reset_index(drop=True)
+                        )
+                        _mi_res = run_vrs(_mi_store, cutoff=_ref_cutoff)
+                        _mi_cache[_mi_key] = _mi_res
+
+                if _mi_key in _mi_cache:
+                    _mi_res = _mi_cache[_mi_key]
+                    _mi_std = _mi_res.get("standings", pd.DataFrame())
+                    if _mi_std.empty or sel_team not in _mi_std["team"].values:
+                        st.warning(
+                            "After removing this match, this team is no longer "
+                            "eligible (≥ 5 matches required)."
+                        )
+                    else:
+                        _mi_row = _mi_std[_mi_std["team"] == sel_team].iloc[0]
+                        # Sign convention: positive = this match HELPED the team
+                        # (added pts / improved rank), negative = it hurt them.
+                        # All deltas are computed as (current_with_match − without_match)
+                        # so removing a contributing win shows as a positive contribution.
+                        _mi_drank = int(_mi_row["rank"]) - int(ex["rank"])  # ranks gained from this match
+                        _mi_dpts  = float(ex["total_points"]) - float(_mi_row["total_points"])
+                        # Per-factor pts contribution: BO/BC/ON/LAN factors are
+                        # converted into seed-points via `_pts_per_factor`
+                        # (same scaling used by the donut + peer comparator);
+                        # Seed and H2H deltas are already on the points scale.
+                        _mi_dseed = float(ex["seed"])      - float(_mi_row["seed"])
+                        _mi_dh2h  = float(ex["h2h_delta"]) - float(_mi_row["h2h_delta"])
+                        _mi_dbo_pts  = (float(ex["bo_factor"])  - float(_mi_row["bo_factor"]))  * _pts_per_factor
+                        _mi_dbc_pts  = (float(ex["bc_factor"])  - float(_mi_row["bc_factor"]))  * _pts_per_factor
+                        _mi_don_pts  = (float(ex["on_factor"])  - float(_mi_row["on_factor"]))  * _pts_per_factor
+                        _mi_dlan_pts = (float(ex["lan_factor"]) - float(_mi_row["lan_factor"])) * _pts_per_factor
+
+                        _mi_rk_arrow = (
+                            f'<span style="color:#3fb950;font-weight:700">▲ {_mi_drank}</span>'
+                            if _mi_drank > 0 else
+                            f'<span style="color:#f85149;font-weight:700">▼ {-_mi_drank}</span>'
+                            if _mi_drank < 0 else
+                            '<span style="color:#8b949e">—</span>'
+                        )
+
+                        st.markdown(
+                            f'<div style="background:#161b22;border:1px solid #30363d;'
+                            f'border-radius:8px;padding:12px 14px;margin:8px 0;">'
+                            f'<div style="font-size:11px;color:#8b949e;text-transform:uppercase;">'
+                            f'Impact of this match</div>'
+                            f'<div style="font-size:22px;font-weight:700;color:#c9d1d9;'
+                            f'margin-top:4px;">'
+                            f'#{int(ex["rank"])} '
+                            f'<span style="font-size:13px;color:#8b949e;font-weight:400">'
+                            f'(would be #{int(_mi_row["rank"])} without · {_mi_rk_arrow})</span></div>'
+                            f'<div style="font-size:13px;color:#c9d1d9;margin-top:6px;">'
+                            f'{float(ex["total_points"]):,.1f} pts '
+                            f'<span style="color:#8b949e;font-size:11px">'
+                            f'({_mi_dpts:+,.1f} from this match)</span></div>'
+                            f'</div>',
+                            unsafe_allow_html=True,
+                        )
+
+                        def _mi_pts_row(label, color, dpts):
+                            col = ("#3fb950" if dpts > 0 else
+                                   "#f85149" if dpts < 0 else "#8b949e")
+                            return (
+                                f'<tr style="border-bottom:1px solid #21262d;">'
+                                f'<td style="padding:5px 8px;color:{color};'
+                                f'font-weight:600;font-size:12px">{label}</td>'
+                                f'<td style="padding:5px 8px;text-align:right;'
+                                f'color:{col};font-size:11px">{dpts:+,.1f}</td>'
+                                f'</tr>'
+                            )
+                        _mi_html = (
+                            _mi_pts_row("🏆 BO",    "#f0b429", _mi_dbo_pts)  +
+                            _mi_pts_row("💰 BC",    "#3fb950", _mi_dbc_pts)  +
+                            _mi_pts_row("🕸️ ON",    "#79c0ff", _mi_don_pts)  +
+                            _mi_pts_row("🖥️ LAN",   "#f85149", _mi_dlan_pts) +
+                            _mi_pts_row("🌱 Seed",  "#58a6ff", _mi_dseed)    +
+                            _mi_pts_row("⚔️ H2H Δ", "#d2a8ff", _mi_dh2h)
+                        )
+                        st.markdown(
+                            f'<div style="border:1px solid #30363d;border-radius:8px;'
+                            f'overflow:hidden;">'
+                            f'<table style="width:100%;border-collapse:collapse;">'
+                            f'<thead style="background:#161b22;color:#8b949e;'
+                            f'font-size:10px;text-transform:uppercase;">'
+                            f'<tr><th style="padding:7px 8px;text-align:left">Factor</th>'
+                            f'<th style="padding:7px 8px;text-align:right">'
+                            f'Δ pts (from this match)</th></tr></thead>'
+                            f'<tbody>{_mi_html}</tbody></table></div>',
+                            unsafe_allow_html=True,
+                        )
 
         # ════════════════════════════════════════════════════════
         # DAY 5 — CLIMB PLAN  (🧗 Pillar 2: Improvement Path)

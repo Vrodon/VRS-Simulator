@@ -39,6 +39,7 @@ app.py                  → Streamlit UI entry point
 - Always answer in caveman language (\skills\caveman)
 - Create and keep a register for our common language up-to-date (skills\ubiquitous-language)
 - Instead of creating plans, issue the grill-me skill (skills\grill-me)
+- old_plans foler contains formally created plans that were fully or partially executed (in case it is required to understand our history)
 
 ## Swiss Tournament Architecture (locked spec)
 

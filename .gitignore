@@ -16,3 +16,4 @@ cache/
 
 # Scratch / debug workspace
 scratch/
+smoke_*.out
